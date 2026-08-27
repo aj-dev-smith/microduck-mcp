@@ -460,7 +460,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", specifier = ">=2" },
+    { name = "mcp", specifier = ">=2,<3" },
     { name = "mujoco", specifier = ">=3.2" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "onnxruntime", specifier = ">=1.20" },

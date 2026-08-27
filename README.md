@@ -21,16 +21,19 @@ sees while driving.*
 ## Architecture
 
 ```
-MCP client (Claude, ...)          duck CLI (humans / scripts)
-        │ stdio                          │
-        ▼                                ▼
-   duck-mcp  ────────────►  Unix socket, JSON lines  ◄────────
+MCP client (Claude, ...)   duck CLI (humans / scripts)   browser: AX debug page
+        │ stdio                          │                        │ http :8400
+        ▼                                ▼                        ▼
+   duck-mcp  ────────────►  Unix socket, JSON lines  ◄────  built-in web UI
                                     │
                                     ▼
                           duck-sim (50 Hz MuJoCo loop,
                           ONNX policy hot-swapping via
                           microduck_rl's PolicyInference)
 ```
+
+Design rationale (tools vs resources, structured output, error semantics) is
+documented in [docs/mcp-design-notes.md](docs/mcp-design-notes.md).
 
 ## Setup
 
@@ -77,16 +80,30 @@ claude mcp add duck -- uv --directory /path/to/microduck-mcp run duck-mcp
 
 ## MCP tools
 
+All state-returning tools emit typed structured output (`DuckState` schema,
+units documented per field); every mutating tool returns post-action state so
+the agent rarely needs a follow-up poll.
+
 | Tool | What it does |
 |---|---|
 | `duck_state` | Position, orientation, body-frame velocity, active policy, upright? |
-| `duck_drive(vx, vy, wz)` | Velocity intent; walking policy engages automatically |
+| `duck_drive(vx, vy, wz, duration_s?)` | Velocity intent; with `duration_s`, drives then stops and reports — one call instead of drive/poll/stop |
 | `duck_stop` | Zero commands → standing policy |
 | `duck_trick(name)` | `sit`, `stand`, `ground_pick`, `kick_left`, `kick_right`, `roulade` |
 | `duck_look(...)` | Point the head (it's a command to the policy, not a servo write) |
-| `duck_camera(view)` | Rendered frame: `follow`, `front`, `side`, `top` |
+| `duck_camera(view, distance)` | Rendered frame: `follow`, `front`, `side`, `top` |
 | `duck_push(magnitude, angle_deg)` | Shove the trunk; tests push recovery |
-| `duck_reset` | Back to origin, default stance |
+| `duck_reset` | Back to origin, default stance (`destructive_hint` — it ends the episode) |
+
+## AX debug page
+
+`duck-sim` also serves an **Agent Experience debug page** at
+`http://127.0.0.1:8400` (`--web PORT`, `--web 0` to disable): a live feed of
+every command hitting the control socket — tagged by client (`mcp`, `cli`,
+`web`) — next to an auto-refreshing camera view and a state dashboard. Open it
+beside the MuJoCo viewer to watch *what the agent is doing and what it can
+see*, in real time. Plain stdlib HTTP + one HTML file; all rendering still
+happens on the sim thread via the same intent queue as every other client.
 
 ## Notes
 

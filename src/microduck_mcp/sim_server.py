@@ -27,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 
 import mujoco
 import numpy as np
@@ -143,6 +144,9 @@ class DuckSim:
         self._renderer = None
         self._frame_count = 0
         self.sim_time = 0.0
+        # Command-feed ring buffer for the AX debug page (webui.py).
+        self.events = deque(maxlen=500)
+        self._event_id = 0
 
     def _apply_current_limit(self, amps: float):
         try:
@@ -218,6 +222,8 @@ class DuckSim:
             return {"ok": True, "pushed": {"magnitude": mag, "angle_deg": round(math.degrees(angle), 1)}}
         if cmd == "camera":
             return self._handle_camera(req)
+        if cmd == "camera_web":
+            return self._handle_camera(req, live=True)
         if cmd == "reset":
             return self._handle_reset()
         return {"ok": False, "error": f"unknown cmd {cmd!r}"}
@@ -268,7 +274,7 @@ class DuckSim:
         self.sim_time = 0.0
         return self.get_state()
 
-    def _handle_camera(self, req: dict) -> dict:
+    def _handle_camera(self, req: dict, live: bool = False) -> dict:
         view = req.get("view", "follow")
         if view not in CAMERA_VIEWS:
             return {"ok": False, "error": f"unknown view {view!r} (choose from {CAMERA_VIEWS})"}
@@ -294,8 +300,12 @@ class DuckSim:
             self._renderer.update_scene(self.data, camera=cam)
             pixels = self._renderer.render()
             from PIL import Image
-            self._frame_count += 1
-            path = os.path.join(self.frames_dir, f"frame_{self._frame_count:05d}_{view}.png")
+            if live:
+                # Ambient page refresh: one file per view, overwritten in place.
+                path = os.path.join(self.frames_dir, f"live_{view}.png")
+            else:
+                self._frame_count += 1
+                path = os.path.join(self.frames_dir, f"frame_{self._frame_count:05d}_{view}.png")
             Image.fromarray(pixels).save(path)
             out = self.get_state()
             out["frame"] = path
@@ -318,11 +328,32 @@ class DuckSim:
                 req, respq = self._requests.get_nowait()
             except queue.Empty:
                 return
+            client = req.pop("client", "cli")
             try:
                 resp = self.handle(req)
             except Exception as e:
                 resp = {"ok": False, "error": repr(e)}
             respq.put(resp)
+            self._log_event(client, req, resp)
+
+    def _log_event(self, client: str, req: dict, resp: dict):
+        cmd = req.get("cmd", "?")
+        if cmd in ("camera_web", "ping"):  # ambient page traffic, not agent intent
+            return
+        if not resp.get("ok"):
+            note = resp.get("error", "error")
+        elif cmd == "trick":
+            note = "started" if resp.get("started") else "refused"
+        elif cmd in ("set_velocity", "reset", "state", "look", "push"):
+            note = f"{resp.get('active_policy', '')}{'' if resp.get('upright', True) else ' DOWN'}"
+        else:
+            note = ""
+        self._event_id += 1
+        self.events.append({
+            "id": self._event_id, "t": time.time(), "client": client, "cmd": cmd,
+            "args": {k: v for k, v in req.items() if k != "cmd"},
+            "ok": bool(resp.get("ok")), "note": note.strip(),
+        })
 
 
 def serve_socket(sim: DuckSim, sock_path: str, stop: threading.Event):
@@ -402,11 +433,17 @@ def main():
     parser.add_argument("--viewer", action="store_true",
                         help="Open the MuJoCo viewer (on macOS run under mjpython)")
     parser.add_argument("--fast", action="store_true", help="Run faster than realtime (headless only)")
+    parser.add_argument("--web", type=int, default=8400, metavar="PORT",
+                        help="Port for the AX debug page (0 disables; default 8400)")
     args = parser.parse_args()
 
     sim = DuckSim(args.rl_repo, args.policies, args.scene, args.frames_dir)
     stop = threading.Event()
     server = serve_socket(sim, args.socket, stop)
+    web_server = None
+    if args.web:
+        from .webui import start_web
+        web_server = start_web(sim, args.web)
     try:
         if args.viewer:
             import mujoco.viewer
@@ -419,6 +456,8 @@ def main():
         pass
     finally:
         stop.set()
+        if web_server is not None:
+            web_server.shutdown()
         server.close()
         if os.path.exists(args.socket):
             os.unlink(args.socket)
