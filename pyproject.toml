@@ -1,0 +1,44 @@
+[project]
+name = "microduck-mcp"
+version = "0.1.0"
+description = "Drive the Pollen Robotics Microduck (simulation) from any MCP client"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "AJ Smith", email = "aj.dev.smith@gmail.com" }]
+keywords = ["mcp", "robotics", "mujoco", "microduck", "simulation", "reinforcement-learning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "mujoco>=3.2",
+    "onnxruntime>=1.20",
+    "numpy>=1.26",
+    "mcp>=2",
+    "pillow>=10",
+]
+
+[project.urls]
+Homepage = "https://github.com/aj-dev-smith/microduck-mcp"
+Repository = "https://github.com/aj-dev-smith/microduck-mcp"
+Issues = "https://github.com/aj-dev-smith/microduck-mcp/issues"
+
+[project.scripts]
+duck-sim = "microduck_mcp.sim_server:main"
+duck = "microduck_mcp.client:main"
+duck-mcp = "microduck_mcp.mcp_server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/microduck_mcp"]

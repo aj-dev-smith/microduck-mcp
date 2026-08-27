@@ -1,0 +1,429 @@
+"""Socket-controlled Microduck MuJoCo simulator.
+
+Runs the same CPU MuJoCo + ONNX policy stack as microduck_rl's
+scripts/infer_policy.py (whose PolicyInference class is imported directly from
+that repo), but replaces terminal-keyboard control with a Unix-socket JSON-lines
+control plane — the same shape as the real robot's robotd socket: clients send
+intents, never motor writes.
+
+Every MuJoCo call happens on the sim thread. Socket connections enqueue
+requests; the 50 Hz loop drains the queue between control ticks and replies.
+
+Run headless (plain python) or with the interactive viewer (macOS: mjpython):
+
+    duck-sim --rl-repo ../microduck_rl --policies ../microduck/policies
+    uv run mjpython -m microduck_mcp.sim_server --viewer ...
+"""
+
+import argparse
+import importlib.util
+import json
+import math
+import os
+import queue
+import random
+import socket
+import sys
+import tempfile
+import threading
+import time
+
+import mujoco
+import numpy as np
+
+# Nm/A for the Dynamixel XL330 (BAM m6 model). Used for the firmware
+# current-limit -> torque clamp when the `bam` package is not installed.
+KT_XL330 = 0.3660
+DEFAULT_CURRENT_LIMIT = 1.75  # A, XL330 firmware default
+
+CONTROL_HZ = 50
+DECIMATION = 4
+TIMESTEP = 0.005
+
+SCENES = {
+    "ball": "src/mjlab_microduck/robot/microduck/scene_ball.xml",
+    "plain": "src/mjlab_microduck/robot/microduck/scene.xml",
+}
+
+# Policy roles -> filenames as shipped in pollen-robotics/microduck's policies/
+POLICY_FILES = {
+    "walking": "alpha_walking.onnx",
+    "standing": "alpha_stand.onnx",
+    "sitstand": "alpha_sitstand.onnx",
+    "ground_pick": "alpha_ground_pick.onnx",
+    "kick_left": "ball_kick_left.onnx",
+    "kick_right": "ball_kick_right.onnx",
+    "roulade": "roulade.onnx",
+}
+
+CAMERA_VIEWS = ("follow", "front", "side", "top")
+
+
+def load_infer_policy_module(rl_repo: str):
+    """Import microduck_rl's scripts/infer_policy.py as a module."""
+    path = os.path.join(rl_repo, "scripts", "infer_policy.py")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"infer_policy.py not found at {path} — pass --rl-repo pointing at a "
+            "clone of https://github.com/pollen-robotics/microduck_rl"
+        )
+    spec = importlib.util.spec_from_file_location("infer_policy", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def quat_to_rpy(q):
+    """Quaternion [w, x, y, z] -> roll, pitch, yaw in radians."""
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))
+    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    return roll, pitch, yaw
+
+
+class DuckSim:
+    def __init__(self, rl_repo: str, policies_dir: str, scene: str, frames_dir: str):
+        self.rl_repo = os.path.abspath(rl_repo)
+        self.frames_dir = frames_dir
+        os.makedirs(self.frames_dir, exist_ok=True)
+
+        ip = load_infer_policy_module(self.rl_repo)
+
+        xml_path = os.path.join(self.rl_repo, SCENES[scene])
+        print(f"Loading MuJoCo model: {xml_path}")
+        self.model = mujoco.MjModel.from_xml_path(xml_path)
+        self.model.opt.timestep = TIMESTEP
+        self.data = mujoco.MjData(self.model)
+        self._apply_current_limit(DEFAULT_CURRENT_LIMIT)
+
+        paths = {}
+        for role, fname in POLICY_FILES.items():
+            p = os.path.join(policies_dir, fname)
+            if os.path.isfile(p):
+                paths[role] = p
+            else:
+                print(f"note: no {role} policy at {p} — skipping")
+        if scene == "plain":
+            paths.pop("kick_left", None)
+            paths.pop("kick_right", None)
+
+        self.policy = ip.PolicyInference(
+            self.model, self.data,
+            walking_onnx_path=paths.get("walking"),
+            standing_onnx_path=paths.get("standing"),
+            sitstand_onnx_path=paths.get("sitstand"),
+            ground_pick_onnx_path=paths.get("ground_pick"),
+            kick_left_onnx_path=paths.get("kick_left"),
+            kick_right_onnx_path=paths.get("kick_right"),
+            roulade_onnx_path=paths.get("roulade"),
+            new_cmd_obs=True,
+            use_projected_gravity=True,
+        )
+        # Velocity command limits matching training ranges (walking robot).
+        self.policy.vel_max_x, self.policy.vel_min_x = 0.3, -0.3
+        self.policy.vel_max_y, self.policy.vel_min_y = 0.2, -0.2
+        self.policy.vel_max_ang = 1.5
+        # Zero command selects the standing policy before the first tick.
+        self.policy.set_vel_cmd(0.0, 0.0, 0.0)
+
+        # Initial stance (matches infer_policy main()).
+        fj = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
+        self.qpos_adr = int(self.model.jnt_qposadr[fj])
+        self.qvel_adr = int(self.model.jnt_dofadr[fj])
+        self.data.qpos[self.qpos_adr:self.qpos_adr + 3] = [0.0, 0.0, 0.125]
+        self.data.qpos[self.qpos_adr + 3:self.qpos_adr + 7] = [1, 0, 0, 0]
+        for i, qi in enumerate(self.policy.joint_qpos_indices):
+            self.data.qpos[qi] = self.policy.default_pose[i]
+        self.data.ctrl[:] = self.policy.default_pose
+        mujoco.mj_forward(self.model, self.data)
+        self._qpos0 = self.data.qpos.copy()
+
+        self._requests: "queue.Queue[tuple[dict, queue.Queue]]" = queue.Queue()
+        self._renderer = None
+        self._frame_count = 0
+        self.sim_time = 0.0
+
+    def _apply_current_limit(self, amps: float):
+        try:
+            from bam.model import load_model
+            kt = load_model(motor_name="xl330", model="m6").kt.value
+        except Exception:
+            kt = KT_XL330
+        limit = kt * amps
+        self.model.actuator_forcerange[:, 0] = -limit
+        self.model.actuator_forcerange[:, 1] = limit
+        self.model.actuator_forcelimited[:] = 1
+        print(f"Current limit {amps:.2f} A -> torque clamp ±{limit:.4f} Nm (kt={kt:.4f})")
+
+    # ---------- state ----------
+
+    def get_state(self) -> dict:
+        adr, vadr = self.qpos_adr, self.qvel_adr
+        pos = self.data.qpos[adr:adr + 3]
+        quat = self.data.qpos[adr + 3:adr + 7].astype(np.float32)
+        roll, pitch, yaw = quat_to_rpy(quat)
+        v_world = np.array(self.data.qvel[vadr:vadr + 3], dtype=np.float32)
+        v_body = self.policy.quat_rotate_inverse(quat, v_world)
+        proj_g = self.policy.get_projected_gravity()
+        p = self.policy
+        state = {
+            "ok": True,
+            "sim_time_s": round(self.sim_time, 2),
+            "position_m": [round(float(v), 3) for v in pos],
+            "rpy_deg": [round(math.degrees(a), 1) for a in (roll, pitch, yaw)],
+            "vel_body_mps": {"forward": round(float(v_body[0]), 3),
+                             "lateral": round(float(v_body[1]), 3)},
+            "yaw_rate_rps": round(float(self.data.qvel[vadr + 5]), 3),
+            "trunk_height_mm": round(float(pos[2]) * 1000, 1),
+            "upright": bool(proj_g[2] < -0.7),
+            "active_policy": p.current_policy,
+            "vel_cmd": [round(float(v), 2) for v in p.vel_cmd],
+            "sitting": bool(p.sit_mode),
+            "behavior": p.behavior_mode,
+            "ground_pick": bool(p.ground_pick_mode),
+        }
+        if p.ball_qpos_adr is not None:
+            b = self.data.qpos[p.ball_qpos_adr:p.ball_qpos_adr + 3]
+            state["ball_position_m"] = [round(float(v), 3) for v in b]
+        return state
+
+    # ---------- request handlers (sim thread only) ----------
+
+    def handle(self, req: dict) -> dict:
+        cmd = req.get("cmd")
+        p = self.policy
+        if cmd == "ping":
+            return {"ok": True, "server": "microduck-sim", "sim_time_s": round(self.sim_time, 2)}
+        if cmd == "state":
+            return self.get_state()
+        if cmd == "set_velocity":
+            vx = float(np.clip(req.get("vx", 0.0), p.vel_min_x, p.vel_max_x))
+            vy = float(np.clip(req.get("vy", 0.0), p.vel_min_y, p.vel_max_y))
+            wz = float(np.clip(req.get("wz", 0.0), -p.vel_max_ang, p.vel_max_ang))
+            p.set_vel_cmd(vx, vy, wz)
+            return self.get_state()
+        if cmd == "trick":
+            return self._handle_trick(req.get("name", ""))
+        if cmd == "look":
+            vals = [req.get(k, 0.0) for k in ("neck_pitch", "head_pitch", "head_yaw", "head_roll")]
+            p.head_offset[:] = np.clip(np.array(vals, dtype=np.float32), -p.head_max, p.head_max)
+            p._update_command()
+            return self.get_state()
+        if cmd == "push":
+            mag = float(np.clip(req.get("magnitude", 1.0), 0.0, 2.0))
+            angle = math.radians(req["angle_deg"]) if "angle_deg" in req else random.uniform(0, 2 * math.pi)
+            self.data.qvel[self.qvel_adr + 0] = mag * math.cos(angle)
+            self.data.qvel[self.qvel_adr + 1] = mag * math.sin(angle)
+            return {"ok": True, "pushed": {"magnitude": mag, "angle_deg": round(math.degrees(angle), 1)}}
+        if cmd == "camera":
+            return self._handle_camera(req)
+        if cmd == "reset":
+            return self._handle_reset()
+        return {"ok": False, "error": f"unknown cmd {cmd!r}"}
+
+    def _handle_trick(self, name: str) -> dict:
+        p = self.policy
+        if name == "sit":
+            if not p.sit_mode:
+                p.toggle_sit()
+            started = p.sit_mode
+        elif name == "stand":
+            if p.sit_mode:
+                p.toggle_sit()
+            else:
+                p.set_vel_cmd(0.0, 0.0, 0.0)
+            started = True
+        elif name == "ground_pick":
+            p.trigger_ground_pick()
+            started = p.ground_pick_mode
+        elif name in ("kick_left", "kick_right", "roulade"):
+            p.trigger_behavior(name)
+            started = p.behavior_mode == name
+        else:
+            return {"ok": False, "error": f"unknown trick {name!r} "
+                    "(sit, stand, ground_pick, kick_left, kick_right, roulade)"}
+        out = self.get_state()
+        out["trick"] = name
+        out["started"] = started
+        if not started:
+            out["ok"] = False
+            out["error"] = f"{name} refused (busy: policy={p.current_policy}, sitting={p.sit_mode})"
+        return out
+
+    def _handle_reset(self) -> dict:
+        p = self.policy
+        self.data.qpos[:] = self._qpos0
+        self.data.qvel[:] = 0.0
+        p.last_action = np.zeros(p.n_joints, dtype=np.float32)
+        p.vel_cmd = np.zeros(3, dtype=np.float32)
+        p.head_offset[:] = 0.0
+        p.body_cmd[:] = 0.0
+        p.sit_mode = False
+        p.ground_pick_mode = False
+        p.behavior_mode = None
+        p.set_vel_cmd(0.0, 0.0, 0.0)  # selects the standing policy
+        self.data.ctrl[:] = p.default_pose
+        mujoco.mj_forward(self.model, self.data)
+        self.sim_time = 0.0
+        return self.get_state()
+
+    def _handle_camera(self, req: dict) -> dict:
+        view = req.get("view", "follow")
+        if view not in CAMERA_VIEWS:
+            return {"ok": False, "error": f"unknown view {view!r} (choose from {CAMERA_VIEWS})"}
+        try:
+            if self._renderer is None:
+                w = min(640, int(self.model.vis.global_.offwidth))
+                h = min(480, int(self.model.vis.global_.offheight))
+                self._renderer = mujoco.Renderer(self.model, height=h, width=w)
+            cam = mujoco.MjvCamera()
+            trunk = self.data.qpos[self.qpos_adr:self.qpos_adr + 3]
+            quat = self.data.qpos[self.qpos_adr + 3:self.qpos_adr + 7]
+            yaw_deg = math.degrees(quat_to_rpy(quat)[2])
+            cam.lookat[:] = [trunk[0], trunk[1], max(0.08, float(trunk[2]))]
+            cam.distance = float(req.get("distance", 0.7))
+            if view == "follow":
+                cam.azimuth, cam.elevation = yaw_deg, -20
+            elif view == "front":
+                cam.azimuth, cam.elevation = yaw_deg + 180, -15
+            elif view == "side":
+                cam.azimuth, cam.elevation = yaw_deg + 90, -10
+            elif view == "top":
+                cam.azimuth, cam.elevation = yaw_deg, -89
+            self._renderer.update_scene(self.data, camera=cam)
+            pixels = self._renderer.render()
+            from PIL import Image
+            self._frame_count += 1
+            path = os.path.join(self.frames_dir, f"frame_{self._frame_count:05d}_{view}.png")
+            Image.fromarray(pixels).save(path)
+            out = self.get_state()
+            out["frame"] = path
+            out["view"] = view
+            return out
+        except Exception as e:
+            return {"ok": False, "error": f"render failed: {e} "
+                    "(offscreen rendering may be unavailable under mjpython; use headless mode)"}
+
+    # ---------- socket plumbing ----------
+
+    def submit(self, req: dict, timeout: float = 10.0) -> dict:
+        respq: "queue.Queue[dict]" = queue.Queue()
+        self._requests.put((req, respq))
+        return respq.get(timeout=timeout)
+
+    def drain_requests(self):
+        while True:
+            try:
+                req, respq = self._requests.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                resp = self.handle(req)
+            except Exception as e:
+                resp = {"ok": False, "error": repr(e)}
+            respq.put(resp)
+
+
+def serve_socket(sim: DuckSim, sock_path: str, stop: threading.Event):
+    if os.path.exists(sock_path):
+        os.unlink(sock_path)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(sock_path)
+    server.listen(8)
+    server.settimeout(0.5)
+    print(f"Control socket: {sock_path}")
+
+    def client_thread(conn):
+        with conn, conn.makefile("rwb") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    req = json.loads(line)
+                    resp = sim.submit(req)
+                except Exception as e:
+                    resp = {"ok": False, "error": repr(e)}
+                f.write((json.dumps(resp) + "\n").encode())
+                f.flush()
+
+    def accept_loop():
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=client_thread, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=accept_loop, daemon=True).start()
+    return server
+
+
+def run_loop(sim: DuckSim, viewer=None, realtime: bool = True, stop: threading.Event = None):
+    control_dt = DECIMATION * TIMESTEP
+    prev = time.time()
+    print(f"Sim loop running at {CONTROL_HZ} Hz "
+          f"({'realtime' if realtime else 'fast'}, {'viewer' if viewer else 'headless'})")
+    while not (stop and stop.is_set()):
+        t0 = time.time()
+        if viewer is not None and not viewer.is_running():
+            break
+        sim.drain_requests()
+        dt = (t0 - prev) if realtime else control_dt
+        prev = t0
+        sim.policy.update_ground_pick_phase(dt)
+        sim.policy.update_behavior(dt)
+        action = sim.policy.infer()
+        sim.policy.apply_action(action)
+        for _ in range(DECIMATION):
+            mujoco.mj_step(sim.model, sim.data)
+        sim.sim_time += control_dt
+        if viewer is not None:
+            viewer.sync()
+        if realtime:
+            sleep = control_dt - (time.time() - t0)
+            if sleep > 0:
+                time.sleep(sleep)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Socket-controlled Microduck simulator")
+    parser.add_argument("--rl-repo", default=os.environ.get("MICRODUCK_RL_REPO", "../microduck_rl"),
+                        help="Path to a microduck_rl clone (scenes + PolicyInference)")
+    parser.add_argument("--policies", default=os.environ.get("MICRODUCK_POLICIES", "../microduck/policies"),
+                        help="Directory of ONNX policies (microduck repo's policies/)")
+    parser.add_argument("--socket", default=os.environ.get("DUCK_SIM_SOCKET",
+                        os.path.join(tempfile.gettempdir(), "microduck-sim.sock")))
+    parser.add_argument("--scene", choices=sorted(SCENES), default="ball")
+    parser.add_argument("--frames-dir", default=os.path.join(tempfile.gettempdir(), "microduck-frames"))
+    parser.add_argument("--viewer", action="store_true",
+                        help="Open the MuJoCo viewer (on macOS run under mjpython)")
+    parser.add_argument("--fast", action="store_true", help="Run faster than realtime (headless only)")
+    args = parser.parse_args()
+
+    sim = DuckSim(args.rl_repo, args.policies, args.scene, args.frames_dir)
+    stop = threading.Event()
+    server = serve_socket(sim, args.socket, stop)
+    try:
+        if args.viewer:
+            import mujoco.viewer
+            with mujoco.viewer.launch_passive(sim.model, sim.data,
+                                              show_left_ui=False, show_right_ui=False) as viewer:
+                run_loop(sim, viewer=viewer, realtime=True, stop=stop)
+        else:
+            run_loop(sim, viewer=None, realtime=not args.fast, stop=stop)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        server.close()
+        if os.path.exists(args.socket):
+            os.unlink(args.socket)
+        print("Sim stopped.")
+
+
+if __name__ == "__main__":
+    main()
