@@ -48,8 +48,17 @@ RESYNC_LAG_S = 0.5
 
 SCENES = {
     "ball": "src/mjlab_microduck/robot/microduck/scene_ball.xml",
+    "pitch": "src/mjlab_microduck/robot/microduck/scene_pitch.xml",
     "plain": "src/mjlab_microduck/robot/microduck/scene.xml",
 }
+
+# The goal in scene_pitch.xml: line at world x=+0.60 with the mouth opening
+# back towards the origin (-x), posts at y=±0.20, crossbar underside at
+# z=0.18. Only used when the loaded scene actually has a goal (see
+# find_goal_geom); every other scene never sees these numbers.
+GOAL_LINE_X = 0.60
+GOAL_HALF_WIDTH_Y = 0.20
+GOAL_HEIGHT_Z = 0.18
 
 # Policy roles -> filenames as shipped in pollen-robotics/microduck's policies/
 POLICY_FILES = {
@@ -146,6 +155,86 @@ def detect_ball_pixels(px, fovy_deg: float = HEAD_CAM_FOVY_DEG,
     }
 
 
+# ---------- the referee (goal scoring) ----------
+# Deliberately reads the ball's ground-truth qpos: this is the referee /
+# goal-line boundary sensor, world infrastructure any real pitch would have,
+# not robot knowledge. The machine digest's honesty rule is about what the
+# ROBOT senses (ball_seen.*, proprioception); a scoreboard is allowed to know
+# where the ball is, and the robot only learns the score, never the position.
+
+# Geom names probed to decide whether the loaded scene has a goal at all.
+GOAL_GEOM_NAMES = ("goal_post_left", "goal_post_right", "goal_crossbar",
+                   "goal_frame", "goal_net", "goal")
+
+
+def find_goal_geom(model) -> str | None:
+    """Name of a goal geom in the model, or None if the scene has no goal.
+
+    Tolerant on purpose: the pitch scene is authored elsewhere, so try the
+    likely names first and then accept any geom whose name starts with "goal".
+    """
+    for name in GOAL_GEOM_NAMES:
+        if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name) >= 0:
+            return name
+    for gid in range(model.ngeom):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+        if name and name.startswith("goal"):
+            return name
+    return None
+
+
+def ball_in_goal(x: float, y: float, z: float,
+                 radius_m: float = BALL_RADIUS_M) -> bool:
+    """Is the ball FULLY across the line and inside the mouth?
+
+    Fully across: the trailing edge of the ball has cleared the line, i.e. the
+    centre is a whole radius past it. Inside: between the posts, under the
+    crossbar (a ball bouncing off the top of the frame is not a goal).
+    """
+    return (x > GOAL_LINE_X + radius_m
+            and abs(y) < GOAL_HALF_WIDTH_Y
+            and z < GOAL_HEIGHT_Z)
+
+
+class GoalReferee:
+    """Scoreboard: counts goals off a stream of ball positions.
+
+    Latched while the ball stays in the goal (one score per shot, not one per
+    tick), re-armed once the ball is back out in front of the line.
+    """
+
+    def __init__(self, radius_m: float = BALL_RADIUS_M):
+        self.radius_m = radius_m
+        self.count = 0
+        self.scored = False  # latched: the ball is in the goal right now
+        self.last_goal_sim_time_s = None
+
+    def reset(self):
+        self.count = 0
+        self.scored = False
+        self.last_goal_sim_time_s = None
+
+    def update(self, x: float, y: float, z: float, sim_time: float) -> bool:
+        """Feed one ball position. True on the rising edge of a goal."""
+        if ball_in_goal(x, y, z, self.radius_m):
+            if self.scored:
+                return False  # still in there from the last tick
+            self.scored = True
+            self.count += 1
+            self.last_goal_sim_time_s = round(float(sim_time), 2)
+            return True
+        if x < GOAL_LINE_X:
+            # Back out in front of the line — someone fetched it. Re-arm.
+            # Anything short of that (wedged against a post, sitting on the
+            # crossbar) leaves the latch alone rather than re-scoring.
+            self.scored = False
+        return False
+
+    def state(self) -> dict:
+        return {"scored": self.scored, "count": self.count,
+                "last_goal_sim_time_s": self.last_goal_sim_time_s}
+
+
 class DuckSim:
     def __init__(self, rl_repo: str, policies_dir: str, scene: str, frames_dir: str):
         self.rl_repo = os.path.abspath(rl_repo)
@@ -214,6 +303,15 @@ class DuckSim:
         self._ball_seen = dict(NOT_SEEN)
         self._ball_seen_t = 0.0
         self.machine = None  # loaded behavior machine (machine.py), or None
+        # Scoring only exists where a goal does: no goal geom (or no ball) and
+        # the referee stays None, so state/digest look exactly as they did.
+        self.referee = None
+        goal_geom = find_goal_geom(self.model)
+        if goal_geom is not None and self.policy.ball_qpos_adr is not None:
+            self.referee = GoalReferee()
+            print(f"Goal in scene (geom {goal_geom!r}) — scoring on: line "
+                  f"x>{GOAL_LINE_X + BALL_RADIUS_M:.3f}, |y|<{GOAL_HALF_WIDTH_Y}, "
+                  f"z<{GOAL_HEIGHT_Z}")
         # Command-feed ring buffer for the AX debug page (webui.py).
         self.events = deque(maxlen=500)
         self._event_id = 0
@@ -298,14 +396,41 @@ class DuckSim:
         self._ball_seen = seen
         self._ball_seen_t = self.sim_time
 
+    # ---------- the referee (sim thread only) ----------
+
+    def referee_tick(self):
+        """Watch the ball across the goal line. No-op on goal-less scenes."""
+        if self.referee is None:
+            return
+        adr = self.policy.ball_qpos_adr
+        x, y, z = (float(v) for v in self.data.qpos[adr:adr + 3])
+        if self.referee.update(x, y, z, self.sim_time):
+            self._event_id += 1
+            self.events.append({
+                "id": self._event_id, "t": time.time(), "client": "referee",
+                "cmd": "GOAL!",
+                "args": {"count": self.referee.count,
+                         "ball_position_m": [round(v, 3) for v in (x, y, z)]},
+                "ok": True,
+                "note": f"goal {self.referee.count} at "
+                        f"t={self.referee.last_goal_sim_time_s}s",
+            })
+            print(f"GOAL! #{self.referee.count} at t="
+                  f"{self.referee.last_goal_sim_time_s}s  "
+                  f"ball=({x:.3f}, {y:.3f}, {z:.3f})")
+
     # ---------- the behavior machine (sim thread only) ----------
 
     def _machine_digest(self) -> dict:
         """The guard vocabulary: sensed ball + proprioception + machine time.
         Deliberately excludes ground-truth ball position — a machine cannot
-        act on knowledge the robot would not have."""
+        act on knowledge the robot would not have. The referee's score is in
+        here (a scoreboard is world infrastructure, and "someone scored" is
+        not "where the ball is"); its keys are always present, False/0 on a
+        scene without a goal, so the key set is stable across scenes."""
         proj_g = self.policy.get_projected_gravity()
         bs = self._ball_seen
+        r = self.referee
         return {
             "ball_seen.visible": bs["visible"],
             "ball_seen.distance_m": bs["distance_m"],
@@ -315,6 +440,8 @@ class DuckSim:
             "ball_seen.est_forward_m": bs.get("est_forward_m"),
             "ball_seen.est_left_m": bs.get("est_left_m"),
             "ball_seen.age_s": round(self.sim_time - self._ball_seen_t, 3),
+            "goal.scored": bool(r.scored) if r is not None else False,
+            "goal.count": int(r.count) if r is not None else 0,
             "upright": bool(proj_g[2] < -0.7),
             "sitting": bool(self.policy.sit_mode),
             "active_policy": self.policy.current_policy,
@@ -426,6 +553,9 @@ class DuckSim:
             c, s = math.cos(yaw), math.sin(yaw)
             state["ball_offset_m"] = {"forward": round(c * dx + s * dy, 3),
                                       "left": round(-s * dx + c * dy, 3)}
+        # Only on a scene with a goal — omitted entirely elsewhere.
+        if self.referee is not None:
+            state["goal"] = self.referee.state()
         return state
 
     # ---------- request handlers (sim thread only) ----------
@@ -525,6 +655,8 @@ class DuckSim:
         self._det_step = 0
         self._ball_seen = dict(NOT_SEEN)
         self._ball_seen_t = 0.0
+        if self.referee is not None:
+            self.referee.reset()  # new episode, new scoreboard
         self._detect_ball()  # so state right after a reset is not stale
         return self.get_state()
 
@@ -673,6 +805,7 @@ def run_loop(sim: DuckSim, viewer=None, realtime: bool = True, stop: threading.E
             mujoco.mj_step(sim.model, sim.data)
         sim.sim_time += control_dt
         sim.sense()
+        sim.referee_tick()
         sim.machine_tick()
         if viewer is not None:
             viewer.sync()
