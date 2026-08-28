@@ -10,6 +10,8 @@ Library (`request()`) plus a small CLI:
     duck cam follow
     duck push [magnitude] [angle_deg]
     duck reset
+    duck machine load machines/soccer.toml
+    duck machine arm | disarm | status | reload | force <node>
 """
 
 import argparse
@@ -62,6 +64,11 @@ def main():
     ps.add_argument("magnitude", type=float, nargs="?", default=1.0)
     ps.add_argument("angle_deg", type=float, nargs="?", default=None)
     sub.add_parser("reset")
+    m = sub.add_parser("machine")
+    m.add_argument("action", choices=["load", "reload", "status", "arm",
+                                      "disarm", "force"])
+    m.add_argument("arg", nargs="?", default=None,
+                   help="path for load, node name for force")
     args = p.parse_args()
 
     if args.command == "drive":
@@ -79,6 +86,12 @@ def main():
         req = {"cmd": "push", "magnitude": args.magnitude}
         if args.angle_deg is not None:
             req["angle_deg"] = args.angle_deg
+    elif args.command == "machine":
+        req = {"cmd": "machine", "action": args.action}
+        if args.action == "load":
+            req["path"] = os.path.abspath(args.arg or "")
+        elif args.action == "force":
+            req["node"] = args.arg
     else:
         req = {"cmd": args.command}
 

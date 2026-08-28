@@ -94,6 +94,7 @@ the agent rarely needs a follow-up poll.
 | `duck_sequence(steps)` | Chain drive/stop/trick/look steps server-side — motion flows through transitions with no client round-trips (arcs, an approach, kick + celebration as one call) |
 | `duck_camera(view, distance)` | Rendered frame: `head` (the duck's own POV), `follow`, `front`, `side`, `top` |
 | `duck_push(magnitude, angle_deg)` | Shove the trunk; tests push recovery |
+| `duck_machine(action, ...)` | Load/arm/hot-reload a **behavior machine** — autonomy between the agent's decisions (see below) |
 | `duck_reset` | Back to origin, default stance (`destructive_hint` — it ends the episode) |
 
 ## Honest sensing (fake mediad)
@@ -107,6 +108,28 @@ service uses (`microduck` docs, architecture §2.4). Distance comes from the
 blob's solid angle (mean error ~6% out to 1.4 m); a ball behind the duck is
 honestly invisible, which makes *searching* for it a real behavior. Prefer
 `ball_seen` when you want sim work to transfer to hardware.
+
+## The behavior machine
+
+The agent doesn't have to drive every step. A **machine** — TOML source, see
+[`machines/soccer.toml`](machines/soccer.toml) — binds nodes to deterministic
+behaviors (`search_ball`, `approach_ball`, `kick`, `celebrate`, `idle`)
+executed at 50 Hz on the sim thread, with transitions guarded by expressions
+over the **sensed digest only**: `ball_seen.*`, `upright`, `elapsed_s`. The
+guard grammar is a strict whitelist (paths, literals, comparisons,
+`and/or/not` — validated at load, nothing else parses), and ground-truth ball
+position is *not in the vocabulary*: an armed machine plays fair by
+construction. Edit the file while it runs; `duck machine reload` hot-swaps it.
+Transitions stream into the AX page's command feed tagged `machine`.
+
+```bash
+uv run duck machine load machines/soccer.toml
+uv run duck machine arm     # duck finds the ball, lines up, kicks — alone
+```
+
+The design lineage: deterministic behaviors under guarded transitions, machine
+source in a git repo, hot-swapped live — a pattern borrowed from an MCP
+instrument built for playing *Ocarina of Time*, ported from Hyrule to a robot.
 
 ## AX debug page
 

@@ -66,6 +66,16 @@ class BallSeen(BaseModel):
         "positive bearing means turn with positive wz to face the ball.")
     elevation_deg: float | None = Field(
         description="Vertical angle off the optical axis, degrees, positive up")
+    ground_distance_m: float | None = Field(
+        default=None, description="Floor-plane range from the camera, meters "
+        "(slant range corrected by the camera's own height)")
+    est_forward_m: float | None = Field(
+        default=None, description="Estimated ball position in the TRUNK's yaw "
+        "frame, meters forward — camera ray + the robot's kinematics, the "
+        "sensed twin of ball_offset_m. Kick pocket: forward~0.09, left~-0.042")
+    est_left_m: float | None = Field(
+        default=None, description="Estimated ball position, trunk yaw frame, "
+        "meters to the left")
     age_s: float = Field(description="Sim seconds since the detector last ran "
                          "(it runs at ~5 Hz, so normally <=0.2)")
 
@@ -288,6 +298,43 @@ def duck_sequence(steps: list[SeqStep]) -> SequenceResult:
         _call({"cmd": "set_velocity", "vx": 0.0, "vy": 0.0, "wz": 0.0})
     return SequenceResult(steps_run=n, aborted=aborted,
                           state=DuckState(**_state_after(0.2)))
+
+
+class MachineStatus(BaseModel):
+    ok: bool
+    name: str | None = None
+    source: str | None = Field(default=None, description="Machine source file "
+                               "(edit it, then action='reload' to hot-swap)")
+    armed: bool | None = None
+    node: str | None = Field(default=None, description="Current node")
+    nodes: list[str] | None = None
+    note: str | None = None
+
+
+@mcp.tool(title="Behavior machine", annotations=_EPISODIC)
+def duck_machine(action: str, path: str | None = None,
+                 node: str | None = None) -> MachineStatus:
+    """Drive the duck's behavior machine — autonomy between your decisions.
+
+    A machine is TOML source (see machines/soccer.toml): nodes bind behaviors
+    (search_ball, approach_ball, kick, celebrate, idle) executed at 50 Hz on
+    the sim thread, with transitions guarded by expressions over the SENSED
+    digest only — ball_seen.* (camera-derived), upright, active_policy,
+    elapsed_s. Ground-truth ball position is not in the guard vocabulary:
+    an armed machine plays fair by construction.
+
+    Actions: 'load' (path, validates + loads disarmed), 'arm' (start at the
+    initial node), 'disarm' (stop, zero velocity), 'reload' (hot-swap edited
+    source; keeps armed state), 'force' (node, jump now), 'status'.
+    While armed the machine owns the velocity intent — duck_drive still works
+    but the machine will override it on its next tick. Transitions appear in
+    the event feed tagged 'machine'."""
+    req: dict[str, Any] = {"cmd": "machine", "action": action}
+    if path is not None:
+        req["path"] = path
+    if node is not None:
+        req["node"] = node
+    return MachineStatus(**_call(req))
 
 
 @mcp.tool(title="Reset the sim", annotations=_RESET)

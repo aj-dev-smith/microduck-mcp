@@ -1,0 +1,77 @@
+# soccer.toml — find the ball, line it up, kick it honestly, celebrate.
+#
+# The shipped example machine. Guards read ONLY the sensed digest
+# (ball_seen.* from the head camera, proprioception, machine time) — never
+# ground-truth ball position. Load + arm it:
+#
+#     duck machine load machines/soccer.toml
+#     duck machine arm
+#
+# Edit this file while it runs and `duck machine reload` hot-swaps it.
+
+[machine]
+name = "soccer"
+initial = "search"
+
+# Checked before any node's own transitions, every tick: the escape hatch.
+# There is no stand-up policy, so a fallen duck parks in `down` and waits
+# for the mind (or a human) to reset. `celebrate` is exempt — a roulade
+# passes through upright=false mid-roll by design.
+[[machine.transition]]
+when = "not upright and elapsed_s > 0.5 and node != 'celebrate'"
+to = "down"
+
+[[node]]
+name = "search"
+behavior = "search_ball"        # full-rate point turn; wz < 1.2 is a dead zone
+[node.params]
+wz = 1.5
+[[node.transition]]
+when = "ball_seen.visible and ball_seen.age_s < 0.4"
+to = "approach"
+
+[[node]]
+name = "approach"
+behavior = "approach_ball"      # the session-tested controller, 50 Hz
+[[node.transition]]
+# Ball lost for real (not just one stale tick between detections).
+when = "not ball_seen.visible and elapsed_s > 1.0"
+to = "search"
+[[node.transition]]
+# The kick pocket, in sensed TRUNK-frame estimates (camera ray + the robot's
+# own kinematics): right foot wants the ball ~9 cm ahead, ~4 cm right.
+# Tolerances match what connected in live MCP piloting.
+when = "ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.est_forward_m > 0.06 and ball_seen.est_forward_m < 0.13 and ball_seen.est_left_m > -0.085 and ball_seen.est_left_m < -0.015 and elapsed_s > 1.0"
+to = "kick"
+
+[[node]]
+name = "kick"
+behavior = "kick"               # stop, settle, one honest kick_right
+[node.params]
+foot = "right"
+stage_ball = false
+settle_s = 0.8
+[[node.transition]]
+# Settle drifted the ball out of the pocket? Line it up again, don't kick air.
+when = "elapsed_s > 0.6 and elapsed_s < 0.75 and ball_seen.visible and ball_seen.est_left_m > -0.01"
+to = "approach"
+[[node.transition]]
+when = "elapsed_s > 4.2"
+to = "celebrate"
+
+[[node]]
+name = "celebrate"
+behavior = "celebrate"          # the headstand (a roulade, honestly)
+[node.params]
+trick = "roulade"
+[[node.transition]]
+when = "elapsed_s > 3.5 and upright"
+to = "search"                   # stuck the landing: go again
+[[node.transition]]
+when = "elapsed_s > 3.5 and not upright"
+to = "down"                     # flubbed it: comedy, then wait for help
+
+[[node]]
+name = "down"
+behavior = "idle"
+# Terminal until the mind intervenes: no stand-up policy exists yet.

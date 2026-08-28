@@ -141,15 +141,21 @@ async function pollLog() {
 async function pollState() {
   try {
     const s = await (await fetch("/state")).json();
-    const vb = s.vel_body_mps || {};
+    const vb = s.vel_body_mps || {}, bs = s.ball_seen || {}, mc = s.machine;
+    const brg = Math.round(bs.bearing_deg || 0) || 0;  // +ve = turn left
     const stats = [
+      ["machine", mc ? mc.node + (mc.armed ? "" : " (disarmed)") : "&mdash;",
+       mc && mc.armed ? "good" : ""],
       ["policy", s.active_policy, ""],
       ["upright", s.upright ? "yes" : "DOWN", s.upright ? "good" : "bad"],
       ["sim time", (s.sim_time_s || 0).toFixed(1) + " s", ""],
       ["position", "(" + s.position_m.slice(0, 2).map(v => v.toFixed(2)) + ")", ""],
       ["fwd vel / cmd", (vb.forward ?? 0).toFixed(2) + " / " + s.vel_cmd[0].toFixed(2), ""],
-      ["ball", s.ball_position_m ?
+      ["ball (god)", s.ball_position_m ?
         "(" + s.ball_position_m.slice(0, 2).map(v => v.toFixed(2)) + ")" : "-", ""],
+      ["ball (seen)", bs.visible ?
+        (bs.distance_m ?? 0).toFixed(2) + " m @ " + (brg < 0 ? "" : "+") + brg + "&deg;"
+        : "not seen", bs.visible ? "good" : "bad"],
     ];
     document.getElementById("stats").innerHTML = stats.map(([k, v, c]) =>
       `<div class="stat"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join("");

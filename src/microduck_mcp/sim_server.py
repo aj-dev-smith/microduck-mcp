@@ -32,6 +32,8 @@ from collections import deque
 import mujoco
 import numpy as np
 
+from .machine import Machine, MachineError
+
 # Nm/A for the Dynamixel XL330 (BAM m6 model). Used for the firmware
 # current-limit -> torque clamp when the `bam` package is not installed.
 KT_XL330 = 0.3660
@@ -40,6 +42,9 @@ DEFAULT_CURRENT_LIMIT = 1.75  # A, XL330 firmware default
 CONTROL_HZ = 50
 DECIMATION = 4
 TIMESTEP = 0.005
+# How far the loop may fall behind its deadline before giving up on catching
+# up (a stall: a slow render, the machine sleeping) and resyncing to now.
+RESYNC_LAG_S = 0.5
 
 SCENES = {
     "ball": "src/mjlab_microduck/robot/microduck/scene_ball.xml",
@@ -101,8 +106,9 @@ def quat_to_rpy(q):
     return roll, pitch, yaw
 
 
-NOT_SEEN = {"visible": False, "distance_m": None, "bearing_deg": None,
-            "elevation_deg": None}
+NOT_SEEN = {"visible": False, "distance_m": None, "ground_distance_m": None,
+            "bearing_deg": None, "elevation_deg": None,
+            "est_forward_m": None, "est_left_m": None}
 
 
 def detect_ball_pixels(px, fovy_deg: float = HEAD_CAM_FOVY_DEG,
@@ -207,6 +213,7 @@ class DuckSim:
         self._det_step = 0
         self._ball_seen = dict(NOT_SEEN)
         self._ball_seen_t = 0.0
+        self.machine = None  # loaded behavior machine (machine.py), or None
         # Command-feed ring buffer for the AX debug page (webui.py).
         self.events = deque(maxlen=500)
         self._event_id = 0
@@ -262,8 +269,118 @@ class DuckSim:
             self._det_off = True
             print(f"note: head-camera detector disabled ({e})")
             return
-        self._ball_seen = detect_ball_pixels(px)
+        seen = detect_ball_pixels(px)
+        if seen["visible"]:
+            # Derived features a real robot could compute too: the camera pose
+            # comes from its own forward kinematics, the ray and range from the
+            # detection. Nothing here reads the ball's actual state.
+            cam_pos = self.data.cam_xpos[self._head_cam_id]
+            h = float(cam_pos[2]) - BALL_RADIUS_M
+            d = seen["distance_m"]
+            seen["ground_distance_m"] = round(math.sqrt(max(0.0, d * d - h * h)), 3)
+            # Camera-frame ray from bearing/elevation (inverting the detector's
+            # angles), through the camera pose, into the trunk's yaw frame —
+            # so guards and behaviors get the same {forward,left} vocabulary
+            # the kick pocket was measured in.
+            uc = -math.tan(math.radians(seen["bearing_deg"]))
+            vc = math.tan(math.radians(seen["elevation_deg"])) * math.sqrt(1 + uc * uc)
+            ray = np.array([uc, vc, -1.0])
+            ray /= np.linalg.norm(ray)
+            R = self.data.cam_xmat[self._head_cam_id].reshape(3, 3)
+            ball_w = np.asarray(cam_pos) + d * (R @ ray)
+            adr = self.qpos_adr
+            tp = self.data.qpos[adr:adr + 3]
+            _, _, yaw = quat_to_rpy(self.data.qpos[adr + 3:adr + 7])
+            dx, dy = float(ball_w[0] - tp[0]), float(ball_w[1] - tp[1])
+            c, s = math.cos(yaw), math.sin(yaw)
+            seen["est_forward_m"] = round(c * dx + s * dy, 3)
+            seen["est_left_m"] = round(-s * dx + c * dy, 3)
+        self._ball_seen = seen
         self._ball_seen_t = self.sim_time
+
+    # ---------- the behavior machine (sim thread only) ----------
+
+    def _machine_digest(self) -> dict:
+        """The guard vocabulary: sensed ball + proprioception + machine time.
+        Deliberately excludes ground-truth ball position — a machine cannot
+        act on knowledge the robot would not have."""
+        proj_g = self.policy.get_projected_gravity()
+        bs = self._ball_seen
+        return {
+            "ball_seen.visible": bs["visible"],
+            "ball_seen.distance_m": bs["distance_m"],
+            "ball_seen.ground_distance_m": bs.get("ground_distance_m"),
+            "ball_seen.bearing_deg": bs["bearing_deg"],
+            "ball_seen.elevation_deg": bs["elevation_deg"],
+            "ball_seen.est_forward_m": bs.get("est_forward_m"),
+            "ball_seen.est_left_m": bs.get("est_left_m"),
+            "ball_seen.age_s": round(self.sim_time - self._ball_seen_t, 3),
+            "upright": bool(proj_g[2] < -0.7),
+            "sitting": bool(self.policy.sit_mode),
+            "active_policy": self.policy.current_policy,
+            "behavior": self.policy.behavior_mode,
+            "sim_time_s": self.sim_time,
+            "node": self.machine.current if self.machine else None,
+        }
+
+    def machine_tick(self):
+        if self.machine is None or not self.machine.armed:
+            return
+        fired = self.machine.tick(self, self._machine_digest())
+        if fired:
+            self._event_id += 1
+            self.events.append({
+                "id": self._event_id, "t": time.time(), "client": "machine",
+                "cmd": f"-> {fired['to']}",
+                "args": {"from": fired["from"], "when": fired["when"]},
+                "ok": True, "note": "",
+            })
+            print(f"machine: {fired['from']} -> {fired['to']}  [{fired['when']}]")
+
+    def _handle_machine(self, req: dict) -> dict:
+        action = req.get("action", "status")
+        m = self.machine
+        if action == "load":
+            path = req.get("path")
+            if not path:
+                return {"ok": False, "error": "load needs a path"}
+            try:
+                self.machine = Machine.load(path)
+            except (MachineError, OSError) as e:
+                return {"ok": False, "error": f"machine rejected: {e}"}
+            return {"ok": True, **self.machine.status(),
+                    "note": "loaded, disarmed — arm to run"}
+        if m is None:
+            return {"ok": False, "error": "no machine loaded (action=load first)"}
+        if action == "reload":
+            try:
+                fresh = Machine.load(m.source_path)
+            except (MachineError, OSError) as e:
+                return {"ok": False, "error": f"reload rejected, old machine "
+                        f"kept: {e}"}
+            fresh.armed = m.armed
+            fresh.enter(fresh.initial if m.current not in fresh.nodes
+                        else m.current, self.sim_time)
+            self.machine = fresh
+            return {"ok": True, **fresh.status(), "note": "hot-swapped"}
+        if action == "arm":
+            m.enter(m.initial, self.sim_time)
+            m.armed = True
+            return {"ok": True, **m.status()}
+        if action == "disarm":
+            m.armed = False
+            self.policy.set_vel_cmd(0.0, 0.0, 0.0)
+            return {"ok": True, **m.status()}
+        if action == "force":
+            node = req.get("node")
+            if node not in m.nodes:
+                return {"ok": False, "error": f"unknown node {node!r} "
+                        f"(have: {', '.join(sorted(m.nodes))})"}
+            m.enter(node, self.sim_time)
+            return {"ok": True, **m.status()}
+        if action == "status":
+            return {"ok": True, **m.status()}
+        return {"ok": False, "error": f"unknown machine action {action!r}"}
 
     # ---------- state ----------
 
@@ -295,6 +412,9 @@ class DuckSim:
             # camera actually saw, as the real robot's mediad would report it.
             "ball_seen": {**self._ball_seen,
                           "age_s": round(self.sim_time - self._ball_seen_t, 3)},
+            "machine": ({"name": self.machine.name, "armed": self.machine.armed,
+                         "node": self.machine.current}
+                        if self.machine is not None else None),
         }
         if p.ball_qpos_adr is not None:
             b = self.data.qpos[p.ball_qpos_adr:p.ball_qpos_adr + 3]
@@ -343,6 +463,8 @@ class DuckSim:
             return self._handle_camera(req, live=True)
         if cmd == "reset":
             return self._handle_reset()
+        if cmd == "machine":
+            return self._handle_machine(req)
         return {"ok": False, "error": f"unknown cmd {cmd!r}"}
 
     def _handle_trick(self, name: str, stage_ball: bool = True) -> dict:
@@ -532,11 +654,12 @@ def serve_socket(sim: DuckSim, sock_path: str, stop: threading.Event):
 
 def run_loop(sim: DuckSim, viewer=None, realtime: bool = True, stop: threading.Event = None):
     control_dt = DECIMATION * TIMESTEP
-    prev = time.time()
+    prev = time.perf_counter()
+    deadline = prev + control_dt
     print(f"Sim loop running at {CONTROL_HZ} Hz "
           f"({'realtime' if realtime else 'fast'}, {'viewer' if viewer else 'headless'})")
     while not (stop and stop.is_set()):
-        t0 = time.time()
+        t0 = time.perf_counter()
         if viewer is not None and not viewer.is_running():
             break
         sim.drain_requests()
@@ -550,12 +673,19 @@ def run_loop(sim: DuckSim, viewer=None, realtime: bool = True, stop: threading.E
             mujoco.mj_step(sim.model, sim.data)
         sim.sim_time += control_dt
         sim.sense()
+        sim.machine_tick()
         if viewer is not None:
             viewer.sync()
         if realtime:
-            sleep = control_dt - (time.time() - t0)
-            if sleep > 0:
-                time.sleep(sleep)
+            # Absolute deadlines, not per-tick relative sleeps: sleep(x) on
+            # macOS routinely overshoots by a millisecond or two, and relative
+            # pacing bakes every overshoot into the schedule (~0.85x realtime).
+            now = time.perf_counter()
+            if now - deadline > RESYNC_LAG_S:
+                deadline = now  # stalled — resync rather than sprint to catch up
+            else:
+                time.sleep(max(0.0, deadline - now))
+            deadline += control_dt
 
 
 def main():
