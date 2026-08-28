@@ -12,6 +12,10 @@ Library (`request()`) plus a small CLI:
     duck reset
     duck machine load machines/soccer.toml
     duck machine arm | disarm | status | reload | force <node>
+    duck film -o match.mp4
+
+Every subcommand but `film` is a one-shot intent over the socket; `film` runs
+its own headless sim and writes an mp4 (see film.py).
 """
 
 import argparse
@@ -69,7 +73,15 @@ def main():
                                       "disarm", "force"])
     m.add_argument("arg", nargs="?", default=None,
                    help="path for load, node name for force")
+    # `film` is the one subcommand that is not a socket intent — it boots its
+    # own headless sim — so its flags live next to the shoot, in film.py.
+    from . import film
+    film.add_arguments(sub.add_parser("film",
+                                      help="film an autonomous match to an mp4"))
     args = p.parse_args()
+
+    if args.command == "film":
+        sys.exit(film.run(args))
 
     if args.command == "drive":
         req = {"cmd": "set_velocity", "vx": args.vx, "vy": args.vy, "wz": args.wz}

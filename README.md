@@ -160,6 +160,40 @@ The design lineage: deterministic behaviors under guarded transitions, machine
 source in a git repo, hot-swapped live — a pattern borrowed from an MCP
 instrument built for playing *Ocarina of Time*, ported from Hyrule to a robot.
 
+## Filming a match
+
+`duck film` shoots an autonomous match and cuts it to an mp4:
+
+```bash
+uv run duck film                       # -> ./duck_match.mp4
+uv run duck film -o goal.mp4 --takes 3 --select goal
+```
+
+Every frame carries the four things worth showing at once: a broadcast camera
+tracking duck and ball (it swings west for the celebration so the goal frame
+stops blocking the shot), the **duck cam** picture-in-picture — the same 70°
+head-camera view the detectors run on — a **sensed-state HUD** reading
+`ball_seen.*` and `goal_seen.est_*` straight out of the machine digest, and a
+**control-surface feed** of the real events: the MCP calls that armed the
+machine, each transition, and the **guard expression that fired it**. What the
+duck knows and why it just did that, on screen, frame by frame.
+
+It runs cold-start takes from known-good spawns and keeps the first that
+scored *and* landed the celebration (`--select goal` accepts any goal); takes
+that never score are discarded, and the goal moment cold-opens the cut so it
+becomes the timeline thumbnail. `--keep-takes` keeps the rushes,
+`--cap-seconds` bounds a take, `--machine` films a machine other than
+`striker.toml`.
+
+Two things to know. **ffmpeg** must be on `PATH` (`brew install ffmpeg`, or
+`--ffmpeg /path/to/it`) — frames are piped into it raw, and it is deliberately
+not a Python dependency; the check runs before the model loads, so a missing
+encoder costs a second rather than a shoot. And unlike every other
+subcommand, `film` does **not** talk to a running `duck-sim`: filming wants raw
+frame buffers, per-take resets and chosen spawns, none of which are socket
+intents, so it boots its own headless sim (`--rl-repo`/`--policies`, same
+defaults as `duck-sim`) and leaves any sim you have running alone.
+
 ## AX debug page
 
 `duck-sim` also serves an **Agent Experience debug page** at
