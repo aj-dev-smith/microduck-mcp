@@ -396,6 +396,9 @@ class MachineStatus(BaseModel):
     nodes: list[str] | None = None
     wake_nodes: list[str] | None = Field(default=None, description="Nodes that "
                                          "park a wake pack on entry")
+    say_nodes: list[str] | None = Field(default=None, description="Nodes that "
+                                        "speak a line on entry (say = \"...\" "
+                                        "in the machine source)")
     note: str | None = None
     wake: dict[str, Any] | None = Field(default=None, description="The wake "
         "pack (action='wait' or a blocking arm/force): reason, node, the "
