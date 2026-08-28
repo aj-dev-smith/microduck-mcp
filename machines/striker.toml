@@ -30,6 +30,15 @@ initial = "search"
 when = "not upright and elapsed_s > 0.5 and node != 'celebrate'"
 to = "down"
 
+# A goal counts whenever the referee calls it, not just while watching: a slow
+# roller can cross the line long after the watch window closes (match #1 scored
+# at t=12.7s while the duck was back in `search`, spinning, and nobody
+# celebrated). Exempt: celebrate/won (already done) and down (no headstands
+# from the floor).
+[[machine.transition]]
+when = "goal.scored and node != 'celebrate' and node != 'won' and node != 'down'"
+to = "celebrate"
+
 [[node]]
 name = "search"
 behavior = "search_ball"        # full-rate point turn; wz < 1.2 is a dead zone
