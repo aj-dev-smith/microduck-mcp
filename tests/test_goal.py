@@ -16,8 +16,9 @@ import numpy as np
 from microduck_mcp.machine import GUARD_PATHS
 from microduck_mcp.sim_server import (BALL_RADIUS_M, GOAL_GEOM_NAMES,
                                       GOAL_HALF_WIDTH_Y, GOAL_HEIGHT_Z,
-                                      GOAL_LINE_X, DuckSim, GoalReferee,
-                                      ball_in_goal, find_goal_geom)
+                                      GOAL_LINE_X, GOAL_NOT_SEEN, DuckSim,
+                                      GoalReferee, ball_in_goal,
+                                      find_goal_geom)
 
 IN = GOAL_LINE_X + BALL_RADIUS_M + 0.02  # comfortably over the line
 
@@ -150,7 +151,12 @@ class _StubSim:
         self._ball_seen = {"visible": False, "distance_m": None,
                            "bearing_deg": None, "elevation_deg": None}
         self._ball_seen_t = 0.0
+        self._goal_seen = dict(GOAL_NOT_SEEN)
+        self._goal_seen_t = 0.0
         self.machine = None
+
+    def _goal_estimates(self):
+        return None, None  # goal never sighted
 
 
 class RefereeTick(unittest.TestCase):

@@ -1,10 +1,21 @@
-# striker.toml — soccer.toml, but playing for the scoreboard.
+# striker.toml — soccer.toml, but playing for the scoreboard. AND AIMING.
 #
-# Same hunt (search -> approach -> honest kick, with the calibrations from
-# soccer.toml verbatim), different ending: the kick is not the achievement,
-# the goal is. After the swing the duck stands and WATCHES; it celebrates only
-# if the referee says the ball crossed the line, and chases the rebound if it
-# did not.
+# Same calibrated hunt as soccer.toml (momentum-gated pocket, ball-speed
+# guards, backoff retry loop), plus the two things a striker needs:
+#
+#   * approach_ball runs with aim = true: before attacking the pocket it
+#     walks a detour to the far side of the ball, onto the BALL->GOAL line
+#     of fire, using goal_seen.est_* — the dead-reckoned memory of the white
+#     goal frame its own camera picked out of the horizon band. The trunk
+#     lines up ~35 deg LEFT of the fire line because a deep-pocket kick_right
+#     sends the ball ~35 deg right of the trunk (measured).
+#   * the kick pocket only fires with the remembered goal inside the kick's
+#     cone: est_bearing_deg in (-49, -21), i.e. the goal sits where the ball
+#     is about to go. Null (goal never yet seen) blocks the kick, correctly.
+#
+# The kick is not the achievement, the goal is: after the swing the duck
+# stands and WATCHES; it celebrates only if the referee says the ball crossed
+# the line, and chases the rebound if it did not.
 #
 # Needs the pitch scene, which is where the goal lives:
 #
@@ -13,10 +24,8 @@
 #     duck machine arm
 #
 # goal.scored/goal.count come from the referee (a goal-line sensor, world
-# infrastructure), not from the robot's eyes — the ball_seen.* guards are
-# still the only thing steering the duck. On a goal-less scene goal.scored is
-# always false, so this machine kicks and chases forever and never celebrates:
-# run it on `pitch`.
+# infrastructure), not from the robot's eyes — the robot's own steering runs
+# entirely on ball_seen.* and goal_seen.*.
 
 [machine]
 name = "striker"
@@ -31,10 +40,8 @@ when = "not upright and elapsed_s > 0.5 and node != 'celebrate'"
 to = "down"
 
 # A goal counts whenever the referee calls it, not just while watching: a slow
-# roller can cross the line long after the watch window closes (match #1 scored
-# at t=12.7s while the duck was back in `search`, spinning, and nobody
-# celebrated). Exempt: celebrate/won (already done) and down (no headstands
-# from the floor).
+# roller can cross the line long after the watch window closes. Exempt:
+# celebrate/won (already done) and down (no headstands from the floor).
 [[machine.transition]]
 when = "goal.scored and node != 'celebrate' and node != 'won' and node != 'down'"
 to = "celebrate"
@@ -42,24 +49,58 @@ to = "celebrate"
 [[node]]
 name = "search"
 behavior = "search_ball"        # full-rate point turn; wz < 1.2 is a dead zone
-[node.params]
-wz = 1.5
-[[node.transition]]
+[node.params]                   # — and the spin doubles as a goal survey: the
+wz = 1.5                        # level camera refreshes goal_seen.est_* on the
+[[node.transition]]             # way to finding the ball.
 when = "ball_seen.visible and ball_seen.age_s < 0.4"
 to = "approach"
 
 [[node]]
 name = "approach"
 behavior = "approach_ball"      # the session-tested controller, 50 Hz
+[node.params]
+aim = true                      # detour onto the line of fire before attacking
+kick_skew_deg = -35.0           # measured: settled kick_right, deep pocket
+aim_tol_deg = 14.0
+standoff_m = 0.45
+pocket_left_m = -0.068          # attack line passes 6.8 cm left of the ball:
+                                # it arrives with the ball in the deep pocket
+# The striker wants the DEEP pocket only: e2e-measured connects — a kick
+# from est_left -0.071 flew ~1 m and scored in 2 s, while -0.057 and
+# -0.047 were sub-0.2 m duds. The fine-range servo and the entry guard
+# below both use the deep window.
+pocket_left_max = -0.056
+pocket_left_min = -0.082
 [[node.transition]]
-# Ball lost for real (not just one stale tick between detections).
-when = "not ball_seen.visible and elapsed_s > 1.0"
+# Ball lost for real: UNSEEN for 6.5 s straight (age_s is time since the
+# last sighting). One blind detector tick mid-maneuver is a blink — the
+# behavior holds course through it — and the far-side aiming detour
+# deliberately walks the ball out of frame for several seconds while the
+# cached standoff target carries the maneuver on dead reckoning.
+when = "not ball_seen.visible and ball_seen.age_s > 6.5 and elapsed_s > 1.0"
 to = "search"
 [[node.transition]]
-# The kick pocket, in sensed TRUNK-frame estimates (camera ray + the robot's
-# own kinematics): right foot wants the ball ~9 cm ahead, ~4 cm right.
-# Tolerances match what connected in live MCP piloting.
-when = "ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.est_forward_m > 0.06 and ball_seen.est_forward_m < 0.13 and ball_seen.est_left_m > -0.085 and ball_seen.est_left_m < -0.015 and elapsed_s > 1.0"
+# Dead-band escape: 20 s into the node and (still, or again) near the ball
+# without a kick: parked too close to rebuild momentum. Generous on purpose
+# — a healthy walk across the pitch takes 15+ s (real speed ~0.11 m/s) and
+# arrives near the ball late; only a genuine stall should back off.
+when = "elapsed_s > 20.0 and ball_seen.est_forward_m < 0.40"
+to = "backoff"
+[[node.transition]]
+# Stop-loss for everything else (orbiting at range, a goal estimate gone
+# stale and wrong): back out and rebuild the whole run.
+when = "elapsed_s > 35.0"
+to = "backoff"
+[[node.transition]]
+# The kick pocket, as calibrated in soccer.toml (momentum-gated forward
+# window) but DEEP-left only, a stricter ball-speed ceiling (0.15, not
+# 0.25 — the line-following attack walks close enough to nudge the ball,
+# and a freshly-nudged 0.2 m/s ball escapes the pocket during the settle),
+# PLUS the aim window: the remembered goal must sit in the kick's cone,
+# ~35 deg right of the trunk, where kick_right actually sends the ball.
+# Null est_bearing (goal never sighted yet) blocks, correctly — no blind
+# kicks on the pitch.
+when = "ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.est_forward_m > 0.100 and ball_seen.est_forward_m < 0.125 and ball_seen.est_left_m > -0.086 and ball_seen.est_left_m < -0.052 and ball_seen.speed_mps < 0.10 and goal_seen.est_bearing_deg > -49 and goal_seen.est_bearing_deg < -21 and elapsed_s > 2.0"
 to = "kick"
 
 [[node]]
@@ -70,35 +111,47 @@ foot = "right"
 stage_ball = false
 settle_s = 0.8
 [[node.transition]]
-# Settle drifted the ball out of the pocket? Line it up again, don't kick air.
-when = "elapsed_s > 0.6 and elapsed_s < 0.75 and ball_seen.visible and ball_seen.est_left_m > -0.01"
-to = "approach"
+# Post-settle sanity check (see soccer.toml): only reject CLEARLY bad
+# stances — the duck is stopped, the camera static, so a rolling ball
+# (speed > 0.08) reads clean here.
+when = "elapsed_s > 0.6 and elapsed_s < 0.75 and ball_seen.visible and (ball_seen.est_forward_m > 0.135 or ball_seen.est_forward_m < 0.050 or ball_seen.est_left_m > -0.012 or ball_seen.est_left_m < -0.10 or ball_seen.speed_mps > 0.08)"
+to = "backoff"
 [[node.transition]]
-# Swing done. soccer.toml celebrates here; a striker waits to be told.
-when = "elapsed_s > 4.2"
+# Swing done and the ball is STILL at the feet: a whiff. Back off, go again.
+when = "elapsed_s > 3.9 and ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.est_forward_m < 0.3"
+to = "backoff"
+[[node.transition]]
+# Ball is away. soccer.toml celebrates here; a striker waits to be told.
+when = "elapsed_s > 4.4"
 to = "watch"
 
 [[node]]
 name = "watch"
-behavior = "idle"               # stand still, head back to level: the ball is
-                                # rolling away, and the approach tilt aims the
-                                # camera at the duck's own feet.
+behavior = "idle"               # stand still, head back to level: watch it
+                                # roll — and re-survey the goal while at it.
 [[node.transition]]
-# The referee. `goal.scored` is the latch (true while the ball is in the net),
-# not the counter: `goal.count > 0` would stay true for the rest of the match
-# and re-fire on every later kick.
+# The referee. `goal.scored` is the latch (true while the ball is in the
+# net), not the counter — `goal.count > 0` would re-fire forever.
 when = "goal.scored"
 to = "celebrate"
 [[node.transition]]
-# No goal in three seconds — a slow roll has had time to cross by now, so it
-# missed, fell short, or hit the frame. Ball still in sight: go again from
-# wherever it stopped.
+# No goal in three seconds: it missed, fell short, or rattled the frame.
+# Ball still in sight — chase the rebound from wherever it stopped.
 when = "elapsed_s > 3.0 and ball_seen.visible and ball_seen.age_s < 0.4"
 to = "approach"
 [[node.transition]]
 # Rebound went somewhere the head camera cannot see it: turn and hunt.
 when = "elapsed_s > 3.0"
 to = "search"
+
+[[node]]
+name = "backoff"
+behavior = "drive"              # walk backward: the gait needs distance to
+[node.params]                   # rebuild momentum — creep from a standstill
+vx = -0.3                       # moves millimeters, and the pocket guard
+[[node.transition]]             # only accepts a duck arriving at speed.
+when = "elapsed_s > 4.0"
+to = "approach"
 
 [[node]]
 name = "celebrate"
@@ -115,11 +168,10 @@ to = "down"                     # flubbed it: comedy, then wait for help
 [[node]]
 name = "won"
 behavior = "idle"
-# The ball is IN the goal and `goal.scored` stays latched while it sits there,
-# so soccer.toml's "go again" would march the duck through the mouth after it.
-# Park instead, and let the scoreboard say when there is a match to play: the
+# The ball is IN the goal and `goal.scored` stays latched while it sits
+# there. Park, and let the scoreboard say when there is a match to play: the
 # referee re-arms once the ball is back out in front of the line, which is
-# exactly what a reset (or a hand putting the ball back) does.
+# what a reset (or a hand putting the ball back) does.
 [[node.transition]]
 when = "not goal.scored"
 to = "search"

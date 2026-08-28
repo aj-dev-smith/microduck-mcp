@@ -83,8 +83,39 @@ class BallSeen(BaseModel):
         "until the ball has been tracked for ~0.25 s. Noisy while walking "
         "(the camera bias breathes with the gait); a parked ball reads "
         "near 0, a freshly kicked one ~1 m/s.")
-    age_s: float = Field(description="Sim seconds since the detector last ran "
-                         "(it runs at ~5 Hz, so normally <=0.2)")
+    age_s: float = Field(description="Sim seconds since the ball was last "
+                         "SEEN (the detector runs at ~5 Hz, so <=0.2 while "
+                         "in view; grows while the ball is out of frame)")
+
+
+class GoalSeen(BaseModel):
+    """What the head camera saw of the GOAL (pitch scene only) — fake mediad
+    part 2. The white goal frame is picked out of the same 5 Hz head-camera
+    render as the ball, separated from the equally-white pitch lines and
+    clouds by ray elevation computed from the robot's own kinematics: only
+    the crossbar band lives just under the horizon. The est_* fields are
+    dead-reckoned from the last sighting via own odometry — the goal is
+    world-fixed, so they stay live while the head is tilted down at the ball
+    (which points the camera at the grass and hides the goal entirely).
+    """
+
+    visible: bool = Field(description="True if the goal frame was in the last frame")
+    bearing_deg: float | None = Field(
+        description="Horizontal angle to the goal-mouth centre, degrees,"
+        " positive to the duck's left (trunk yaw frame; robust to head pitch)")
+    width_deg: float | None = Field(
+        description="Angular width of the detected frame, degrees")
+    distance_m: float | None = Field(
+        description="Range to the mouth from its angular width, meters —"
+        " coarse (±30%); null on partial views (goal clipped by frame edge)")
+    age_s: float = Field(description="Sim seconds since the goal was last seen")
+    est_bearing_deg: float | None = Field(
+        default=None, description="Dead-reckoned bearing to the remembered "
+        "goal, trunk yaw frame — live every tick once the goal has been "
+        "sighted, even with the goal out of frame. Null until first sighted.")
+    est_distance_m: float | None = Field(
+        default=None, description="Dead-reckoned range to the remembered "
+        "goal, meters; null until a ranged sighting has happened.")
 
 
 class DuckState(BaseModel):
@@ -112,6 +143,9 @@ class DuckState(BaseModel):
         default=None, description="Camera-derived ball sighting — the sensed "
         "view. Prefer it over ball_position_m when you want the robot to act "
         "on what it can actually perceive.")
+    goal_seen: GoalSeen | None = Field(
+        default=None, description="Camera-derived goal sighting (pitch scene "
+        "only) — how the duck aims. Absent on scenes without a goal.")
     ball_position_m: list[float] | None = Field(
         default=None, description="Ball world position [x, y, z], meters (ball scene only)")
     ball_offset_m: dict[str, float] | None = Field(
@@ -326,9 +360,12 @@ def duck_machine(action: str, path: str | None = None,
     A machine is TOML source (see machines/soccer.toml): nodes bind behaviors
     (search_ball, approach_ball, kick, celebrate, idle) executed at 50 Hz on
     the sim thread, with transitions guarded by expressions over the SENSED
-    digest only — ball_seen.* (camera-derived), upright, active_policy,
-    elapsed_s. Ground-truth ball position is not in the guard vocabulary:
-    an armed machine plays fair by construction.
+    digest only — ball_seen.* and goal_seen.* (camera-derived), upright,
+    active_policy, elapsed_s, plus the referee's goal.scored/goal.count.
+    Ground-truth ball position is not in the guard vocabulary: an armed
+    machine plays fair by construction. machines/striker.toml is the aiming
+    variant: approach_ball with aim=true walks onto the ball->goal line of
+    fire before kicking, steered by goal_seen's dead-reckoned bearing.
 
     Actions: 'load' (path, validates + loads disarmed), 'arm' (start at the
     initial node), 'disarm' (stop, zero velocity), 'reload' (hot-swap edited

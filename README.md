@@ -113,6 +113,19 @@ parked ball reads ~0 even mid-stride while a kicked one reads ~1 m/s, which
 is how a machine can decline to kick a rolling ball. Prefer
 `ball_seen` when you want sim work to transfer to hardware.
 
+On the pitch scene the same 5 Hz frame also feeds a **goal detector**
+(`goal_seen`): the white goal frame is separated from the equally-white
+pitch lines and clouds purely by ray elevation computed from the robot's own
+kinematics — sky can only exist above the true horizon, painted lines on
+the ground sit well below it anywhere on the pitch, and the crossbar (hung
+at almost exactly camera height) lives in the narrow band between. Grazing
+far-off lines that do reach the band arrive one pixel per image column;
+posts stack several, and a dense-column filter drops the difference. Range
+comes from the mouth's angular width. Because the goal never moves, a
+sighting plus own odometry keeps `est_bearing_deg`/`est_distance_m` alive
+while the head is tilted down at the ball — which is how the duck can aim a
+kick at a goal it currently cannot see.
+
 ## The behavior machine
 
 The agent doesn't have to drive every step. A **machine** — TOML source, see
@@ -131,6 +144,17 @@ Transitions stream into the AX page's command feed tagged `machine`.
 uv run duck machine load machines/soccer.toml
 uv run duck machine arm     # duck finds the ball, lines up, kicks — alone
 ```
+
+[`machines/striker.toml`](machines/striker.toml) is the match-play variant
+for the pitch scene: `approach_ball` runs with `aim = true`, so before
+attacking the ball the duck walks a detour onto the **ball→goal line of
+fire** (steered by `goal_seen`'s dead-reckoned bearing, trunk offset ~35°
+left of the line because that is where `kick_right` actually sends the
+ball), kicks only with the remembered goal inside the kick's cone, then
+stands and watches — it celebrates only when the referee calls the goal,
+and chases the rebound when it doesn't. On the pitch the ball kicks off a
+metre from the goal line, where the mouth subtends ±11° and aiming is the
+difference between scoring and a throw-in.
 
 The design lineage: deterministic behaviors under guarded transitions, machine
 source in a git repo, hot-swapped live — a pattern borrowed from an MCP

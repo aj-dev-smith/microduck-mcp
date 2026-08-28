@@ -99,6 +99,26 @@ DET_MIN_PX = 6
 DET_SPEED_WINDOW_S = 0.6   # baseline for the ball-speed estimate
 DET_SPEED_MIN_DT_S = 0.25  # publish null speed until the track spans this
 
+# Goal detector (fake mediad, part 2): the goal frame is white — but so are
+# the painted pitch lines and the clouds. What tells them apart is WORLD-RAY
+# ELEVATION from the robot's own kinematics: sky can only exist above the
+# true horizon (the floor plane is infinite), painted lines on the ground sit
+# below -5.5 deg anywhere on the pitch, and the crossbar — hung at almost
+# exactly camera height — lives in the narrow band between. The ceiling is
+# -0.5 (not 0) because past MuJoCo's 50 m far clip the ground is not drawn
+# and a 1-px sliver of sky leaks below the geometric horizon. Grazing-angle
+# line pixels that do reach the band arrive 1 px per image column; posts
+# stack several, hence the dense-column filter.
+GOAL_DET_MIN_PX = 8
+GOAL_ELEV_LO_DEG = -5.5
+GOAL_ELEV_HI_DEG = -0.5
+GOAL_MOUTH_OUTER_W = 0.432  # outer post faces, m -> range from angular width
+
+# Kickoff spot on the pitch scene: NOT the scene's penalty spot (0.30 m from
+# the line, where the mouth subtends ±34 deg and scoring is luck-proof). A
+# metre out the mouth is ±11 deg and the duck has to actually aim.
+PITCH_BALL_SPAWN = (-0.40, 0.0)
+
 
 def load_infer_policy_module(rl_repo: str):
     """Import microduck_rl's scripts/infer_policy.py as a module."""
@@ -126,6 +146,9 @@ def quat_to_rpy(q):
 NOT_SEEN = {"visible": False, "distance_m": None, "ground_distance_m": None,
             "bearing_deg": None, "elevation_deg": None,
             "est_forward_m": None, "est_left_m": None, "speed_mps": None}
+
+GOAL_NOT_SEEN = {"visible": False, "bearing_deg": None, "width_deg": None,
+                 "distance_m": None}
 
 
 def detect_ball_pixels(px, fovy_deg: float = HEAD_CAM_FOVY_DEG,
@@ -161,6 +184,61 @@ def detect_ball_pixels(px, fovy_deg: float = HEAD_CAM_FOVY_DEG,
         "bearing_deg": round(-math.degrees(math.atan(uc)), 3),
         "elevation_deg": round(math.degrees(math.atan(vc / math.sqrt(1 + uc * uc))), 3),
     }
+
+
+def detect_goal_pixels(px, cam_rot, fovy_deg: float = HEAD_CAM_FOVY_DEG) -> dict:
+    """Find the white goal frame in an RGB frame -> visible/bearing/width/range.
+
+    Pixels + pinhole geometry + the camera's own pose (forward kinematics) —
+    nothing reads the scene. White mask, then the elevation band that only the
+    goal frame occupies (see GOAL_ELEV_* above), then the dense-column filter
+    that rejects grazing-angle painted lines. Bearing is the horizontal WORLD
+    azimuth of the blob centroid returned relative to the camera's yaw — i.e.
+    robust to the head being pitched. Range comes from the angular width of
+    the mouth when both edges are inside the frame; a partial view (goal
+    half out of frame) publishes bearing but null distance.
+    """
+    h, w = px.shape[:2]
+    f = px.astype(np.int16)
+    r, g, b = f[:, :, 0], f[:, :, 1], f[:, :, 2]
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    white = (mn > 150) & (mx - mn < 35)
+    ys, xs = np.nonzero(white)
+    if len(xs) < GOAL_DET_MIN_PX:
+        return dict(GOAL_NOT_SEEN)
+    fl = (h / 2) / math.tan(math.radians(fovy_deg) / 2)
+    u = (xs + 0.5 - w / 2) / fl
+    v = (h / 2 - ys - 0.5) / fl
+    d = np.stack([u, v, -np.ones_like(u)], axis=1)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    wd = d @ np.asarray(cam_rot).reshape(3, 3).T  # rays in world frame
+    elev = np.degrees(np.arcsin(np.clip(wd[:, 2], -1.0, 1.0)))
+    band = (elev > GOAL_ELEV_LO_DEG) & (elev < GOAL_ELEV_HI_DEG)
+    if int(band.sum()) < GOAL_DET_MIN_PX:
+        return dict(GOAL_NOT_SEEN)
+    xb = xs[band]
+    cols = np.bincount(xb, minlength=w)
+    dense = cols[xb] >= 2
+    if int(dense.sum()) < GOAL_DET_MIN_PX:
+        return dict(GOAL_NOT_SEEN)
+    uk, xk, wk = u[band][dense], xb[dense], wd[band][dense]
+    # centroid azimuth in the world's horizontal plane, then back to a
+    # camera-yaw-relative bearing (positive left, like ball bearing)
+    mean_dir = wk.mean(axis=0)
+    az_w = math.atan2(mean_dir[1], mean_dir[0])
+    fwd_w = np.asarray(cam_rot).reshape(3, 3) @ np.array([0.0, 0.0, -1.0])
+    cam_az = math.atan2(fwd_w[1], fwd_w[0])
+    bearing = math.degrees((az_w - cam_az + math.pi) % (2 * math.pi) - math.pi)
+    span = math.degrees(math.atan(float(uk.max())) - math.atan(float(uk.min())))
+    dist = None
+    if xk.min() > 2 and xk.max() < w - 3 and span > 2.0:
+        est = (GOAL_MOUTH_OUTER_W / 2) / math.tan(math.radians(span) / 2)
+        if 0.2 < est < 4.5:  # the pitch is 3.2 m long; junk reads 15 m
+            dist = round(est, 3)
+    return {"visible": True, "bearing_deg": round(bearing, 3),
+            "width_deg": round(span, 3), "distance_m": dist,
+            "_azimuth_w_rad": az_w}
 
 
 # ---------- the referee (goal scoring) ----------
@@ -298,6 +376,11 @@ class DuckSim:
         self.data.qpos[self.qpos_adr + 3:self.qpos_adr + 7] = [1, 0, 0, 0]
         for i, qi in enumerate(self.policy.joint_qpos_indices):
             self.data.qpos[qi] = self.policy.default_pose[i]
+        if scene == "pitch" and self.policy.ball_qpos_adr is not None:
+            # Kickoff from a metre out, not the scene's point-blank penalty
+            # spot — snapshot before _qpos0 so reset restarts the match here.
+            ba = self.policy.ball_qpos_adr
+            self.data.qpos[ba:ba + 2] = PITCH_BALL_SPAWN
         self.data.ctrl[:] = self.policy.default_pose
         mujoco.mj_forward(self.model, self.data)
         self._qpos0 = self.data.qpos.copy()
@@ -312,6 +395,14 @@ class DuckSim:
         self._ball_seen = dict(NOT_SEEN)
         self._ball_seen_t = 0.0
         self._ball_track = deque()  # (t, x, y) world estimates -> speed_mps
+        self._goal_seen = dict(GOAL_NOT_SEEN)
+        self._goal_seen_t = 0.0
+        # Dead-reckoned goal memory: the goal is world-fixed, so a sighting
+        # plus own odometry keeps an estimate alive while the head is down
+        # tracking the ball. _goal_fix is a world (x, y) position (needs a
+        # ranged sighting); _goal_azimuth_w a bearing-only memory.
+        self._goal_fix = None
+        self._goal_azimuth_w = None
         self.machine = None  # loaded behavior machine (machine.py), or None
         # Scoring only exists where a goal does: no goal geom (or no ball) and
         # the referee stays None, so state/digest look exactly as they did.
@@ -427,7 +518,57 @@ class DuckSim:
                     math.hypot(float(ball_w[0]) - x0, float(ball_w[1]) - y0)
                     / (self.sim_time - t0), 3)
         self._ball_seen = seen
-        self._ball_seen_t = self.sim_time
+        if seen["visible"]:
+            # age_s = time since last SIGHTING (matches goal_seen.age_s): it
+            # lets a guard say "unseen for 2 s" — one blind tick mid-maneuver
+            # is a blink, two seconds is a lost ball.
+            self._ball_seen_t = self.sim_time
+        self._detect_goal(px)
+
+    def _detect_goal(self, px):
+        """Goal sighting from the SAME frame the ball detector rendered.
+
+        Only on scenes with a goal (a mediad configured for the pitch knows
+        the pitch has one). On a sighting, refresh the dead-reckoned memory:
+        world azimuth always, world position when the sighting was ranged.
+        """
+        if self.referee is None:
+            return
+        cam_rot = self.data.cam_xmat[self._head_cam_id]
+        gs = detect_goal_pixels(px, cam_rot)
+        az_w = gs.pop("_azimuth_w_rad", None)
+        self._goal_seen = gs
+        if not gs["visible"]:
+            return
+        self._goal_seen_t = self.sim_time
+        self._goal_azimuth_w = az_w
+        if gs["distance_m"] is not None:
+            cam = self.data.cam_xpos[self._head_cam_id]
+            fx = float(cam[0]) + gs["distance_m"] * math.cos(az_w)
+            fy = float(cam[1]) + gs["distance_m"] * math.sin(az_w)
+            if self._goal_fix is None:
+                self._goal_fix = (fx, fy)
+            else:  # range is the noisy axis (±30%); smooth across sightings
+                ox, oy = self._goal_fix
+                self._goal_fix = (0.6 * ox + 0.4 * fx, 0.6 * oy + 0.4 * fy)
+
+    def _goal_estimates(self):
+        """(est_bearing_deg, est_distance_m) to the remembered goal, from own
+        pose — live every tick, even with the goal out of frame. Nulls until
+        the goal has been sighted at all."""
+        if self._goal_azimuth_w is None:
+            return None, None
+        adr = self.qpos_adr
+        tp = self.data.qpos[adr:adr + 3]
+        _, _, yaw = quat_to_rpy(self.data.qpos[adr + 3:adr + 7])
+        if self._goal_fix is not None:
+            dx, dy = self._goal_fix[0] - float(tp[0]), self._goal_fix[1] - float(tp[1])
+            az = math.atan2(dy, dx)
+            dist = round(math.hypot(dx, dy), 3)
+        else:  # bearing-only memory: goal treated as distant along last azimuth
+            az, dist = self._goal_azimuth_w, None
+        bear = math.degrees((az - yaw + math.pi) % (2 * math.pi) - math.pi)
+        return round(bear, 3), dist
 
     # ---------- the referee (sim thread only) ----------
 
@@ -463,6 +604,8 @@ class DuckSim:
         scene without a goal, so the key set is stable across scenes."""
         proj_g = self.policy.get_projected_gravity()
         bs = self._ball_seen
+        gs = self._goal_seen
+        g_bear, g_dist = self._goal_estimates()
         r = self.referee
         return {
             "ball_seen.visible": bs["visible"],
@@ -474,6 +617,13 @@ class DuckSim:
             "ball_seen.est_left_m": bs.get("est_left_m"),
             "ball_seen.speed_mps": bs.get("speed_mps"),
             "ball_seen.age_s": round(self.sim_time - self._ball_seen_t, 3),
+            "goal_seen.visible": gs["visible"],
+            "goal_seen.bearing_deg": gs["bearing_deg"],
+            "goal_seen.width_deg": gs["width_deg"],
+            "goal_seen.distance_m": gs["distance_m"],
+            "goal_seen.age_s": round(self.sim_time - self._goal_seen_t, 3),
+            "goal_seen.est_bearing_deg": g_bear,
+            "goal_seen.est_distance_m": g_dist,
             "goal.scored": bool(r.scored) if r is not None else False,
             "goal.count": int(r.count) if r is not None else 0,
             "upright": bool(proj_g[2] < -0.7),
@@ -590,6 +740,11 @@ class DuckSim:
         # Only on a scene with a goal — omitted entirely elsewhere.
         if self.referee is not None:
             state["goal"] = self.referee.state()
+            g_bear, g_dist = self._goal_estimates()
+            state["goal_seen"] = {
+                **self._goal_seen,
+                "age_s": round(self.sim_time - self._goal_seen_t, 3),
+                "est_bearing_deg": g_bear, "est_distance_m": g_dist}
         return state
 
     # ---------- request handlers (sim thread only) ----------
@@ -694,6 +849,10 @@ class DuckSim:
         self._ball_seen = dict(NOT_SEEN)
         self._ball_seen_t = 0.0
         self._ball_track.clear()  # sim clock rewound; stale points are future-dated
+        self._goal_seen = dict(GOAL_NOT_SEEN)
+        self._goal_seen_t = 0.0
+        self._goal_fix = None       # the goal has not moved, but the clock
+        self._goal_azimuth_w = None  # rewound: start the episode's memory clean
         if self.referee is not None:
             self.referee.reset()  # new episode, new scoreboard
         self._detect_ball()  # so state right after a reset is not stale

@@ -28,6 +28,13 @@ GUARD_PATHS = {
     "ball_seen.visible", "ball_seen.distance_m", "ball_seen.ground_distance_m",
     "ball_seen.bearing_deg", "ball_seen.elevation_deg", "ball_seen.age_s",
     "ball_seen.est_forward_m", "ball_seen.est_left_m", "ball_seen.speed_mps",
+    # The goal sighting (fake mediad part 2: white frame in the horizon band
+    # of the duck's own camera). est_* are dead-reckoned from the last
+    # sighting via own odometry — the goal is world-fixed, so they stay live
+    # while the head is down tracking the ball; null until first sighted.
+    "goal_seen.visible", "goal_seen.bearing_deg", "goal_seen.width_deg",
+    "goal_seen.distance_m", "goal_seen.age_s",
+    "goal_seen.est_bearing_deg", "goal_seen.est_distance_m",
     "upright", "sitting", "active_policy", "behavior",
     # The referee's scoreboard (goal scenes only; False/0 elsewhere). Not a
     # fairness leak: a real pitch has a goal-line sensor, and "someone scored"
@@ -187,6 +194,144 @@ def bhv_search_ball(sim, params, mem, digest):
     sim.policy.set_vel_cmd(0.0, 0.0, wz)
 
 
+def _wrap(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def _own_pose(sim):
+    """Own world pose (x, y, yaw) — odometry, the robot's own knowledge."""
+    adr = sim.qpos_adr
+    x, y = float(sim.data.qpos[adr]), float(sim.data.qpos[adr + 1])
+    q = sim.data.qpos[adr + 3:adr + 7]
+    w, qx, qy, qz = (float(v) for v in q)
+    yaw = math.atan2(2 * (w * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+    return x, y, yaw
+
+
+def _drive_to(sim, dist, bearing):
+    """Walk toward a trunk-frame target: full point turn when badly off,
+    else forward with proportional steering (the session-tested gains)."""
+    if abs(bearing) > math.radians(35):
+        sim.policy.set_vel_cmd(0.0, 0.0, math.copysign(1.5, bearing))
+    else:
+        vx = 0.3 if dist > 0.35 else 0.2
+        sim.policy.set_vel_cmd(vx, 0.0, _clip(2.5 * bearing, -1.2, 1.2))
+
+
+def _aim_ready(sim, params, mem, digest, fwd, left, d, b, gb_deg):
+    """The line-of-fire detour. True when the duck is behind the ball facing
+    along it (attack: fall through to the normal pocket approach); False
+    while still maneuvering (a velocity command has been issued).
+
+    Geometry, all sensed/remembered: ball at (fwd, left); goal from the
+    dead-reckoned estimate. The fire line runs ball->goal; the desired trunk
+    heading is that direction minus kick_skew_deg (kick_right sends the ball
+    ~30 deg right of the trunk, so the trunk wants to be ~30 deg left of the
+    line). Walk to a standoff point behind the ball on that line — swerving
+    to give the ball 0.28 m clearance so the walk-up cannot dribble it away
+    — then attack.
+    """
+    if d > 1.1:
+        # Far field: the ball position estimate wobbles ±0.25 m with the
+        # gait out here — any alignment decision would be noise. Just close
+        # in (the plain approach below); the maneuvering starts near-field.
+        return True
+    skew = math.radians(float(params.get("kick_skew_deg", -30.0)))
+    tol = math.radians(float(params.get("aim_tol_deg", 14.0)))
+    standoff = float(params.get("standoff_m", 0.45))
+    gd = digest.get("goal_seen.est_distance_m")
+    gd = gd if gd is not None else 2.0  # bearing-only memory: goal treated far
+    gbr = math.radians(gb_deg)
+    ux, uy = gd * math.cos(gbr) - fwd, gd * math.sin(gbr) - left
+    if math.hypot(ux, uy) < 1e-6:
+        return True
+    # Desired arrival heading: along the fire line, rotated by the kick skew
+    # (the trunk aims left of the goal so the rightward kick aims at it).
+    h_des = _wrap(math.atan2(uy, ux) - skew)
+    e = h_des  # current heading is 0 in the trunk frame
+    ef = mem.get("aim_err_f")
+    ef = e if ef is None else (0.9 * ef + 0.1 * e)  # ~0.2 s EMA vs gait noise
+    mem["aim_err_f"] = ef
+    mem["aim_n"] = mem.get("aim_n", 0) + 1
+    if mem.get("attacking"):
+        if abs(ef) > math.radians(60.0) and d > 0.20:
+            # Aim badly wrong at ANY range (a wrong-side entanglement, the
+            # geometry flipped as the ball got nudged): stop dribbling chaos,
+            # go around again.
+            mem["attacking"] = False
+        elif abs(ef) > math.radians(35.0) and d > 0.50:
+            mem["attacking"] = False  # drifted off the line; go around again
+        elif d <= 0.20:
+            return True  # fine range: the pocket trim below finishes the job
+        else:
+            # Attack run: FOLLOW THE LINE, don't chase the ball. Holding the
+            # ball at a fixed bearing is a pursuit spiral — the heading
+            # rotates all the way in and the aim washes out. Instead track a
+            # carrot on the line parallel to the fire line, offset so the
+            # duck's path passes pocket_left to the LEFT of the ball: it
+            # arrives heading h_des with the ball already sitting in the
+            # deep pocket, no terminal point turn needed.
+            off = -float(params.get("pocket_left_m", -0.055))
+            nx, ny = -math.sin(h_des), math.cos(h_des)  # left normal
+            # Long lookahead and soft gain: a short twitchy carrot overshoots
+            # laterally at close range and swings the ball out of the tight
+            # head-down field of view right before the pocket.
+            c = _clip(0.5 * d, 0.18, 0.35)
+            cx = fwd + off * nx - c * math.cos(h_des)
+            cy = left + off * ny - c * math.sin(h_des)
+            bC = math.atan2(cy, cx)
+            sim.policy.set_vel_cmd(0.3 if d > 0.4 else 0.25, 0.0,
+                                   _clip(1.8 * bC, -0.9, 0.9))
+            return False
+    if abs(ef) < tol and abs(b) < math.radians(30.0) and mem["aim_n"] > 25:
+        # aim_n > 25: the EMA needs ~0.5 s of samples before it means
+        # anything — one lucky tick at node entry must not latch an attack.
+        mem["attacking"] = True
+        mem["standoff_w"] = None
+        return True
+    x, y, yaw = _own_pose(sim)
+    cy_, sy_ = math.cos(yaw), math.sin(yaw)
+    # Remember where the ball is in the world: the far-side detour below
+    # deliberately walks it out of frame, and the arrival turn-in needs to
+    # know where to look.
+    mem["ball_w"] = (x + cy_ * fwd - sy_ * left, y + sy_ * fwd + cy_ * left)
+    sx = fwd - standoff * math.cos(h_des)
+    sy = left - standoff * math.sin(h_des)
+    dS, bS = math.hypot(sx, sy), math.atan2(sy, sx)
+    if dS < 0.12:
+        # Behind the ball but not yet facing down the line: turn in place.
+        sim.policy.set_vel_cmd(0.0, 0.0, math.copysign(1.5, ef))
+        return False
+    far_side = abs(_wrap(bS - b)) > math.radians(60)
+    if far_side and d < 0.38:
+        # Wrong side of the ball and right on top of it: back away first
+        # (ball kept in view) — the detour needs room to swing around.
+        sim.policy.set_vel_cmd(-0.25, 0.0, _clip(2.5 * b, -0.5, 0.5))
+        return False
+    if not far_side:
+        if abs(b) > math.radians(30):
+            # Eye on the ball: it is drifting toward the frame edge —
+            # re-centre before maneuvering further.
+            sim.policy.set_vel_cmd(0.0, 0.0, math.copysign(1.5, b))
+            return False
+        # Keep the ball in frame while walking: cap the walk direction to
+        # within 35 deg of the ball; the path curves, re-planned every tick.
+        bS = _clip(bS, b - math.radians(35), b + math.radians(35))
+    # else: the standoff is on the FAR side — a deliberate blind detour on
+    # dead-reckoning (the cached target + blink mode carry it, and the
+    # arrival turn-in re-acquires the ball).
+    # Swerve if the straight walk to the standoff would plow through the ball.
+    phi = _wrap(b - bS)
+    phi_min = math.asin(min(1.0, 0.30 / max(d, 0.05)))
+    if math.cos(phi) > 0.0 and d < dS + 0.1 and abs(phi) < phi_min:
+        sgn = 1.0 if phi >= 0 else -1.0
+        bS = _wrap(b - sgn * phi_min)
+    sxp, syp = dS * math.cos(bS), dS * math.sin(bS)
+    mem["standoff_w"] = (x + cy_ * sxp - sy_ * syp, y + sy_ * sxp + cy_ * syp)
+    _drive_to(sim, dS, bS)
+    return False
+
+
 def bhv_approach_ball(sim, params, mem, digest):
     """Close on the ball and settle into the kick pocket — the session-tested
     controller (continuous sticky intents; full-throttle point turns; bearing
@@ -195,14 +340,40 @@ def bhv_approach_ball(sim, params, mem, digest):
     Looks DOWN as it closes: with the head level, a floor ball drops below
     the camera frame at ~0.15 m ground distance — before the 0.10 m pocket —
     so near-range tracking is physically impossible without the head tilt.
+
+    With `aim = true` (and a goal in the duck's memory) the approach comes in
+    along the LINE OF FIRE: first walk to a standoff point behind the ball on
+    the ball->goal line — detouring around the ball rather than dribbling it
+    away by accident — then attack the pocket straight down that line. The
+    heading is offset by `kick_skew_deg` (measured: a settled kick_right
+    sends the ball ~30 deg RIGHT of the trunk heading), so the trunk aims
+    left of the goal and the kick aims AT it.
     """
-    if not digest.get("ball_seen.visible"):
-        sim.policy.set_vel_cmd(0.0, 0.0, 0.0)  # lost it; a guard will exit
-        return
+    aim = bool(params.get("aim", False))
     fwd = digest.get("ball_seen.est_forward_m")
     left = digest.get("ball_seen.est_left_m")
-    if fwd is None or left is None:
-        sim.policy.set_vel_cmd(0.0, 0.0, 0.0)
+    if not digest.get("ball_seen.visible") or fwd is None or left is None:
+        if aim and mem.get("attacking"):
+            return  # hold course through a detector blink mid-attack — the
+            # velocity intent is sticky, and the node's age guard catches a
+            # ball that is genuinely gone.
+        tgt = mem.get("standoff_w")
+        if aim and tgt is not None and not mem.get("attacking"):
+            # Mid-detour blink: the ball slid out of frame while we walk
+            # around it. Keep walking to the cached standoff point (own
+            # odometry); on arrival, turn toward the remembered ball to
+            # re-acquire — and if it truly vanished, the node's guard exits.
+            x, y, yaw = _own_pose(sim)
+            dx, dy = tgt[0] - x, tgt[1] - y
+            dT = math.hypot(dx, dy)
+            bw = mem.get("ball_w")
+            if dT < 0.15 and bw is not None:
+                bb = _wrap(math.atan2(bw[1] - y, bw[0] - x) - yaw)
+                sim.policy.set_vel_cmd(0.0, 0.0, math.copysign(1.5, bb))
+            else:
+                _drive_to(sim, dT, _wrap(math.atan2(dy, dx) - yaw))
+        else:
+            sim.policy.set_vel_cmd(0.0, 0.0, 0.0)  # lost it; a guard will exit
         return
     # Trunk-frame geometry — the pocket the kick was measured in. d/bearing
     # here are TRUNK-relative, not camera-relative: the camera sits ~8 cm
@@ -217,16 +388,26 @@ def bhv_approach_ball(sim, params, mem, digest):
     elif d > 0.60:
         mem["tilted"] = False
     _set_head(sim, head_down if mem.get("tilted") else 0.0)
+    gb = digest.get("goal_seen.est_bearing_deg")
+    if aim and gb is not None and not _aim_ready(sim, params, mem, digest,
+                                                fwd, left, d, b, gb):
+        return  # walking the detour onto the line of fire
     # Kick sweep (measured): forward is the critical axis — the ball connects
     # hard at true forward <= 0.09 m, dies at 0.10-0.12. The camera reads
     # ~1.5 cm long at point-blank (beak occlusion biases the blob), so the
     # sensed stop target sits closer than the old 0.099.
     if d > 0.18:
-        tgt_b = math.radians(float(params.get("pocket_bearing_deg", -25.0)))
-        if abs(b) > math.radians(35):
-            vx, wz = 0.0, math.copysign(1.5, b)
+        # Walk-in bearing target: 0 drives straight at the ball (soccer);
+        # the striker holds the ball at ~-18 deg so it ARRIVES with the ball
+        # already in the deep pocket — the fine-range tuck below is a trim,
+        # not a point turn (a 1.5 rad/s spin overshoots ~17 deg per 5 Hz
+        # detector tick and flings the ball out of frame).
+        tgt_b = math.radians(float(params.get("pocket_bearing_deg", 0.0)))
+        e_b = _wrap(b - tgt_b)
+        if abs(e_b) > math.radians(35):
+            vx, wz = 0.0, math.copysign(1.5, e_b)
         else:
-            vx, wz = 0.3, _clip(2.5 * b, -1.0, 1.0)
+            vx, wz = 0.3, _clip(2.5 * e_b, -1.0, 1.0)
     else:
         # Fine range: servo est_forward/est_left into the pocket guard's
         # window, so "controller satisfied" implies "guard fires". The creep
@@ -236,7 +417,9 @@ def bhv_approach_ball(sim, params, mem, digest):
         # creeping, and the stop's own forward slide delivers the last
         # ~3 cm with feet planted. The stop closes the gap, not a step.
         vx = 0.2 if fwd > 0.110 else (-0.2 if fwd < 0.085 else 0.0)
-        wz = 1.5 if left > -0.020 else (-1.5 if left < -0.080 else 0.0)
+        lmax = float(params.get("pocket_left_max", -0.020))
+        lmin = float(params.get("pocket_left_min", -0.080))
+        wz = 1.5 if left > lmax else (-1.5 if left < lmin else 0.0)
     sim.policy.set_vel_cmd(vx, 0.0, wz)
 
 
