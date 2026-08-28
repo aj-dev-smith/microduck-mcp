@@ -1,0 +1,29 @@
+# head_tilt — curiosity: the sideways look a bird gives a thing it does not
+# understand yet. One channel, one held beat, and the `inquire` call over it.
+#
+# The roll goes to 0.30 rather than the 0.45 a dog-tilt wants: head_roll was
+# trained to ±0.31 (microduck_rl's infer_policy spells the per-joint caps out),
+# and a command past the training range is not a bigger tilt, it is an
+# untrained one. The gesture reads at 0.30; ask the neck for more and the
+# policy, not this file, decides what happens.
+
+[emote]
+name = "head_tilt"
+sound = "inquire"
+
+[[key]]
+t = 0.0
+
+[[key]]                  # the tilt itself, quick enough to look like a thought
+t = 0.4
+head_roll = 0.30
+ease = "smooth"
+
+[[key]]                  # the hold IS the question — a tilt that snaps back
+t = 1.2                  # is a twitch
+ease = "hold"
+
+[[key]]
+t = 1.7
+head_roll = 0.0
+ease = "smooth"
