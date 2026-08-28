@@ -127,20 +127,21 @@ PITCH_BALL_SPAWN = (-0.40, 0.0)
 
 # The mouth. The real robot has a mouth servo (one of the five neck/head/mouth
 # XL330s) and a `robot.mouth` verb: opening 0 (closed) to 1 (open), sent as a
-# continuous notification. The shipped MJCF has no mouth joint — the soft
-# mouth plate (`soft_mouth_top`, the pink part that drops out of the bill,
-# BD-X style) is a fixed visual geom on the head body — so at load time the
-# model is rebuilt with that geom moved onto a mocap body, posed every tick
-# from the head's own kinematics plus the commanded opening. Mocap means no
-# new qpos/dof: the walk policy, kick pockets and every recorded address are
-# byte-identical to the stock model. Hinge placement was tuned against
-# rendered frames: the plate pivots at the back of the mouth slit and swings
-# down up to ~29 deg.
+# continuous notification. The shipped MJCF has no mouth joint — the whole
+# beak (`jaw` mesh, the yellow bill with the round pivot boss on its side) is
+# fixed to the head body — so at load time the model is rebuilt with the
+# beak's VISUAL geom (group 2) moved onto a mocap body, posed every tick from
+# the head's own kinematics plus the commanded opening. Its collision twin
+# (group 3) stays on the head, so physics is byte-identical to the stock
+# model and no qpos/dof shifts under the walk policy. The pink soft-mouth
+# interior stays on the head too — dropping the beak reveals it, BD-X style.
+# Hinge placement was tuned against rendered frames: the beak pivots at the
+# boss (rear-top, the visible hinge on the real robot) and swings down.
 MOUTH_BODY = "jaw_soft"
-MOUTH_MESH = "soft_mouth_top"
-MOUTH_HINGE_POS = (0.0, 0.0, -0.050)  # in the head body frame
+MOUTH_MESH = "jaw"
+MOUTH_HINGE_POS = (0.005, 0.0, -0.018)  # boss center, head body frame
 MOUTH_HINGE_AXIS = (0.0, 1.0, 0.0)
-MOUTH_MAX_RAD = 0.5
+MOUTH_MAX_RAD = 0.45
 
 
 def load_infer_policy_module(rl_repo: str):
@@ -170,16 +171,18 @@ def load_model_with_mouth(xml_path: str):
         for body in spec.bodies:
             if body.name == MOUTH_BODY:
                 for geom in body.geoms:
-                    if geom.meshname == MOUTH_MESH:
+                    # the beak has a visual/collision twin pair; take the
+                    # visual (group 2) and leave the collision copy in place
+                    if geom.meshname == MOUTH_MESH and geom.group == 2:
                         plate = geom
         if plate is None:
-            raise ValueError(f"no {MOUTH_MESH} geom on body {MOUTH_BODY!r}")
+            raise ValueError(f"no visual {MOUTH_MESH} geom on body {MOUTH_BODY!r}")
         pos, quat, mat = plate.pos.copy(), plate.quat.copy(), plate.material
         spec.delete(plate)
         mouth = spec.worldbody.add_body(name="mouth_plate", mocap=True)
         mouth.add_geom(type=mujoco.mjtGeom.mjGEOM_MESH, meshname=MOUTH_MESH,
                        pos=pos, quat=quat, material=mat,
-                       contype=0, conaffinity=0, group=0)
+                       contype=0, conaffinity=0, group=2)
         return spec.compile(), True
     except Exception as e:
         print(f"note: mouth disabled ({e}) — loading stock model")
