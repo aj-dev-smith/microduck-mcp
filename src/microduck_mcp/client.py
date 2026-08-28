@@ -17,10 +17,12 @@ Library (`request()`) plus a small CLI:
     duck film -o match.mp4
     duck mouth 0.6
     duck say "hello A J" --voice-bank bank/
+    duck chirp inquire --voice-bank bank/    # nonverbal: one call from the bank
+    duck emote head_tilt | duck emote --list # authored gestures (see emotes/)
 
-Every subcommand but `film` and `say` is a one-shot intent over the socket;
-`film` runs its own headless sim and writes an mp4 (see film.py), and `say`
-renders the duck's voice, plays it host-side and streams the beak to the
+Every subcommand but `film`, `say` and `chirp` is a one-shot intent over the
+socket; `film` runs its own headless sim and writes an mp4 (see film.py), and
+`say`/`chirp` play the duck's voice host-side while streaming the beak to the
 running sim (see voice.py).
 """
 
@@ -85,20 +87,30 @@ def main():
                    "for the first wake after the jump.")
     mo = sub.add_parser("mouth", help="set the beak opening")
     mo.add_argument("opening", type=float, help="0 (closed) to 1 (open)")
-    # `film` and `say` are not plain socket intents — film boots its own
-    # headless sim, say renders audio and then performs it — so their flags
-    # live next to their implementations.
+    em = sub.add_parser("emote", help="play an authored gesture")
+    em.add_argument("name", nargs="?", default=None,
+                    help="emote name — the file stem in the server's emote "
+                    "directory (head_tilt, nod, perk_up, droop)")
+    em.add_argument("--list", action="store_true", dest="list_emotes",
+                    help="list the server's emotes and whether they parse")
+    # `film`, `say` and `chirp` are not plain socket intents — film boots its
+    # own headless sim, the two voices play audio host-side and then perform
+    # it — so their flags live next to their implementations.
     from . import film, voice
     film.add_arguments(sub.add_parser("film",
                                       help="film an autonomous match to an mp4"))
     voice.add_arguments(sub.add_parser("say",
                                        help="speak: audio host-side, beak in sim"))
+    voice.add_chirp_arguments(sub.add_parser(
+        "chirp", help="play one call from the duck's voice bank"))
     args = p.parse_args()
 
     if args.command == "film":
         sys.exit(film.run(args))
     if args.command == "say":
         sys.exit(voice.run(args))
+    if args.command == "chirp":
+        sys.exit(voice.run_chirp(args))
 
     if args.command == "drive":
         req = {"cmd": "set_velocity", "vx": args.vx, "vy": args.vy, "wz": args.wz}
@@ -117,6 +129,11 @@ def main():
             req["angle_deg"] = args.angle_deg
     elif args.command == "mouth":
         req = {"cmd": "mouth", "opening": args.opening}
+    elif args.command == "emote":
+        # No name is the same question as --list: "what can it do?"
+        req = ({"cmd": "emote", "name": args.name}
+               if args.name and not args.list_emotes
+               else {"cmd": "emote", "action": "list"})
     elif args.command == "machine":
         req = {"cmd": "machine", "action": args.action}
         if args.action == "load":

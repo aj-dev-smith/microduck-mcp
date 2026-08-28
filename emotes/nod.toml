@@ -1,0 +1,33 @@
+# nod — yes. Two dips, no sound: agreement that announces itself is not
+# agreement, it is an argument.
+#
+# POSITIVE PITCH LOOKS DOWN (the approach behavior tilts the camera at the
+# ball with head_down = +0.5), so a nod is a dip to +0.30 and back, twice, at
+# roughly the rate a person nods — 0.3 s down, 0.3 s up. Smooth throughout:
+# the ease is what separates a nod from a servo test.
+
+[emote]
+name = "nod"
+
+[[key]]
+t = 0.0
+
+[[key]]
+t = 0.3
+head_pitch = 0.30
+ease = "smooth"
+
+[[key]]
+t = 0.6
+head_pitch = 0.0
+ease = "smooth"
+
+[[key]]
+t = 0.9
+head_pitch = 0.30
+ease = "smooth"
+
+[[key]]
+t = 1.2
+head_pitch = 0.0
+ease = "smooth"

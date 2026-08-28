@@ -1,0 +1,32 @@
+# droop — dejected: the missed kick, the ball that rolled away, the goal that
+# was not one. Everything about it is slow, which is the whole trick — the
+# timings ARE the emotion, and this gesture is `perk_up` at a third of the
+# speed with the sign flipped.
+#
+# The beak cracks open a little on the way down (0.15, a breath rather than a
+# gape) and closes again on the way back up. It is the one shipped emote that
+# touches the mouth, so it is also the one that visibly yields it: trigger it
+# while the duck is talking and the head droops with the words still coming.
+
+[emote]
+name = "droop"
+sound = "coo"
+
+[[key]]
+t = 0.0
+
+[[key]]
+t = 1.5
+head_pitch = 0.45
+mouth = 0.15
+ease = "smooth"
+
+[[key]]                  # the bottom of it, held
+t = 2.2
+ease = "hold"
+
+[[key]]
+t = 3.6
+head_pitch = 0.0
+mouth = 0.0
+ease = "smooth"

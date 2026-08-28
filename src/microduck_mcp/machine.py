@@ -34,6 +34,16 @@ problem. Nothing about the behavior, the guards or the physics depends on it,
 and a server too old to know the key simply ignores it — an unknown node key
 has never been an error here, which is what makes a machine with a voice safe
 to hot-reload onto a server without one.
+
+EMOTING NODES: `emote = "name"` names an authored gesture (emotes/*.toml, see
+emote.py) to play on entry, and it is `say`'s exact parallel — same code site,
+same annotation status, same indifference to whether anything is listening.
+A node may carry both, and that is the point rather than a conflict: the mouth
+says the line, the body plays the gesture. The grammar knows only that this is
+a string. It does not know what emotes exist, what they do, or whether the
+server it lands on has any — a machine naming a gesture nobody has is a lint
+warning at load and a note at fire time, never a rejection, for the same
+reason a machine with a voice loads onto a mute server.
 """
 
 import ast
@@ -544,8 +554,9 @@ class Machine:
             wake = n.get("wake")
             wake_hold = n.get("wake_hold")
             say = n.get("say")
+            emote = n.get("emote")
             for key, val in (("wake", wake), ("wake_hold", wake_hold),
-                             ("say", say)):
+                             ("say", say), ("emote", emote)):
                 if val is not None and not isinstance(val, str):
                     raise MachineError(f"node {name!r}: {key} must be a string")
             if say is not None and len(say) > MAX_SAY_CHARS:
@@ -567,7 +578,7 @@ class Machine:
                                 "params": n.get("params", {}),
                                 "transitions": trans,
                                 "wake": wake, "wake_hold": wake_hold,
-                                "say": say}
+                                "say": say, "emote": emote}
         # machine-level transitions (checked before the node's own — the
         # "fell over" escape hatch lives here)
         self.global_transitions = []
@@ -616,7 +627,9 @@ class Machine:
                 "wake_nodes": sorted(n for n, v in self.nodes.items()
                                      if v["wake"] is not None),
                 "say_nodes": sorted(n for n, v in self.nodes.items()
-                                    if v["say"] is not None)}
+                                    if v["say"] is not None),
+                "emote_nodes": sorted(n for n, v in self.nodes.items()
+                                      if v["emote"] is not None)}
 
     def tick(self, sim, digest: dict):
         """One 50 Hz step: transitions first (global, then node, in order),

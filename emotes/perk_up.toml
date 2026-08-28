@@ -1,0 +1,32 @@
+# perk_up — alert: something just happened and the duck noticed. The startle
+# `resident.toml` plays when it spots the ball, under the wake pack going out.
+#
+# Up is NEGATIVE pitch (positive looks down), and the neck comes with it: a
+# head that lifts on its own is a nod played backwards, while a head and neck
+# lifting together is an animal getting taller. The rise is fast (0.25 s — a
+# startle has no ease-in worth the name), the hold is the looking, and the
+# settle is slow enough to read as "still interested" rather than "false
+# alarm".
+
+[emote]
+name = "perk_up"
+sound = "greet"
+
+[[key]]
+t = 0.0
+
+[[key]]
+t = 0.25
+neck_pitch = -0.10
+head_pitch = -0.25
+ease = "smooth"
+
+[[key]]                  # holding the look — this is the beat the wake pack
+t = 0.9                  # is parked in
+ease = "hold"
+
+[[key]]
+t = 1.5
+neck_pitch = 0.0
+head_pitch = 0.0
+ease = "smooth"

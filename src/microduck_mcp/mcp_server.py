@@ -284,6 +284,80 @@ def duck_say(text: str, voice_bank: str | None = None) -> DuckState:
     return DuckState(**_call({"cmd": "state"}))
 
 
+@mcp.tool(title="Chirp", annotations=_EPISODIC)
+def duck_chirp(tag: str, variant: int = 0,
+               voice_bank: str | None = None) -> DuckState:
+    """React without words: play one call from the duck's own voice bank —
+    'alarm', 'greet', 'inquire', 'peck', 'chirp', 'coo', 'wheee' — on the
+    host's speakers, with the beak driven by that call's envelope. This is the
+    duck's native vocabulary; duck_say is the translation. Blocks for the
+    length of the call (a call is under a second, the wheee a few).
+
+    'wheee' is the goal celebration and the sim rations it: it is refused
+    unless the referee has a goal on the board this episode. Every other tag
+    is yours whenever you like.
+
+    variant picks between wavs when the bank holds several for a tag (sorted,
+    default the first). voice_bank: the directory of wavs rendered by the
+    microduck `sounds` crate; defaults to $DUCK_VOICE_BANK. Requires `afplay`
+    on the machine running this MCP server."""
+    from . import voice
+    bank = voice_bank or os.environ.get("DUCK_VOICE_BANK")
+    try:
+        wav, traj = voice.chirp_render(bank, tag, variant)
+        voice.perform(wav, traj, {"cmd": "chirp", "client": "mcp",
+                                  "tag": tag, "variant": variant})
+    except voice.VoiceError as e:
+        raise ToolError(str(e)) from e
+    return DuckState(**_call({"cmd": "state"}))
+
+
+class EmoteResult(BaseModel):
+    """An emote played, or the directory listed."""
+
+    ok: bool
+    emote: str | None = Field(default=None, description="The gesture that started")
+    duration_s: float | None = Field(default=None, description="How long it "
+                                     "plays; the head is yours again after")
+    sound: str | None = Field(default=None, description="Voice-bank tag the "
+                              "gesture fires at t=0, if any")
+    note: str | None = Field(default=None, description="Why the sound did not "
+                             "play, when it didn't (no bank, already talking)")
+    dir: str | None = Field(default=None, description="The server's emote "
+                            "directory — edit the TOML in it and the next "
+                            "trigger plays the edit")
+    emotes: list[dict[str, Any]] | None = Field(
+        default=None, description="action='list': every emote in the "
+        "directory, with duration, sound, and whether it parses")
+    playing: str | None = Field(default=None, description="The gesture "
+                                "playing right now, if any")
+
+
+@mcp.tool(title="Emote", annotations=_EPISODIC)
+def duck_emote(name: str | None = None, action: str = "play") -> EmoteResult:
+    """Play an authored gesture: a keyframed head pose (and sometimes beak,
+    and sometimes a voice-bank call) from the server's `emotes/` directory.
+    Shipped: 'head_tilt' (curiosity), 'nod' (yes), 'perk_up' (alert),
+    'droop' (dejected). action='list' shows what a given server has, with
+    durations and whether each file parses — emotes are TOML you can edit
+    while the duck stands there, and the next trigger plays the edit.
+
+    Returns as soon as the gesture STARTS; it plays out on the sim's own clock
+    (a second or two) and then hands the head back exactly where it found it.
+
+    Who owns what, so a refusal reads as a fact rather than a failure: a
+    gesture is refused while another is playing (a duck restarting a nod looks
+    broken), and while an armed machine is running approach_ball or kick —
+    those behaviors steer by the head camera and need the head level to swing.
+    The beak yields to speech: emote under a duck_say and the head still
+    moves, the beak just keeps lip-syncing the words."""
+    if action == "list":
+        return EmoteResult(**_call({"cmd": "emote", "action": "list"}))
+    if not name:
+        raise ToolError("which emote? (action='list' shows what this server has)")
+    return EmoteResult(**_call({"cmd": "emote", "name": name}))
+
+
 @mcp.tool(title="Duck camera", annotations=_READ)
 def duck_camera(view: str = "follow", distance: float = 0.7) -> Image:
     """Render a camera frame of the sim. Views: 'head' (the duck's POV, from
@@ -399,6 +473,13 @@ class MachineStatus(BaseModel):
     say_nodes: list[str] | None = Field(default=None, description="Nodes that "
                                         "speak a line on entry (say = \"...\" "
                                         "in the machine source)")
+    emote_nodes: list[str] | None = Field(default=None, description="Nodes "
+                                          "that play a gesture on entry "
+                                          "(emote = \"...\" in the source)")
+    warnings: list[str] | None = Field(default=None, description="Lint from "
+        "load/reload: gestures this machine names that this server cannot "
+        "play. The machine still loaded — the missing emote is simply a node "
+        "that will enter quietly.")
     note: str | None = None
     wake: dict[str, Any] | None = Field(default=None, description="The wake "
         "pack (action='wait' or a blocking arm/force): reason, node, the "

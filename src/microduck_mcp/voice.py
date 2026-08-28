@@ -14,6 +14,12 @@ clock. One envelope drives both the chirp placement and the beak, which is
 what keeps them honest to each other: the beak opens exactly where the voice
 leans.
 
+`duck chirp` is the same performance with the render stage cut out: a tag from
+the voice bank (alarm, greet, inquire, peck, chirp, coo, wheee) played straight,
+the beak driven by that call's own envelope. The bank is the duck's OWN
+vocabulary — the words are the borrowed part — so a chirp is the honest
+reaction and a sentence is the translation.
+
 The duckness lives IN the voice, not under it: the speech is pitched up and
 run through the modulation parameters of the duck's own synthesized
 personality (see the constants below), and the chirps are grains of a real
@@ -169,6 +175,38 @@ def syllable_peaks(env: np.ndarray, min_gap_s: float = 0.18,
     return sorted(peaks[: max(2, len(peaks) // 2)])
 
 
+def bank_wavs(bank_dir: str | None, tag: str) -> list:
+    """Every `<tag>*.wav` in the bank, sorted — the tag's variants.
+
+    Sorted, so a tag names the same wav on every host and every run: the bank
+    is content, and content the duck reacts with must not depend on readdir
+    order. Empty list for no bank and for a bank without that tag; the callers
+    decide which of those is fatal.
+    """
+    if not bank_dir or not os.path.isdir(bank_dir):
+        return []
+    return sorted(glob.glob(os.path.join(bank_dir, f"{tag}*.wav")))
+
+
+def bank_wav_path(bank_dir: str | None, tag: str, variant: int = 0) -> str:
+    """The wav a `<tag>[, variant]` names, or a VoiceError saying why not."""
+    if not tag or not tag.isidentifier():
+        raise VoiceError(f"{tag!r} is not a voice-bank tag (try alarm, greet, "
+                         "inquire, peck, chirp, coo, wheee)")
+    if not bank_dir:
+        raise VoiceError(
+            "no voice bank — pass --voice-bank DIR (or set DUCK_VOICE_BANK) "
+            "pointing at wavs rendered by the microduck `sounds` crate")
+    hits = bank_wavs(bank_dir, tag)
+    if not hits:
+        raise VoiceError(f"no {tag}*.wav in {bank_dir} — render it with the "
+                         f"`sounds` crate, or pick a tag the bank has")
+    if not 0 <= variant < len(hits):
+        raise VoiceError(f"{tag} has {len(hits)} variant(s) in {bank_dir}; "
+                         f"there is no variant {variant}")
+    return hits[variant]
+
+
 def load_chirp(bank_dir: str | None) -> np.ndarray | None:
     """First chirp wav from a voice bank rendered by the `sounds` crate.
 
@@ -177,7 +215,7 @@ def load_chirp(bank_dir: str | None) -> np.ndarray | None:
     """
     if not bank_dir:
         return None
-    hits = sorted(glob.glob(os.path.join(bank_dir, "chirp*.wav")))
+    hits = bank_wavs(bank_dir, "chirp")
     if not hits:
         print(f"note: no chirp*.wav in {bank_dir} — speaking without chirps",
               file=sys.stderr)
@@ -258,19 +296,27 @@ def render_voice(text: str, ffmpeg: str, voice: str = DEFAULT_TTS_VOICE,
 
 # ---------- the performance ----------
 
-def speak(wav_path: str, traj: np.ndarray, text: str, duration_s: float,
-          sock_path: str | None = None, play_audio: bool = True,
-          rate_hz: int = MOUTH_RATE_HZ) -> None:
-    """Play the wav host-side while streaming the beak to the sim.
+def perform(wav_path: str, traj: np.ndarray, annotation: dict,
+            sock_path: str | None = None, play_audio: bool = True,
+            rate_hz: int = MOUTH_RATE_HZ) -> None:
+    """Play a wav host-side while streaming the beak to the sim.
 
-    One shared t0 and absolute per-sample deadlines (the sim loop's own
-    pacing rule): drift never accumulates, and the beak cannot slide against
-    the audio because both run off the same clock.
+    The shared performance behind both of the duck's voices: `duck say` hands
+    it a rendered sentence, `duck chirp` a call straight out of the bank. One
+    shared t0 and absolute per-sample deadlines (the sim loop's own pacing
+    rule): drift never accumulates, and the beak cannot slide against the
+    audio because both run off the same clock.
+
+    `annotation` is the intent that puts the act on the control surface before
+    a sound is made — and the server's chance to REFUSE it (the wheee is
+    reserved for goals the duck actually scored), which is why its reply is
+    read rather than merely drained: a refused sound is not played.
     """
     from .client import DEFAULT_SOCKET
     import json
     import socket as socketlib
 
+    client = annotation.get("client", "say")
     sock = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
     sock.settimeout(5.0)
     try:
@@ -283,15 +329,20 @@ def speak(wav_path: str, traj: np.ndarray, text: str, duration_s: float,
             "or pass --audio-only to just hear the voice") from e
     f = sock.makefile("rwb")
 
-    def send(req: dict):
+    def send(req: dict) -> dict:
         f.write((json.dumps(req) + "\n").encode())
         f.flush()
-        f.readline()  # ack; keep the pipe drained
+        line = f.readline()  # ack; keep the pipe drained
+        try:
+            return json.loads(line)
+        except (ValueError, TypeError):
+            return {"ok": True}
 
     player = None
     try:
-        send({"cmd": "say", "client": "say", "text": text,
-              "duration_s": round(duration_s, 2)})
+        resp = send(annotation)
+        if not resp.get("ok"):
+            raise VoiceError(resp.get("error", "the sim refused the sound"))
         if play_audio:
             afplay = shutil.which("afplay")
             if afplay is None:
@@ -304,15 +355,74 @@ def speak(wav_path: str, traj: np.ndarray, text: str, duration_s: float,
             now = time.perf_counter()
             if deadline > now:
                 time.sleep(deadline - now)
-            send({"cmd": "mouth", "client": "say", "opening": float(opening)})
+            send({"cmd": "mouth", "client": client, "opening": float(opening)})
     finally:
         try:
-            send({"cmd": "mouth", "client": "say", "opening": 0.0})
+            send({"cmd": "mouth", "client": client, "opening": 0.0})
         finally:
             f.close()
             sock.close()
         if player is not None:
             player.wait()
+
+
+def speak(wav_path: str, traj: np.ndarray, text: str, duration_s: float,
+          sock_path: str | None = None, play_audio: bool = True,
+          rate_hz: int = MOUTH_RATE_HZ) -> None:
+    """`duck say`'s performance: the rendered line, annotated as speech."""
+    perform(wav_path, traj,
+            {"cmd": "say", "client": "say", "text": text,
+             "duration_s": round(duration_s, 2)},
+            sock_path=sock_path, play_audio=play_audio, rate_hz=rate_hz)
+
+
+# ---------- the nonverbal voice ----------
+
+def chirp_render(bank_dir: str | None, tag: str, variant: int = 0):
+    """(wav path, mouth trajectory) for one call out of the voice bank.
+
+    The same two signals speech produces, one stage shorter: a bank wav is
+    already the duck's own voice at 48 kHz, so there is nothing to synthesize
+    and nothing to modulate. The beak still comes from the call's own
+    envelope — a duck that chirped with its beak shut would be a speaker.
+    """
+    path = bank_wav_path(bank_dir, tag, variant)
+    return path, mouth_trajectory(envelope(load_wav48(path)))
+
+
+def add_chirp_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument("tag", help="voice-bank tag: alarm, greet, inquire, "
+                        "peck, chirp, coo — plus wheee, which the sim grants "
+                        "only when the referee has a goal on the board")
+    parser.add_argument("--variant", type=int, default=0, metavar="N",
+                        help="which wav when the bank holds several for the "
+                        "tag (sorted; default the first)")
+    parser.add_argument("--voice-bank", default=os.environ.get("DUCK_VOICE_BANK"),
+                        metavar="DIR",
+                        help="directory of voice-bank wavs rendered by the "
+                        "microduck `sounds` crate")
+    parser.add_argument("--audio-only", action="store_true",
+                        help="skip the sim: just play the call")
+
+
+def run_chirp(args) -> int:
+    """`duck chirp`. Returns a process exit code."""
+    try:
+        wav, traj = chirp_render(args.voice_bank, args.tag, args.variant)
+        if args.audio_only:
+            afplay = shutil.which("afplay")
+            if afplay is None:
+                raise VoiceError(f"no `afplay`; the call is at {wav}")
+            subprocess.run([afplay, wav], check=True)
+        else:
+            perform(wav, traj,
+                    {"cmd": "chirp", "client": "chirp", "tag": args.tag,
+                     "variant": args.variant},
+                    sock_path=getattr(args, "socket", None))
+    except VoiceError as e:
+        print(f"duck chirp: {e}", file=sys.stderr)
+        return 1
+    return 0
 
 
 # ---------- the machine's own voice ----------
@@ -365,6 +475,13 @@ class SayPlayer:
                   file=sys.stderr)
             return None
         return cls(resolved, bank_dir=bank_dir, tts_voice=tts_voice)
+
+    @property
+    def busy(self) -> bool:
+        """Is a line playing right now? The mouth's ownership question: while
+        this is True the beak belongs to the words, and an emote gesturing at
+        the same time leaves it alone."""
+        return self._busy.locked()
 
     def speak(self, text: str, sim=None) -> bool:
         """Start a line. False if the duck is already mid-sentence."""

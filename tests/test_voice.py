@@ -142,6 +142,97 @@ class VoiceBank(unittest.TestCase):
             voice.render_voice("quack " * 200, ffmpeg="ffmpeg")
 
 
+class ChirpBank(unittest.TestCase):
+    """`duck chirp`: resolving a tag to a wav, deterministically.
+
+    The bank is content the duck reacts with, so the same tag must name the
+    same call on every host — hence sorted globs and an index, not a shuffle.
+    """
+
+    def bank(self, d, *names):
+        for name in names:
+            save_wav48(os.path.join(d, name),
+                       np.linspace(-0.4, 0.4, SR // 20, dtype=np.float32))
+        return d
+
+    def test_the_first_sorted_match_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.bank(d, "greet2.wav", "greet1.wav", "greet3.wav")
+            self.assertTrue(voice.bank_wav_path(d, "greet").endswith("greet1.wav"))
+
+    def test_variant_indexes_the_sorted_matches(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.bank(d, "chirp1.wav", "chirp2.wav")
+            self.assertTrue(
+                voice.bank_wav_path(d, "chirp", 1).endswith("chirp2.wav"))
+            with self.assertRaisesRegex(VoiceError, "no variant 2"):
+                voice.bank_wav_path(d, "chirp", 2)
+
+    def test_a_bare_tag_matches_the_unnumbered_wav(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.bank(d, "wheee.wav")
+            self.assertTrue(voice.bank_wav_path(d, "wheee").endswith("wheee.wav"))
+
+    def test_missing_bank_and_missing_tag_are_clean_sentences(self):
+        with self.assertRaisesRegex(VoiceError, "no voice bank"):
+            voice.bank_wav_path(None, "coo")
+        with tempfile.TemporaryDirectory() as d:
+            self.bank(d, "coo.wav")
+            with self.assertRaisesRegex(VoiceError, r"no alarm\*\.wav"):
+                voice.bank_wav_path(d, "alarm")
+            with self.assertRaisesRegex(VoiceError, "not a voice-bank tag"):
+                voice.bank_wav_path(d, "../etc/passwd")
+
+    def test_the_call_drives_the_beak_from_its_own_envelope(self):
+        with tempfile.TemporaryDirectory() as d:
+            save_wav48(os.path.join(d, "peck.wav"), tone_bursts([0.2], dur_s=1.0))
+            path, traj = voice.chirp_render(d, "peck")
+        self.assertTrue(path.endswith("peck.wav"))
+        self.assertEqual(len(traj), int(1.0 * MOUTH_RATE_HZ))
+        self.assertGreater(traj.max(), 0.9)
+        self.assertEqual(float(traj[-1]), 0.0)   # and shuts when the call ends
+
+
+class TheWheeeIsEarned(unittest.TestCase):
+    """The server's half of the chirp contract, on a bare DuckSim.
+
+    Fairness by construction, the same shape as the guard vocabulary: the
+    celebration is not something a client can decide it deserves.
+    """
+
+    def sim(self, count=None):
+        from collections import deque
+        from microduck_mcp.sim_server import DuckSim, GoalReferee
+        sim = DuckSim.__new__(DuckSim)
+        sim.events = deque(maxlen=500)
+        sim._event_id = 0
+        sim.policy = None     # a chirp is an annotation: no physics in the path
+        sim.referee = None
+        if count is not None:
+            sim.referee = GoalReferee()
+            sim.referee.count = count
+        return sim
+
+    def test_no_goal_no_wheee(self):
+        resp = self.sim(count=0).handle({"cmd": "chirp", "tag": "wheee"})
+        self.assertFalse(resp["ok"])
+        self.assertIn("actually scored", resp["error"])
+
+    def test_a_scene_without_a_referee_can_never_earn_one(self):
+        self.assertFalse(self.sim().handle({"cmd": "chirp", "tag": "wheee"})["ok"])
+
+    def test_a_goal_on_the_board_grants_it(self):
+        resp = self.sim(count=1).handle({"cmd": "chirp", "tag": "wheee"})
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["goals"], 1)
+
+    def test_every_other_call_is_the_duck_s_to_make(self):
+        for tag in ("alarm", "greet", "inquire", "peck", "chirp", "coo"):
+            with self.subTest(tag=tag):
+                self.assertTrue(self.sim().handle({"cmd": "chirp",
+                                                   "tag": tag})["ok"])
+
+
 class MouthPose(unittest.TestCase):
     HEAD_POS = np.array([0.1, -0.2, 0.22])
     HEAD_QUAT = np.array([0.92387953, 0.0, 0.0, 0.38268343])  # 45 deg yaw
@@ -255,6 +346,15 @@ class CliWiring(unittest.TestCase):
                     client.main()
         self.assertEqual(run.call_args[0][0].text, "hi")
         self.assertTrue(run.call_args[0][0].audio_only)
+        with mock.patch.object(client.sys, "argv",
+                               ["duck", "chirp", "inquire", "--variant", "1",
+                                "--voice-bank", "bank/"]):
+            with mock.patch.object(voice, "run_chirp", return_value=0) as run:
+                with self.assertRaises(SystemExit):
+                    client.main()
+        args = run.call_args[0][0]
+        self.assertEqual((args.tag, args.variant, args.voice_bank),
+                         ("inquire", 1, "bank/"))
         sent = {}
         with mock.patch.object(client.sys, "argv", ["duck", "mouth", "0.6"]):
             with mock.patch.object(client, "request",

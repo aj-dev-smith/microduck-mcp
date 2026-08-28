@@ -251,6 +251,62 @@ class SpeakingNodes(unittest.TestCase):
                     self.assertNotIn("wheee", (spec["say"] or "").lower())
 
 
+class EmotingNodes(unittest.TestCase):
+    """`emote = "..."` on a node: `say`'s parallel, and just as ignorant.
+
+    The grammar validates that this is a string and stops there. It does not
+    know what emotes exist — a machine naming one the server has never heard
+    of must still load, or hot-reloading a machine onto a server would depend
+    on the two agreeing about content.
+    """
+
+    @staticmethod
+    def _spec(node):
+        return {"machine": {"name": "t", "initial": "a"},
+                "node": [{"name": "a", "behavior": "idle",
+                          "transition": [{"when": "upright", "to": "e"}]},
+                         node]}
+
+    def test_a_node_can_carry_a_gesture(self):
+        m = Machine(self._spec({"name": "e", "behavior": "idle",
+                                "emote": "perk_up"}))
+        self.assertEqual(m.nodes["e"]["emote"], "perk_up")
+        self.assertIsNone(m.nodes["a"]["emote"])
+
+    def test_non_string_refused(self):
+        with self.assertRaisesRegex(MachineError, "string"):
+            Machine(self._spec({"name": "e", "behavior": "idle", "emote": 7}))
+
+    def test_an_emote_nobody_has_still_loads(self):
+        m = Machine(self._spec({"name": "e", "behavior": "idle",
+                                "emote": "moonwalk"}))
+        self.assertEqual(m.status()["emote_nodes"], ["e"])
+
+    def test_a_node_may_say_and_emote_at_once(self):
+        # The whole point: mouth to say, body to emote. They are separate
+        # channels, so carrying both is a chord, not a conflict.
+        m = Machine(self._spec({"name": "e", "behavior": "idle",
+                                "say": "oh!", "emote": "perk_up"}))
+        self.assertEqual(m.status()["say_nodes"], ["e"])
+        self.assertEqual(m.status()["emote_nodes"], ["e"])
+
+    def test_status_reports_them_alongside_the_speaking_ones(self):
+        m = Machine(self._spec({"name": "e", "behavior": "idle"}))
+        self.assertEqual(m.status()["emote_nodes"], [])
+
+    def test_the_resident_startles_at_the_ball(self):
+        m = Machine.load(os.path.join(REPO, "machines", "resident.toml"))
+        self.assertEqual(m.status()["emote_nodes"], ["ball_spotted"])
+        self.assertEqual(m.nodes["ball_spotted"]["emote"], "perk_up")
+
+    def test_the_match_machines_are_left_alone(self):
+        # striker is the demo machine and approach/kick own the head anyway.
+        for name in ("striker.toml", "soccer.toml"):
+            with self.subTest(machine=name):
+                m = Machine.load(os.path.join(REPO, "machines", name))
+                self.assertEqual(m.status()["emote_nodes"], [])
+
+
 class _StubPolicy:
     def __init__(self):
         self.cmds = []

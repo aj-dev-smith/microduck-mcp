@@ -123,6 +123,15 @@ class ControlSurfaceFeed(unittest.TestCase):
     GOAL = {"client": "referee", "cmd": "GOAL!", "args": {"count": 1}}
     SAY = {"client": "machine", "cmd": "say",
            "args": {"node": "celebrate", "text": "Goal!"}}
+    EMOTE = {"client": "machine", "cmd": "emote",
+             "args": {"node": "ball_spotted", "name": "perk_up"}}
+
+    def test_a_gesture_shows_up_without_eating_the_guard(self):
+        # Same shape as a spoken line: an annotation riding along with the
+        # transition, carrying no `when` of its own.
+        lines, guard = feed_lines(deque([self.TRANSITION, self.EMOTE]))
+        self.assertEqual(lines[1][1], "emote perk_up")
+        self.assertEqual(guard, self.TRANSITION["args"]["when"])
 
     def test_a_speaking_node_puts_its_line_on_the_feed(self):
         lines, _ = feed_lines(deque([self.SAY]))
