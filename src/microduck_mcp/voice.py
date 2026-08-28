@@ -26,6 +26,13 @@ personality (see the constants below), and the chirps are grains of a real
 voice-bank chirp riding the syllables the enunciation already hits hardest —
 an accent, not punctuation. TTS is a stand-in boundary: macOS `say` today, a
 phoneme-timed engine (e.g. Piper) later.
+
+A MOOD is weather over that climate. The recipe below is the duck's identity
+and it does not move; a mood only leans on the knobs it already has — pitch,
+tempo, the two modulation depths, which bank tag the grains are cut from and
+how loud, how many syllables get one, and how fast the beak shuts. Same duck,
+different weather: a sad duck is this duck, slower and lower and cooing, not
+a different voice and never a human one.
 """
 
 import argparse
@@ -39,6 +46,7 @@ import tempfile
 import threading
 import time
 import wave
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -80,8 +88,78 @@ DEFAULT_TTS_VOICE = "Samantha"
 MAX_SAY_CHARS = 400
 
 
+# ---------- moods ----------
+
+@dataclass(frozen=True)
+class Mood:
+    """The knobs a mood is allowed to move — and nothing else.
+
+    Every field defaults to the ratified recipe above, so a mood is written
+    as the handful of values it CHANGES and `Mood()` is, by construction,
+    exactly today's pipeline. Retuning by ear is meant to be a one-line edit
+    in MOODS, which is why each knob is a named field and not a curve.
+    """
+
+    asetrate: int = PITCH_ASETRATE
+    tempo: float = PITCH_TEMPO
+    vibrato_depth: float = VIBRATO_DEPTH
+    tremolo_depth: float = TREMOLO_DEPTH
+    grain_tag: str = "chirp"
+    grain_gain: float = GRAIN_GAIN
+    syllable_share: float = 0.5     # of the peaks, by attack; floor of 2
+    mouth_release_s: float = MOUTH_RELEASE_S
+
+
+# Five weathers over one climate. The numbers are ear-guesses pending a live
+# tuning pass; the INTENT behind each is the part that should survive retuning:
+#
+#   excited  brighter and quicker, and chirpier — more syllables carry a grain.
+#   sad      lower, slower, tremolo flattened to a dulled affect, coo grains,
+#            and a droopy beak (long release). Still well above human pitch:
+#            sad, not human.
+#   alarmed  NOT higher — faster and shakier, with alarm grains riding the
+#            stresses. Alarm calls are long, but grains still clip to GRAIN_S,
+#            which is what keeps them accents instead of sirens.
+#   smug     a drawl: slow, wide vibrato, and sparse dry peck grains low in the
+#            mix — a tut-tut, not a chirp.
+MOODS = {
+    "neutral": Mood(),
+    "excited": Mood(asetrate=56800, tempo=1.00,
+                    vibrato_depth=0.16, tremolo_depth=0.22,
+                    grain_gain=0.90, syllable_share=2 / 3,
+                    mouth_release_s=0.070),
+    "sad": Mood(asetrate=51600, tempo=0.74,
+                vibrato_depth=0.04, tremolo_depth=0.06,
+                grain_tag="coo", grain_gain=0.60, syllable_share=1 / 3,
+                mouth_release_s=0.140),
+    "alarmed": Mood(tempo=1.03, vibrato_depth=0.13, tremolo_depth=0.33,
+                    grain_tag="alarm", grain_gain=0.85, syllable_share=2 / 3,
+                    mouth_release_s=0.070),
+    "smug": Mood(tempo=0.78,
+                 vibrato_depth=0.20, tremolo_depth=0.10,
+                 grain_tag="peck", grain_gain=0.55, syllable_share=1 / 3,
+                 mouth_release_s=0.110),
+}
+NEUTRAL = MOODS["neutral"]
+
+
 class VoiceError(Exception):
     """A problem worth a clean sentence, not a stack trace."""
+
+
+def resolve_mood(mood) -> Mood:
+    """A mood name (or an already-resolved Mood) -> the parameter set.
+
+    The one place a mood name becomes numbers, so every surface — CLI, MCP,
+    machine node, direct call — refuses an unknown one with the same sentence.
+    """
+    if isinstance(mood, Mood):
+        return mood
+    try:
+        return MOODS[mood]
+    except (KeyError, TypeError):
+        raise VoiceError(f"{mood!r} is not a mood (have: "
+                         f"{', '.join(sorted(MOODS))})") from None
 
 
 # ---------- wav I/O ----------
@@ -122,15 +200,23 @@ def tts_render(text: str, out_path: str, voice: str = DEFAULT_TTS_VOICE):
     subprocess.run([find_say(), "-v", voice, "-o", out_path, text], check=True)
 
 
-def duck_modulate(src: str, dst_wav: str, ffmpeg: str):
+def modulation_chain(mood: Mood = NEUTRAL) -> str:
+    """The ffmpeg filter chain that turns speech into this duck, this mood.
+
+    The rates are the personality's (they ARE the duck); the mood moves the
+    pitch, the tempo and the two depths.
+    """
+    return (f"aresample={SR},asetrate={mood.asetrate},aresample={SR},"
+            f"atempo={mood.tempo},"
+            f"vibrato=f={VIBRATO_HZ}:d={mood.vibrato_depth},"
+            f"tremolo=f={TREMOLO_HZ}:d={mood.tremolo_depth},"
+            f"aformat=sample_rates={SR}:channel_layouts=mono")
+
+
+def duck_modulate(src: str, dst_wav: str, ffmpeg: str, mood: Mood = NEUTRAL):
     """Pitch the speech up and run it through the personality's modulation."""
-    chain = (f"aresample={SR},asetrate={PITCH_ASETRATE},aresample={SR},"
-             f"atempo={PITCH_TEMPO},"
-             f"vibrato=f={VIBRATO_HZ}:d={VIBRATO_DEPTH},"
-             f"tremolo=f={TREMOLO_HZ}:d={TREMOLO_DEPTH},"
-             f"aformat=sample_rates={SR}:channel_layouts=mono")
     subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", src,
-                    "-af", chain, dst_wav], check=True)
+                    "-af", modulation_chain(mood), dst_wav], check=True)
 
 
 def envelope(x: np.ndarray) -> np.ndarray:
@@ -152,11 +238,16 @@ def envelope(x: np.ndarray) -> np.ndarray:
 
 
 def syllable_peaks(env: np.ndarray, min_gap_s: float = 0.18,
-                   floor: float = 0.35, attack_win_s: float = 0.06) -> list:
+                   floor: float = 0.35, attack_win_s: float = 0.06,
+                   share: float = NEUTRAL.syllable_share) -> list:
     """Stressed-syllable nuclei: local envelope maxima with a sharp attack.
 
     Returns [(env_index, amplitude, attack)] for the syllables leaned on
-    hardest — the top half by attack ramp, at least two. Deterministic.
+    hardest — the top `share` by attack ramp, at least two. Deterministic.
+
+    `share` is the mood's: an excited duck chirps on two thirds of its
+    syllables, a sad one on a third. The floor of two stays whatever the mood
+    is, because one grain in a sentence reads as a glitch rather than a voice.
     """
     if not len(env) or env.max() <= 0.0:
         return []
@@ -172,7 +263,9 @@ def syllable_peaks(env: np.ndarray, min_gap_s: float = 0.18,
         else:
             i += 1
     peaks.sort(key=lambda p: -p[2])
-    return sorted(peaks[: max(2, len(peaks) // 2)])
+    # +1e-9 so a third of six is two: the shares are exact fractions on paper
+    # and a hair under them in binary floating point.
+    return sorted(peaks[: max(2, int(len(peaks) * share + 1e-9))])
 
 
 def bank_wavs(bank_dir: str | None, tag: str) -> list:
@@ -207,26 +300,32 @@ def bank_wav_path(bank_dir: str | None, tag: str, variant: int = 0) -> str:
     return hits[variant]
 
 
-def load_chirp(bank_dir: str | None) -> np.ndarray | None:
-    """First chirp wav from a voice bank rendered by the `sounds` crate.
+def load_grain(bank_dir: str | None, tag: str = "chirp") -> np.ndarray | None:
+    """First `<tag>` wav from a voice bank rendered by the `sounds` crate.
 
-    No bank, no chirps: the voice degrades to unblended speech with a note,
-    because a duck that cannot chirp should still be able to talk.
+    The material the mood's grains are cut from — chirp by default, coo for a
+    sad duck, alarm for a rattled one. Tag resolution is bank_wavs', the same
+    sorted lookup `duck chirp` uses, so a mood names the same wav everywhere.
+
+    No bank, no grains: the voice degrades to unblended speech with a note,
+    because a duck that cannot chirp should still be able to talk. A bank
+    missing THIS mood's tag degrades identically — a coo the bank never had
+    is not a reason to refuse the sentence.
     """
     if not bank_dir:
         return None
-    hits = bank_wavs(bank_dir, "chirp")
+    hits = bank_wavs(bank_dir, tag)
     if not hits:
-        print(f"note: no chirp*.wav in {bank_dir} — speaking without chirps",
+        print(f"note: no {tag}*.wav in {bank_dir} — speaking without chirps",
               file=sys.stderr)
         return None
     return load_wav48(hits[0])
 
 
 def blend_chirps(speech: np.ndarray, chirp: np.ndarray | None,
-                 env: np.ndarray) -> tuple[np.ndarray, list]:
+                 env: np.ndarray, mood: Mood = NEUTRAL) -> tuple[np.ndarray, list]:
     """Ride chirp grains on the stressed syllables. Returns (audio, hits)."""
-    hits = syllable_peaks(env)
+    hits = syllable_peaks(env, share=mood.syllable_share)
     if chirp is None or not hits:
         return speech, hits if chirp is not None else []
     grain = chirp[: int(GRAIN_S * SR)].copy()
@@ -242,21 +341,23 @@ def blend_chirps(speech: np.ndarray, chirp: np.ndarray | None,
         # local envelope, upsampled to shape the grain by the word itself
         idx = (start + np.arange(len(seg))) / block
         shape = np.interp(idx, np.arange(len(env)), env) / (amp or 1.0)
-        seg += grain[: len(seg)] * (GRAIN_GAIN * amp / peak) * shape
+        seg += grain[: len(seg)] * (mood.grain_gain * amp / peak) * shape
     return out, hits
 
 
-def mouth_trajectory(env: np.ndarray, rate_hz: int = MOUTH_RATE_HZ) -> np.ndarray:
+def mouth_trajectory(env: np.ndarray, rate_hz: int = MOUTH_RATE_HZ,
+                     mood: Mood = NEUTRAL) -> np.ndarray:
     """Beak openings in [0, 1] at rate_hz, from the shared envelope.
 
     Fast attack, slower release (a beak snaps open and eases shut), a noise
     floor so breath does not flutter it, normalized per utterance, and a
-    guaranteed 0.0 on silence.
+    guaranteed 0.0 on silence. The release is the mood's — a sad duck's beak
+    droops shut, an excited one's snaps.
     """
     if not len(env) or env.max() <= 0.0:
         return np.zeros(0, dtype=np.float32)
     aa = 1.0 - math.exp(-1.0 / (MOUTH_ATTACK_S * ENV_RATE))
-    ar = 1.0 - math.exp(-1.0 / (MOUTH_RELEASE_S * ENV_RATE))
+    ar = 1.0 - math.exp(-1.0 / (mood.mouth_release_s * ENV_RATE))
     sm = np.empty_like(env)
     acc = 0.0
     for i, v in enumerate(env):
@@ -270,24 +371,31 @@ def mouth_trajectory(env: np.ndarray, rate_hz: int = MOUTH_RATE_HZ) -> np.ndarra
 
 
 def render_voice(text: str, ffmpeg: str, voice: str = DEFAULT_TTS_VOICE,
-                 bank_dir: str | None = None, out_wav: str | None = None):
-    """text -> (wav_path, mouth trajectory, duration_s). The whole render."""
+                 bank_dir: str | None = None, out_wav: str | None = None,
+                 mood: str | Mood = "neutral"):
+    """text -> (wav_path, mouth trajectory, duration_s). The whole render.
+
+    `mood` is resolved once, here, and then carried through every stage: the
+    modulation, the grains, and the beak all read the SAME parameter set, so
+    a mood cannot end up half-applied.
+    """
     if not text.strip():
         raise VoiceError("nothing to say")
     if len(text) > MAX_SAY_CHARS:
         raise VoiceError(f"text too long ({len(text)} chars, max {MAX_SAY_CHARS})")
-    chirp = load_chirp(bank_dir)
+    params = resolve_mood(mood)
+    chirp = load_grain(bank_dir, params.grain_tag)
     with tempfile.TemporaryDirectory(prefix="duck-say-") as tmp:
         raw = os.path.join(tmp, "speech.aiff")
         mod = os.path.join(tmp, "speech48.wav")
         tts_render(text, raw, voice=voice)
-        duck_modulate(raw, mod, ffmpeg)
+        duck_modulate(raw, mod, ffmpeg, params)
         speech = load_wav48(mod)
     env = envelope(speech)
-    audio, hits = blend_chirps(speech, chirp, env)
+    audio, hits = blend_chirps(speech, chirp, env, params)
     if hits:
         print(f"chirps on {len(hits)} syllables", file=sys.stderr)
-    traj = mouth_trajectory(env)
+    traj = mouth_trajectory(env, mood=params)
     wav_path = out_wav or os.path.join(
         tempfile.gettempdir(), f"duck_say_{os.getpid()}.wav")
     save_wav48(wav_path, audio)
@@ -483,21 +591,27 @@ class SayPlayer:
         the same time leaves it alone."""
         return self._busy.locked()
 
-    def speak(self, text: str, sim=None) -> bool:
-        """Start a line. False if the duck is already mid-sentence."""
+    def speak(self, text: str, sim=None, mood: str = "neutral") -> bool:
+        """Start a line, in a mood. False if the duck is already mid-sentence.
+
+        The mood is validated on the worker, not here: this call happens on
+        the 50 Hz control thread, and a machine author's typo is a note on
+        stderr, not an exception thrown into the walking.
+        """
         if not self._busy.acquire(blocking=False):
             return False
-        threading.Thread(target=self._run, args=(text, sim),
+        threading.Thread(target=self._run, args=(text, sim, mood),
                          daemon=True, name="duck-say").start()
         return True
 
-    def _run(self, text: str, sim):
+    def _run(self, text: str, sim, mood: str = "neutral"):
         wav = None
         try:
             fd, wav = tempfile.mkstemp(prefix="duck-say-", suffix=".wav")
             os.close(fd)
             _, traj, _ = render_voice(text, self.ffmpeg, voice=self.tts_voice,
-                                      bank_dir=self.bank_dir, out_wav=wav)
+                                      bank_dir=self.bank_dir, out_wav=wav,
+                                      mood=mood)
             self._perform(wav, traj, sim)
         except Exception as e:
             # The line is already on the control surface; failing to voice it
@@ -540,6 +654,10 @@ def add_arguments(parser: argparse.ArgumentParser):
                         "without it the voice has no chirps")
     parser.add_argument("--voice", default=DEFAULT_TTS_VOICE,
                         help=f"TTS voice (default {DEFAULT_TTS_VOICE})")
+    parser.add_argument("--mood", default="neutral", choices=sorted(MOODS),
+                        help="same duck, different weather: the mood leans on "
+                        "pitch, tempo, modulation, which bank tag the grains "
+                        "come from, and the beak (default neutral)")
     parser.add_argument("--wav-out", default=None, metavar="PATH",
                         help="also keep the rendered wav here")
     parser.add_argument("--audio-only", action="store_true",
@@ -554,7 +672,8 @@ def run(args) -> int:
         ffmpeg = find_ffmpeg(args.ffmpeg)
         wav, traj, duration = render_voice(
             args.text, ffmpeg, voice=args.voice,
-            bank_dir=args.voice_bank, out_wav=args.wav_out)
+            bank_dir=args.voice_bank, out_wav=args.wav_out,
+            mood=getattr(args, "mood", "neutral"))
         if args.audio_only:
             afplay = shutil.which("afplay")
             if afplay is None:

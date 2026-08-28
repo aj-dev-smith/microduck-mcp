@@ -935,7 +935,9 @@ class DuckSim:
                 self._resolve_wakes(fired["from"], fired)
             say = self.machine.nodes[fired["to"]].get("say")
             if say:
-                self._say_line(fired["to"], say)
+                self._say_line(fired["to"], say,
+                               self.machine.nodes[fired["to"]].get("say_mood")
+                               or "neutral")
             emote = self.machine.nodes[fired["to"]].get("emote")
             if emote:
                 self._emote_node(fired["to"], emote)
@@ -945,7 +947,7 @@ class DuckSim:
                                  {"from": fired["from"], "when": fired["when"]},
                                  digest)
 
-    def _say_line(self, node: str, text: str):
+    def _say_line(self, node: str, text: str, mood: str = "neutral"):
         """A speaking node's line: onto the control surface, then into the air.
 
         The annotation goes through the same `say` verb `duck say` uses, so a
@@ -953,16 +955,22 @@ class DuckSim:
         identical on the event feed — and the film's control-surface feed
         picks it up for free.
 
+        The mood rides along on the event only when there IS one: a neutral
+        line is the ordinary case, and an event feed that annotates the
+        ordinary case stops being readable.
+
         Speaking is best-effort and belongs to the host: the robot has a mouth
         servo, not a speaker. Without a voice this session the line is still an
         event, which is the point of it being an annotation.
         """
+        args = {"cmd": "say", "node": node, "text": text}
+        if mood != "neutral":
+            args["mood"] = mood
         resp = self.handle({"cmd": "say", "text": text})
-        self._log_event("machine", {"cmd": "say", "node": node, "text": text},
-                        resp)
+        self._log_event("machine", args, resp)
         if self.voice is not None:
             try:
-                self.voice.speak(text, self)
+                self.voice.speak(text, self, mood)
             except Exception as e:      # this runs in the 50 Hz control loop:
                 print(f"note: voice failed ({e})", file=sys.stderr)  # nothing
                 self.voice = None       # about talking may stall the walking

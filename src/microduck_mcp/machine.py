@@ -35,6 +35,13 @@ and a server too old to know the key simply ignores it — an unknown node key
 has never been an error here, which is what makes a machine with a voice safe
 to hot-reload onto a server without one.
 
+A speaking node may add `say_mood = "excited"`: the weather on that line (see
+voice.MOODS). It is a separate key rather than a table-valued `say` for the
+degradation it buys — a server too old to know the mood speaks the line
+neutral, which is exactly right, where a `say = { ... }` table would have made
+the whole line unreadable to it. A mood with nothing to say is an error,
+though: that is a line the author lost, not a style choice.
+
 EMOTING NODES: `emote = "name"` names an authored gesture (emotes/*.toml, see
 emote.py) to play on entry, and it is `say`'s exact parallel — same code site,
 same annotation status, same indifference to whether anything is listening.
@@ -78,6 +85,14 @@ GUARD_PATHS = {
 # than imported: the grammar deliberately knows nothing about audio, and this
 # module's imports stay light enough to validate a machine anywhere.
 MAX_SAY_CHARS = 400
+
+# The moods a `say_mood` may name — voice.MOODS' keys, spelled out for the
+# same reason MAX_SAY_CHARS is: validating a machine must not need numpy, an
+# ffmpeg, or an opinion about audio. The roster is closed on purpose. A mood
+# is not free-form content like an emote name (which the server may or may not
+# have): it is a fixed vocabulary the renderer implements, so a typo here is a
+# load-time error rather than a line that quietly comes out flat.
+MOOD_NAMES = frozenset({"neutral", "excited", "sad", "alarmed", "smug"})
 
 _ALLOWED_NODES = (
     ast.Expression, ast.BoolOp, ast.UnaryOp, ast.Not, ast.USub, ast.And, ast.Or,
@@ -554,15 +569,25 @@ class Machine:
             wake = n.get("wake")
             wake_hold = n.get("wake_hold")
             say = n.get("say")
+            say_mood = n.get("say_mood")
             emote = n.get("emote")
             for key, val in (("wake", wake), ("wake_hold", wake_hold),
-                             ("say", say), ("emote", emote)):
+                             ("say", say), ("say_mood", say_mood),
+                             ("emote", emote)):
                 if val is not None and not isinstance(val, str):
                     raise MachineError(f"node {name!r}: {key} must be a string")
             if say is not None and len(say) > MAX_SAY_CHARS:
                 raise MachineError(
                     f"node {name!r}: say is {len(say)} chars (max "
                     f"{MAX_SAY_CHARS}) — a behavior node is not a monologue")
+            if say_mood is not None and say_mood not in MOOD_NAMES:
+                raise MachineError(
+                    f"node {name!r}: unknown say_mood {say_mood!r} "
+                    f"(have: {', '.join(sorted(MOOD_NAMES))})")
+            if say_mood is not None and say is None:
+                raise MachineError(
+                    f"node {name!r}: say_mood without say — a mood with "
+                    f"nothing to say")
             if wake_hold is not None and wake is None:
                 raise MachineError(
                     f"node {name!r}: wake_hold without wake — the hold is the "
@@ -578,7 +603,8 @@ class Machine:
                                 "params": n.get("params", {}),
                                 "transitions": trans,
                                 "wake": wake, "wake_hold": wake_hold,
-                                "say": say, "emote": emote}
+                                "say": say, "say_mood": say_mood,
+                                "emote": emote}
         # machine-level transitions (checked before the node's own — the
         # "fell over" escape hatch lives here)
         self.global_transitions = []
@@ -628,6 +654,8 @@ class Machine:
                                      if v["wake"] is not None),
                 "say_nodes": sorted(n for n, v in self.nodes.items()
                                     if v["say"] is not None),
+                "say_mood_nodes": sorted(n for n, v in self.nodes.items()
+                                         if v["say_mood"] is not None),
                 "emote_nodes": sorted(n for n, v in self.nodes.items()
                                       if v["emote"] is not None)}
 

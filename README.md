@@ -193,8 +193,11 @@ an annotation in the same sense `wake` is: the guards, the behaviors and the
 physics play out identically without it, and a server too old to know the key
 simply ignores it. `striker.toml` speaks on `celebrate` and `won` — both
 reachable only through the referee's call, so the celebration line is earned
-by construction. A node may carry `emote = "..."` the same way, and the two
-fire together: mouth to say, body to emote (see
+by construction. A speaking node may add `say_mood = "excited"` — a separate
+key rather than a table-valued `say`, so a server too old to know it speaks
+the line neutral instead of not at all (`striker.toml`'s `celebrate` is the
+one line in the repo that carries one). A node may carry `emote = "..."` the
+same way, and the two fire together: mouth to say, body to emote (see
 [Emotes](#emotes-the-ducks-body-language)).
 
 The design lineage: deterministic behaviors under guarded transitions, machine
@@ -302,6 +305,24 @@ No bank? The duck still talks, just chirpless (with a note). `--audio-only`
 skips the sim, `--wav-out` keeps the render, and `duck mouth 0.6` holds an
 expression by hand. Requires `say`, `ffmpeg` and `afplay` on the host —
 speech is rendered and played host-side; the sim gets only the beak.
+
+### Moods: same duck, different weather
+
+```bash
+uv run duck say "I found the ball" --mood excited --voice-bank bank/
+uv run duck say "the ball went behind the goal" --mood sad
+```
+
+`--mood neutral | excited | sad | alarmed | smug` (and `mood=` on `duck_say`).
+The recipe above is the duck's *identity* and it does not move; a mood only
+leans on knobs the pipeline already has — pitch, tempo, the two modulation
+depths, which bank tag the grains are cut from and how loud, how many
+syllables carry one, and how fast the beak shuts. A sad duck is this duck,
+slower and lower and cooing over `coo*.wav` grains; an alarmed one is not
+higher but faster and shakier, over `alarm*.wav`. `neutral` is the absence of
+overrides and renders exactly what it always did. The whole table is eight
+named fields per mood in `voice.MOODS` — retuning by ear is meant to be one
+line.
 
 ### The nonverbal voice (`duck chirp`)
 
