@@ -203,6 +203,109 @@ class TheCut(unittest.TestCase):
                                        without[-1]))
 
 
+class TheSoundClock(unittest.TestCase):
+    """Sim time -> the finished film's clock, across the cold open."""
+
+    def frames(self, n=100):
+        return [i / FPS for i in range(n)]
+
+    def test_the_cold_open_pushes_everything_back(self):
+        at = film.frame_clock(self.frames())
+        self.assertAlmostEqual(at(0.0), film.HOOK_FRAMES / FPS)
+
+    def test_a_beat_lands_on_the_frame_the_viewer_is_watching(self):
+        at = film.frame_clock(self.frames())
+        # the beat at sim t=3 s is on frame 50; the viewer sees it 1 s later
+        self.assertAlmostEqual(at(3.0), (film.HOOK_FRAMES + 50) / FPS)
+
+    def test_a_beat_after_the_last_frame_clamps_into_the_film(self):
+        at = film.frame_clock(self.frames(10))
+        self.assertAlmostEqual(at(900.0), (film.HOOK_FRAMES + 9) / FPS)
+
+    def test_a_take_with_no_frames_does_not_divide_by_anything(self):
+        self.assertAlmostEqual(film.frame_clock([])(7.0),
+                               film.HOOK_FRAMES / FPS)
+
+    def test_beats_keep_their_order_on_the_new_clock(self):
+        at = film.frame_clock(self.frames())
+        times = [at(t) for t in (0.0, 1.5, 3.0, 5.9)]
+        self.assertEqual(times, sorted(times))
+
+
+class TheScript(unittest.TestCase):
+    def args(self, **kw):
+        import argparse
+        p = argparse.ArgumentParser()
+        sub = p.add_subparsers(dest="command")
+        film.add_arguments(sub.add_parser("film"))
+        argv = ["film"]
+        for flag, value in kw.items():
+            name = f"--{flag.replace('_', '-')}"
+            argv += [name] if value is True else [name, value]
+        return p.parse_args(argv)
+
+    def test_zero_config_uses_the_shipped_lines(self):
+        from microduck_mcp import soundtrack
+        self.assertEqual(film.script_lines(self.args()),
+                         soundtrack.DEFAULT_LINES)
+
+    def test_a_line_can_be_rewritten(self):
+        lines = film.script_lines(self.args(line_goal="get in"))
+        self.assertEqual(lines["goal"], "get in")
+        self.assertEqual(lines["arm"],
+                         film.script_lines(self.args())["arm"])
+
+    def test_an_empty_line_is_kept_as_a_deletion(self):
+        # argparse cannot tell "" from "unset" for us; script_lines must.
+        self.assertEqual(film.script_lines(self.args(line_arm=""))["arm"], "")
+
+    def test_no_audio_films_silently_without_touching_the_toolchain(self):
+        self.assertIsNone(film.build_kit(self.args(no_audio=True),
+                                         ffmpeg="/nonexistent",
+                                         work_dir="/nonexistent"))
+
+    def test_a_toolchain_that_renders_nothing_is_a_silent_film_not_a_crash(self):
+        # No usable ffmpeg and no bank: every stage degrades, and the shoot
+        # ends up with no kit rather than with a broken one.
+        kit = film.build_kit(self.args(voice_bank="/nonexistent/bank"),
+                             ffmpeg="/nonexistent", work_dir="/nonexistent")
+        self.assertIsNone(kit)
+
+
+class ASilentFilm(unittest.TestCase):
+    """The soundtrack is an enhancement: without one, nothing changes."""
+
+    def shoot(self, kit=None):
+        s = object.__new__(MatchFilm)
+        s.kit = kit
+        s.quiet = True
+        s.ffmpeg = "ffmpeg"
+        return s
+
+    def test_dubbing_a_kitless_shoot_does_nothing(self):
+        # No kit, no ffmpeg call, no exception, and the mp4 is left alone.
+        self.shoot().dub("/nonexistent/film.mp4", [], [], 10)
+
+    def test_a_failed_dub_leaves_the_film_alone(self):
+        from microduck_mcp import soundtrack
+        kit = object.__new__(soundtrack.SoundKit)
+        kit.lines, kit.voicings = dict(soundtrack.DEFAULT_LINES), {}
+        kit.wheee, kit.chirp = None, np.ones(10, dtype=np.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "film.mp4")
+            with open(path, "wb") as f:
+                f.write(b"not really an mp4")
+            shoot = self.shoot(kit)
+            shoot.ffmpeg = "/nonexistent/ffmpeg"
+            shoot.dub(path, [film._soundtrack().Beat("node", 1.0, "kick")],
+                      [0.0, 1.0, 2.0], 30)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), b"not really an mp4")
+
+    def test_the_beak_is_shut_when_nobody_is_speaking(self):
+        self.assertIsNone(film._soundtrack().mouth_at([], 1.0))
+
+
 class FfmpegPreflight(unittest.TestCase):
     def test_a_missing_encoder_says_what_to_install(self):
         with self.assertRaises(FilmError) as caught:
@@ -268,6 +371,9 @@ class Wiring(unittest.TestCase):
         self.assertEqual(args.select, "won")
         self.assertEqual(args.scene, "pitch")
         self.assertEqual(args.takes, len(MATCH_SPAWNS))
+        # Sound is on by default, with nothing to configure.
+        self.assertFalse(args.no_audio)
+        self.assertIsNone(args.line_arm)
 
     def test_the_real_cli_parser_knows_the_subcommand(self):
         # Reaches the film subparser (which rejects the flag) rather than the

@@ -14,6 +14,14 @@ in a goal. Each frame is a composite of four honest things:
     load/arm calls, machine transitions, and the guard expression that fired
     each one, plus the referee's goal call.
 
+It also has a voice. The soundtrack (soundtrack.py) is cut from the take's own
+event timeline on the same sim clock the frames are sampled on: the duck says
+a line as the machine arms, chirps on the kick, and the referee's goal — only
+the referee's goal — gets the wheee, with the celebration line behind it. The
+beak moves with the words in the picture, off the same trajectory that drives
+the mix. Audio is an enhancement: anything that cannot be rendered is noted on
+stderr and the film is cut silently rather than not at all.
+
 Unlike every other `duck` subcommand this one does not talk to a running sim
 over the control socket: filming needs raw frame buffers at 17 fps, per-take
 resets and chosen spawns, none of which are (or should be) socket intents. So
@@ -25,6 +33,7 @@ of the slow work starts.
 """
 
 import argparse
+import bisect
 import math
 import os
 import shutil
@@ -75,6 +84,11 @@ END_CARD = ("DUCK 1 - 0 GOAL",
             "github.com/aj-dev-smith/microduck-mcp")
 CARD_S = 2.8
 
+# The cold open: the goal frame, held, so it becomes the timeline thumbnail.
+# Everything the soundtrack places is offset by it — the match starts here.
+HOOK_S = 1.0
+HOOK_FRAMES = int(HOOK_S * FPS)
+
 SANS_CANDIDATES = ("/System/Library/Fonts/Helvetica.ttc",
                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
 MONO_CANDIDATES = ("/System/Library/Fonts/Menlo.ttc",
@@ -93,6 +107,34 @@ FFMPEG_MISSING = (
 
 class FilmError(RuntimeError):
     """Anything that stops a shoot before it starts (or an encode failing)."""
+
+
+def _soundtrack():
+    """The soundtrack module, imported late on purpose.
+
+    voice.py imports this module for the ffmpeg preflight and soundtrack.py
+    imports voice.py, so a top-level import here would close the ring. The
+    sound is also strictly optional to filming, which is the shape a lazy
+    import is for.
+    """
+    from . import soundtrack
+    return soundtrack
+
+
+def frame_clock(frame_times, hook_frames: int = HOOK_FRAMES, fps: float = FPS):
+    """Take-relative sim time -> time on the finished film's clock.
+
+    The cut holds a goal frame as a cold open before the match starts, so the
+    two clocks differ by that hook. Times are resolved through the frames that
+    were actually kept — a cue lands on the frame the viewer is looking at
+    when the thing happened, not on an arithmetic guess about the sample rate.
+    """
+    def at(t_s: float) -> float:
+        if not frame_times:
+            return hook_frames / fps
+        k = min(bisect.bisect_left(frame_times, t_s), len(frame_times) - 1)
+        return (hook_frames + k) / fps
+    return at
 
 
 # ---------- take selection ----------
@@ -302,10 +344,11 @@ class MatchFilm:
 
     def __init__(self, sim, ffmpeg: str, machine_path: str,
                  machine_label: str = None, cards: bool = True,
-                 quiet: bool = False):
+                 quiet: bool = False, kit=None):
         self.sim = sim
         self.ffmpeg = ffmpeg
         self.machine_path = machine_path
+        self.kit = kit          # a soundtrack.SoundKit, or None for a silent film
         # What the feed shows for the load call: the path as a human would
         # type it, not the absolute one the loader resolved to.
         self.machine_label = machine_label or machine_path
@@ -327,12 +370,21 @@ class MatchFilm:
         if not self.quiet:
             print(msg, flush=True)
 
-    def tick(self):
-        """One 50 Hz control step — run_loop's body, minus socket and pacing."""
+    def tick(self, mouth: float = 0.0):
+        """One 50 Hz control step — run_loop's body, minus socket and pacing.
+
+        `mouth` is the commanded beak opening for this step, so the duck's
+        mouth moves with its lines on camera. It rides on a mocap plate with
+        no collision geometry and no dofs, exactly as it does live: the walk
+        policy's observation is untouched, and a silent film steps the same
+        physics as a talking one.
+        """
         sim = self.sim
         sim.policy.update_ground_pick_phase(self.dt)
         sim.policy.update_behavior(self.dt)
         sim.policy.apply_action(sim.policy.infer())
+        sim.mouth_opening = float(min(1.0, max(0.0, mouth)))
+        sim.mouth_tick()
         for _ in range(ss.DECIMATION):
             mujoco.mj_step(sim.model, sim.data)
         sim.sim_time += self.dt
@@ -340,7 +392,8 @@ class MatchFilm:
         sim.referee_tick()
         sim.machine_tick()
 
-    def render_frame(self, cam, node, goals, goal_age_s, t, celebrating=False):
+    def render_frame(self, cam, node, goals, goal_age_s, t, celebrating=False,
+                     mouth=None):
         sim, f = self.sim, self.fonts
         self.renderer.update_scene(sim.data, camera=cam.mjv(celebrating))
         img = Image.fromarray(self.renderer.render())
@@ -363,10 +416,23 @@ class MatchFilm:
         d.text((28 + 330, 24), f"t={t:5.1f}s", font=f.med, fill=(240, 240, 240))
         # sensed-state HUD under the duck cam: exactly what the AI knows
         bx, by = W - PIP_W - 16, 16 + PIP_H + 10
-        d.rectangle([bx - 3, by, W - 13, by + 66], fill=(12, 12, 12))
+        d.rectangle([bx - 3, by, W - 13, by + (66 if mouth is None else 88)],
+                    fill=(12, 12, 12))
         for i, (line, col) in enumerate(zip(hud_lines(sim._machine_digest()),
                                             HUD_COLORS)):
             d.text((bx + 6, by + 4 + 20 * i), line, font=f.mono_s, fill=col)
+        if mouth is not None:
+            # The beak trajectory, while the duck is talking: the same signal
+            # that opens the mouth on camera and places the chirps in the
+            # voice — so the HUD is showing the mix, not illustrating it.
+            ty = by + 4 + 20 * 3
+            d.text((bx + 6, ty), "beak", font=f.mono_s, fill=(200, 200, 200))
+            x0, x1 = bx + 6 + 44, W - 20
+            d.rectangle([x0, ty + 3, x1, ty + 13], outline=(90, 90, 90))
+            fill_w = (x1 - x0 - 2) * min(1.0, max(0.0, mouth))
+            if fill_w >= 1:
+                d.rectangle([x0 + 1, ty + 4, x0 + 1 + fill_w, ty + 12],
+                            fill=(255, 190, 90))
         # control-surface feed: the real MCP commands + machine transitions
         bar_y = H - 96
         d.rectangle([0, bar_y, W, H], fill=(8, 8, 8))
@@ -430,44 +496,92 @@ class MatchFilm:
             sim._log_event("mcp", {**req, **({"path": shown} if shown else {})},
                            resp)
 
+    def _cue_speech(self, speaking, beat: str, start_s: float):
+        """Schedule a rendered line's beak trajectory from `start_s`.
+
+        The lines are rendered before the shoot, so the mouth can be animated
+        live during the take from the same trajectory the mix will use — the
+        picture and the track are cut from one render, not synced afterwards.
+        """
+        voicing = self.kit.voicings.get(beat) if self.kit else None
+        if voicing is not None:
+            speaking.append((start_s, voicing))
+
     def film_take(self, index: int, spawn, out_path: str,
                   cap_s: float = DEFAULT_CAP_S) -> Take:
-        """Run one match, and encode it if it produced a goal."""
+        """Run one match, and cut it (picture and sound) if it produced a goal."""
+        st = _soundtrack()
         sim = self.sim
         self.start_take(spawn)
-        frames = []  # buffered so the goal moment can cold-open the cut
+        frames = []       # buffered so the goal moment can cold-open the cut
+        frame_times = []  # each frame's take-relative sim time: the sound clock
+        beats = [st.Beat(st.ARM, 0.0, "arm")]
+        speaking = []     # [(start_s, Voicing)] — what the beak is up to
+        self._cue_speech(speaking, "arm", 0.0)
         cam = BroadcastCamera(sim)
         t0 = sim.sim_time
         goal_t = None
         end_t = None
+        node = sim.machine.current
+        mouth = None
         i = 0
         while sim.sim_time - t0 < cap_s:
-            self.tick()
+            self.tick(mouth or 0.0)
             i += 1
+            t_rel = sim.sim_time - t0
             goals = sim.referee.count
             if goals > 0 and goal_t is None:
                 goal_t = sim.sim_time
-                self._say(f"  GOAL on film at t={goal_t - t0:.1f}s")
-            node = sim.machine.current
+                beats.append(st.Beat(st.GOAL, t_rel))
+                self._cue_speech(speaking, "goal",
+                                 t_rel + st.GOAL_LINE_DELAY_S)
+                self._say(f"  GOAL on film at t={t_rel:.1f}s")
+            if sim.machine.current != node:
+                node = sim.machine.current
+                beats.append(st.Beat(st.NODE, t_rel, node))
             if end_t is None and (node in ("won", "down") and goals > 0):
                 end_t = sim.sim_time + 3.0  # linger on the final pose
             if end_t is None and node == "down" and goals == 0:
                 break  # fell without scoring: not the take
+            mouth = st.mouth_at(speaking, t_rel)
             if i % FPS_EVERY == 0:
                 ga = None if goal_t is None else sim.sim_time - goal_t
                 celebrating = goals > 0 or node == "celebrate"
-                frames.append(self.render_frame(cam, node, goals, ga,
-                                                sim.sim_time - t0, celebrating))
+                frames.append(self.render_frame(cam, node, goals, ga, t_rel,
+                                                celebrating, mouth))
+                frame_times.append(t_rel)
             if end_t is not None and sim.sim_time >= end_t:
                 break
         scored = sim.referee.count > 0
         take = Take(index, tuple(spawn), out_path, scored, sim.machine.current,
                     round(sim.sim_time - t0, 1))
         if scored:
-            encode(self.cut(frames, goal_t, t0), out_path, self.ffmpeg)
+            seq = self.cut(frames, goal_t, t0)
+            encode(seq, out_path, self.ffmpeg)
+            self.dub(out_path, beats, frame_times, len(seq))
         self._say(f"take {index} {tuple(spawn)}: scored={scored} "
                   f"node={take.node} len={take.duration_s:.1f}s")
         return take
+
+    def dub(self, path: str, beats, frame_times, n_frames: int):
+        """Cut the soundtrack to this take's beats and mux it onto the film.
+
+        Wrapped end to end: a soundtrack is worth having and never worth
+        losing a filmed goal over, so every failure here downgrades to a
+        silent film plus a note.
+        """
+        if self.kit is None or not self.kit.audible:
+            return
+        st = _soundtrack()
+        try:
+            cues = st.plan_cues(beats, self.kit.lines)
+            track = self.kit.track(cues, n_frames / FPS,
+                                   frame_clock(frame_times))
+            st.mux(path, track, self.ffmpeg)
+            self._say(f"  audio: {st.scored_note(cues)}")
+        except Exception as e:
+            print(f"note: no soundtrack on take ({e}) — the film is silent",
+                  file=sys.stderr)
 
     def cut(self, frames, goal_t, t0):
         """Assemble for the scroll-by: the GOAL! money shot as a 1 s cold open
@@ -475,7 +589,7 @@ class MatchFilm:
         credits at the very end."""
         hook_i = min(len(frames) - 1,
                      int((goal_t - t0 + 1.1) * FPS)) if goal_t else 0
-        seq = [frames[hook_i]] * int(1.0 * FPS) + frames
+        seq = [frames[hook_i]] * HOOK_FRAMES + frames
         if self.cards:
             seq += self.card(TITLE_CARD, CARD_S) + self.card(END_CARD, CARD_S)
         return seq
@@ -537,11 +651,76 @@ def add_arguments(parser: argparse.ArgumentParser):
                         help="ffmpeg binary to encode with (default: ffmpeg on PATH)")
     parser.add_argument("--no-cards", action="store_true",
                         help="drop the title and credit cards; match footage only")
+    parser.add_argument("--no-audio", action="store_true",
+                        help="film silently: no voice, no wheee, no chirps")
+    parser.add_argument("--voice-bank", default=os.environ.get("DUCK_VOICE_BANK"),
+                        metavar="DIR",
+                        help="voice-bank wavs from the microduck `sounds` "
+                             "crate (chirp*.wav, wheee.wav); without it the "
+                             "shoot renders its own from the crate beside "
+                             "--policies, and films chirpless if it cannot")
+    parser.add_argument("--tts-voice", default=_soundtrack().DEFAULT_TTS_VOICE,
+                        metavar="NAME",
+                        help="TTS voice the duck's own voice is built from")
+    parser.add_argument("--line-arm", default=None, metavar="TEXT",
+                        help="what the duck says as the machine arms "
+                             "(empty string: say nothing)")
+    parser.add_argument("--line-goal", default=None, metavar="TEXT",
+                        help="what the duck says after a goal (empty string: "
+                             "let the wheee speak for itself)")
     parser.add_argument("--keep-takes", action="store_true",
                         help="keep every scoring take next to the output "
                              "instead of only the chosen one")
     parser.add_argument("--quiet", action="store_true",
                         help="only print the path of the finished film")
+
+
+def script_lines(args) -> dict:
+    """The film's script: the defaults, with anything the caller overrode.
+
+    An explicitly empty line is a deletion, not a default — `--line-arm ""`
+    means the film opens without a word.
+    """
+    lines = dict(_soundtrack().DEFAULT_LINES)
+    for beat in ("arm", "goal"):
+        override = getattr(args, f"line_{beat}", None)
+        if override is not None:
+            lines[beat] = override
+    return lines
+
+
+def build_kit(args, ffmpeg: str, work_dir: str):
+    """Render the shoot's sound, or return None and say what went wrong.
+
+    Zero-config: with no --voice-bank the shoot renders its own from the
+    `sounds` crate in the repo that --policies already points into. Cargo
+    missing, crate not building, no TTS on this platform — each is a note on
+    stderr and a quieter film, never a failed shoot.
+    """
+    if args.no_audio:
+        return None
+    st = _soundtrack()
+    try:
+        bank = args.voice_bank
+        if not bank:
+            repo = st.find_sounds_repo(args.policies)
+            if repo is not None:
+                if not args.quiet:
+                    print(f"rendering the voice bank from {repo} "
+                          f"(first build can take a minute)", flush=True)
+                bank = st.render_bank(repo, os.path.join(work_dir, "bank"))
+            if not bank:
+                print("note: no voice bank — pass --voice-bank DIR, or point "
+                      "--policies into a microduck checkout with the `sounds` "
+                      "crate", file=sys.stderr)
+        kit = st.SoundKit(script_lines(args), ffmpeg, bank, args.tts_voice)
+    except Exception as e:
+        print(f"note: no sound this shoot ({e}) — filming silently",
+              file=sys.stderr)
+        return None
+    for note in kit.notes:
+        print(f"note: {note}", file=sys.stderr)
+    return kit if kit.audible else None
 
 
 def run(args) -> int:
@@ -560,12 +739,16 @@ def run(args) -> int:
     shoot = None
     takes = []
     try:
+        # Before the model loads, like the ffmpeg preflight: rendering the
+        # voice is the one other slow thing that can degrade, and the shoot
+        # should say so up front rather than after a two-minute match.
+        kit = build_kit(args, ffmpeg, frames_dir)
         sim = ss.DuckSim(args.rl_repo, args.policies, args.scene, frames_dir)
         if sim.referee is None or sim.policy.ball_qpos_adr is None:
             raise FilmError(f"scene {args.scene!r} has no goal to score in — "
                             "film needs --scene pitch")
         shoot = MatchFilm(sim, ffmpeg, machine_path, machine_label=args.machine,
-                          cards=not args.no_cards, quiet=args.quiet)
+                          cards=not args.no_cards, quiet=args.quiet, kit=kit)
         for index, spawn in enumerate(MATCH_SPAWNS[:args.takes]):
             take = shoot.film_take(
                 index, spawn, take_path(args.output, index, args.keep_takes),
