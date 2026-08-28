@@ -111,6 +111,59 @@ class MachineValidation(unittest.TestCase):
             Machine(spec)
 
 
+class WakeNodes(unittest.TestCase):
+    """The wake grammar: `wake = "reason"` on a node, with ocarina's
+    mandatory-default discipline — a deadline transition on elapsed_s, or an
+    explicit wake_hold declaring that parking forever is the answer."""
+
+    @staticmethod
+    def _spec(node):
+        return {"machine": {"name": "t", "initial": "a"},
+                "node": [{"name": "a", "behavior": "idle",
+                          "transition": [{"when": "upright", "to": "w"}]},
+                         node]}
+
+    def test_wake_without_deadline_or_hold_refused(self):
+        with self.assertRaisesRegex(MachineError, "deadline"):
+            Machine(self._spec({"name": "w", "behavior": "idle",
+                                "wake": "something happened"}))
+
+    def test_wake_with_deadline_loads(self):
+        m = Machine(self._spec({
+            "name": "w", "behavior": "idle", "wake": "something happened",
+            "transition": [{"when": "elapsed_s > 300.0", "to": "a"}]}))
+        self.assertEqual(m.nodes["w"]["wake"], "something happened")
+        self.assertIsNone(m.nodes["a"]["wake"])
+
+    def test_wake_with_hold_loads(self):
+        m = Machine(self._spec({"name": "w", "behavior": "idle",
+                                "wake": "down", "wake_hold": "safe on floor"}))
+        self.assertEqual(m.nodes["w"]["wake_hold"], "safe on floor")
+
+    def test_hold_without_wake_refused(self):
+        with self.assertRaisesRegex(MachineError, "wake_hold"):
+            Machine(self._spec({"name": "w", "behavior": "idle",
+                                "wake_hold": "orphaned hold"}))
+
+    def test_non_string_wake_refused(self):
+        with self.assertRaisesRegex(MachineError, "string"):
+            Machine(self._spec({"name": "w", "behavior": "idle", "wake": 1}))
+
+    def test_status_lists_wake_nodes(self):
+        m = Machine(self._spec({"name": "w", "behavior": "idle",
+                                "wake": "hey", "wake_hold": "parked"}))
+        self.assertEqual(m.status()["wake_nodes"], ["w"])
+
+    def test_shipped_resident_machine_loads(self):
+        m = Machine.load(os.path.join(REPO, "machines", "resident.toml"))
+        self.assertEqual(m.initial, "rest")
+        self.assertEqual(m.status()["wake_nodes"], ["ball_spotted", "fallen"])
+
+    def test_shipped_striker_wake_nodes(self):
+        m = Machine.load(os.path.join(REPO, "machines", "striker.toml"))
+        self.assertEqual(m.status()["wake_nodes"], ["down", "won"])
+
+
 class _StubPolicy:
     def __init__(self):
         self.cmds = []

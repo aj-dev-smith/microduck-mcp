@@ -12,6 +12,8 @@ Library (`request()`) plus a small CLI:
     duck reset
     duck machine load machines/soccer.toml
     duck machine arm | disarm | status | reload | force <node>
+    duck machine wait [--block-s 300]     # block until a wake node fires
+    duck machine arm --block-s 300        # arm, then block for the first wake
     duck film -o match.mp4
     duck mouth 0.6
     duck say "hello A J" --voice-bank bank/
@@ -74,9 +76,13 @@ def main():
     sub.add_parser("reset")
     m = sub.add_parser("machine")
     m.add_argument("action", choices=["load", "reload", "status", "arm",
-                                      "disarm", "force"])
+                                      "disarm", "force", "wait"])
     m.add_argument("arg", nargs="?", default=None,
                    help="path for load, node name for force")
+    m.add_argument("--block-s", type=float, default=None,
+                   help="wait: how long to block for a wake (default 55; "
+                   "returns no_wake and you call again). arm/force: block "
+                   "for the first wake after the jump.")
     mo = sub.add_parser("mouth", help="set the beak opening")
     mo.add_argument("opening", type=float, help="0 (closed) to 1 (open)")
     # `film` and `say` are not plain socket intents — film boots its own
@@ -117,11 +123,17 @@ def main():
             req["path"] = os.path.abspath(args.arg or "")
         elif args.action == "force":
             req["node"] = args.arg
+        if args.action == "wait" and args.block_s is None:
+            args.block_s = 55.0
+        if args.block_s is not None and args.action in ("wait", "arm", "force"):
+            req["block_s"] = args.block_s
     else:
         req = {"cmd": args.command}
 
+    # A blocking machine wait must outlive its block window on the socket.
+    timeout = req.get("block_s", 0.0) + 15.0 if "block_s" in req else 12.0
     try:
-        resp = request(req, sock_path=args.socket)
+        resp = request(req, sock_path=args.socket, timeout=timeout)
     except (ConnectionRefusedError, FileNotFoundError):
         print(json.dumps({"ok": False, "error": f"sim server not running (socket {args.socket or DEFAULT_SOCKET})"}))
         sys.exit(1)

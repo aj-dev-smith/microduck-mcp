@@ -1,0 +1,84 @@
+# resident.toml — not a soccer player: an inhabitant.
+#
+# The machine that runs while a mind LIVES in the duck. Mostly it rests and
+# occasionally looks around; the point is the WAKE NODES — ocarina's wake,
+# ported (see ~/Code/ocarina MACHINE.md; machine.py's docstring for the
+# robot adaptation). Entering a node that declares `wake = "..."` parks a
+# wake pack on the sim server (reason + sensed-digest snapshot + event
+# tail); the mind listens with a blocking call:
+#
+#     duck machine load machines/resident.toml
+#     duck machine arm --block-s 300      # arm, then block until woken
+#     duck machine wait --block-s 300     # ...and keep listening
+#
+# A robot cannot freeze like a paused game, so a wake node's own behavior is
+# the holding pattern while the mind thinks, and its deadline transition
+# (guarded on elapsed_s) is the default that runs if no answer ever comes.
+# Autonomous-first, mind-optional — the machine never NEEDS the mind, it
+# just knows what deserves one.
+
+[machine]
+name = "resident"
+initial = "rest"
+
+# The fall reflex: wake once, from the floor. `fallen` excludes itself so
+# the wake cannot restorm; `down` is the post-deadline park.
+[[machine.transition]]
+when = "not upright and elapsed_s > 0.5 and node != 'fallen' and node != 'down'"
+to = "fallen"
+
+[[node]]
+name = "rest"
+behavior = "idle"
+[[node.transition]]
+when = "ball_seen.visible and ball_seen.age_s < 0.4"
+to = "ball_spotted"
+[[node.transition]]                 # boredom: glance around the room
+when = "elapsed_s > 45.0"
+to = "look_around"
+
+[[node]]
+name = "look_around"
+behavior = "search_ball"            # a scan is just the search turn —
+[node.params]                       # wz below ~1.2 is a dead zone, so the
+wz = 1.5                            # glance is a brisk one
+[[node.transition]]
+when = "ball_seen.visible and ball_seen.age_s < 0.4"
+to = "ball_spotted"
+[[node.transition]]
+when = "elapsed_s > 5.0"
+to = "rest"
+
+[[node]]
+name = "ball_spotted"
+behavior = "idle"                   # stand and look at it: the holding pattern
+wake = "ball sighted — what do we do with it?"
+[[node.transition]]                 # the deadline default: lost interest
+when = "elapsed_s > 300.0"
+to = "rest"
+[[node.transition]]                 # it left before the mind answered
+when = "not ball_seen.visible and ball_seen.age_s > 10.0"
+to = "rest"
+
+[[node]]
+name = "watch_ball"
+behavior = "idle"
+# The mind's parking answer to ball_spotted (`duck machine force watch_ball`):
+# acknowledged, keep an eye on it, don't wake me for the same ball again.
+[[node.transition]]
+when = "not ball_seen.visible and ball_seen.age_s > 10.0"
+to = "rest"
+
+[[node]]
+name = "fallen"
+behavior = "idle"
+wake = "I've fallen — no stand-up policy; duck_reset is the escape hatch"
+[[node.transition]]                 # deadline default: park quietly
+when = "elapsed_s > 300.0"
+to = "down"
+
+[[node]]
+name = "down"
+behavior = "idle"
+# Terminal, and deliberately NOT a wake node: the `fallen` wake already
+# went out, and the global fall reflex excludes this park.

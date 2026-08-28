@@ -508,6 +508,16 @@ class DuckSim:
         # Command-feed ring buffer for the AX debug page (webui.py).
         self.events = deque(maxlen=500)
         self._event_id = 0
+        # The wake latch (ocarina's wake pack, robot-adapted): entering a
+        # machine node that declares `wake = "..."` parks a pack here, and a
+        # `machine wait` long-polls it from its own connection thread — never
+        # the request queue, which the 50 Hz sim thread drains synchronously.
+        # The robot cannot freeze like a paused game, so the wake node's own
+        # behavior is the holding pattern and its deadline transition (or
+        # declared wake_hold) is the no-answer default.
+        self._wake_cond = threading.Condition()
+        self._wakes = deque(maxlen=16)  # parked packs, oldest first
+        self._wake_id = 0
 
     def _fix_ball_contact(self):
         """Give the ball real rolling resistance (see BALL_ROLL_FRICTION)."""
@@ -743,7 +753,8 @@ class DuckSim:
     def machine_tick(self):
         if self.machine is None or not self.machine.armed:
             return
-        fired = self.machine.tick(self, self._machine_digest())
+        digest = self._machine_digest()
+        fired = self.machine.tick(self, digest)
         if fired:
             self._event_id += 1
             self.events.append({
@@ -753,6 +764,83 @@ class DuckSim:
                 "ok": True, "note": "",
             })
             print(f"machine: {fired['from']} -> {fired['to']}  [{fired['when']}]")
+            if self.machine.nodes[fired["from"]]["wake"] is not None:
+                self._resolve_wakes(fired["from"], fired)
+            wake = self.machine.nodes[fired["to"]]["wake"]
+            if wake is not None:
+                self._latch_wake(fired["to"], wake,
+                                 {"from": fired["from"], "when": fired["when"]},
+                                 digest)
+
+    def _latch_wake(self, node: str, reason: str, via: dict, digest: dict):
+        """Sim thread: park a wake pack and release any blocked machine_wait.
+        The pack carries what ocarina's does — reason, digest snapshot, event
+        tail, the transition that fired — so the mind wakes into context, not
+        into a contextless prompt."""
+        self._event_id += 1
+        self.events.append({
+            "id": self._event_id, "t": time.time(), "client": "machine",
+            "cmd": "wake", "args": {"node": node, **via}, "ok": True,
+            "note": reason,
+        })
+        pack = {
+            "reason": reason, "node": node, "via": via,
+            "sim_time_s": round(self.sim_time, 3),
+            "digest": digest,
+            "events": list(self.events)[-8:],
+            "resolved": None,
+        }
+        with self._wake_cond:
+            self._wake_id += 1
+            pack["id"] = self._wake_id
+            self._wakes.append(pack)
+            self._wake_cond.notify_all()
+        print(f"machine: WAKE [{node}] {reason}")
+
+    def _resolve_wakes(self, node: str, fired: dict):
+        """Sim thread: the machine left a wake node on its own (the deadline
+        default, or any other guard firing first) — mark still-parked packs
+        for that node, so a late listener learns the body already answered
+        itself, and how."""
+        with self._wake_cond:
+            for pack in self._wakes:
+                if pack["node"] == node and pack["resolved"] is None:
+                    pack["resolved"] = {"to": fired["to"],
+                                        "when": fired["when"],
+                                        "sim_time_s": round(self.sim_time, 3)}
+
+    def _maybe_entry_wake(self, via: dict):
+        """Sim thread: arm/force landed the machine directly on a wake node."""
+        m = self.machine
+        if m is not None and m.armed and m.nodes[m.current]["wake"] is not None:
+            self._latch_wake(m.current, m.nodes[m.current]["wake"], via,
+                             self._machine_digest())
+
+    def machine_wait(self, block_s: float = 55.0) -> dict:
+        """CLIENT-connection thread: long-poll the wake latch. Returns the
+        oldest parked pack, or an honest no_wake once block_s expires — the
+        caller re-arms with another wait (ocarina's max_block_s pattern, for
+        clients whose request timeouts are shorter than a quiet afternoon)."""
+        block_s = max(0.0, min(float(block_s), 600.0))
+        t0 = time.monotonic()
+        deadline = t0 + block_s
+        with self._wake_cond:
+            while True:
+                if self._wakes:
+                    return {"ok": True, "wake": self._wakes.popleft()}
+                m = self.machine
+                if m is None:
+                    return {"ok": False,
+                            "error": "no machine loaded (action=load first)"}
+                if not m.armed:
+                    return {"ok": False, "error": "machine is disarmed — "
+                            "nothing will ever wake (arm it first)"}
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"ok": True, "no_wake": True,
+                            "waited_s": round(time.monotonic() - t0, 1)}
+                # Short slices so a disarm/unload during the wait is noticed.
+                self._wake_cond.wait(timeout=min(remaining, 0.5))
 
     def _handle_machine(self, req: dict) -> dict:
         action = req.get("action", "status")
@@ -783,6 +871,7 @@ class DuckSim:
         if action == "arm":
             m.enter(m.initial, self.sim_time)
             m.armed = True
+            self._maybe_entry_wake({"action": "arm"})
             return {"ok": True, **m.status()}
         if action == "disarm":
             m.armed = False
@@ -794,6 +883,7 @@ class DuckSim:
                 return {"ok": False, "error": f"unknown node {node!r} "
                         f"(have: {', '.join(sorted(m.nodes))})"}
             m.enter(node, self.sim_time)
+            self._maybe_entry_wake({"action": "force"})
             return {"ok": True, **m.status()}
         if action == "status":
             return {"ok": True, **m.status()}
@@ -1077,6 +1167,24 @@ def serve_socket(sim: DuckSim, sock_path: str, stop: threading.Event):
     server.settimeout(0.5)
     print(f"Control socket: {sock_path}")
 
+    def dispatch(req: dict) -> dict:
+        # `machine wait` (and arm/force with a block_s) long-polls the wake
+        # latch on THIS connection thread — it must never ride the request
+        # queue, which the sim thread drains synchronously between ticks.
+        if req.get("cmd") == "machine":
+            block_s = req.pop("block_s", None)
+            if req.get("action") == "wait":
+                return sim.machine_wait(55.0 if block_s is None else block_s)
+            resp = sim.submit(req)
+            if (block_s is not None and resp.get("ok")
+                    and req.get("action") in ("arm", "force")):
+                wake = sim.machine_wait(block_s)
+                resp = {**resp,
+                        **{k: v for k, v in wake.items() if k != "ok"},
+                        "ok": bool(wake.get("ok"))}
+            return resp
+        return sim.submit(req)
+
     def client_thread(conn):
         with conn, conn.makefile("rwb") as f:
             for line in f:
@@ -1085,7 +1193,7 @@ def serve_socket(sim: DuckSim, sock_path: str, stop: threading.Event):
                     continue
                 try:
                     req = json.loads(line)
-                    resp = sim.submit(req)
+                    resp = dispatch(req)
                 except Exception as e:
                     resp = {"ok": False, "error": repr(e)}
                 f.write((json.dumps(resp) + "\n").encode())

@@ -171,7 +171,10 @@ behavior = "idle"
 # The ball is IN the goal and `goal.scored` stays latched while it sits
 # there. Park, and let the scoreboard say when there is a match to play: the
 # referee re-arms once the ball is back out in front of the line, which is
-# what a reset (or a hand putting the ball back) does.
+# what a reset (or a hand putting the ball back) does. WAKE the mind — a
+# goal deserves company (and someone to run duck_say).
+wake = "GOAL — match won, ball in the net"
+wake_hold = "parked and safe; the referee re-arms when the ball comes back out"
 [[node.transition]]
 when = "not goal.scored"
 to = "search"
@@ -179,4 +182,8 @@ to = "search"
 [[node]]
 name = "down"
 behavior = "idle"
-# Terminal until the mind intervenes: no stand-up policy exists yet.
+# Terminal until the mind intervenes: no stand-up policy exists yet. So
+# SAY SO — wake whoever is listening, and hold (the honest default: there
+# is nothing better a machine with no StandUp can do from the floor).
+wake = "down and cannot stand — no stand-up policy; duck_reset is the escape hatch"
+wake_hold = "safe on the floor, holding for a reset"

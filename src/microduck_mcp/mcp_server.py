@@ -159,9 +159,10 @@ class DuckState(BaseModel):
         "forward=0.09, left=±0.042 — aim for that spot before an unstaged kick.")
 
 
-def _call(req: dict, retries_note: str = "") -> dict[str, Any]:
+def _call(req: dict, retries_note: str = "",
+          timeout: float = 12.0) -> dict[str, Any]:
     try:
-        resp = request({**req, "client": "mcp"})
+        resp = request({**req, "client": "mcp"}, timeout=timeout)
     except (ConnectionRefusedError, FileNotFoundError, TimeoutError) as e:
         raise ToolError(
             f"Simulator not reachable ({e.__class__.__name__}). Start it with "
@@ -393,12 +394,23 @@ class MachineStatus(BaseModel):
     armed: bool | None = None
     node: str | None = Field(default=None, description="Current node")
     nodes: list[str] | None = None
+    wake_nodes: list[str] | None = Field(default=None, description="Nodes that "
+                                         "park a wake pack on entry")
     note: str | None = None
+    wake: dict[str, Any] | None = Field(default=None, description="The wake "
+        "pack (action='wait' or a blocking arm/force): reason, node, the "
+        "transition that fired (via), a digest snapshot, the recent event "
+        "tail. `resolved` is non-null if the machine's deadline default "
+        "already ran before anyone listened — the body answered itself.")
+    no_wake: bool | None = Field(default=None, description="True: block_s "
+        "elapsed with nothing to report — wait again to keep listening")
+    waited_s: float | None = None
 
 
 @mcp.tool(title="Behavior machine", annotations=_EPISODIC)
 def duck_machine(action: str, path: str | None = None,
-                 node: str | None = None) -> MachineStatus:
+                 node: str | None = None,
+                 block_s: float | None = None) -> MachineStatus:
     """Drive the duck's behavior machine — autonomy between your decisions.
 
     A machine is TOML source (see machines/soccer.toml): nodes bind behaviors
@@ -413,16 +425,31 @@ def duck_machine(action: str, path: str | None = None,
 
     Actions: 'load' (path, validates + loads disarmed), 'arm' (start at the
     initial node), 'disarm' (stop, zero velocity), 'reload' (hot-swap edited
-    source; keeps armed state), 'force' (node, jump now), 'status'.
+    source; keeps armed state), 'force' (node, jump now), 'status', and
+    'wait' — BLOCK until the machine wakes you. A node declaring
+    wake = "reason" parks a wake pack on entry (reason + digest snapshot +
+    event tail); 'wait' returns the oldest pack, or no_wake=true after
+    block_s (default 55 s — wait again to keep listening; the machine keeps
+    playing either way, and its own deadline transition answers a wake you
+    slept through, reported in the pack's `resolved`). Pass block_s with
+    'arm' or 'force' to arm-and-listen in one blocking call — the residency
+    loop: arm(block_s) -> act on the wake (force/reload/say) -> wait again.
+    machines/resident.toml is the idle-life machine built around this.
     While armed the machine owns the velocity intent — duck_drive still works
     but the machine will override it on its next tick. Transitions appear in
-    the event feed tagged 'machine'."""
+    the event feed tagged 'machine', wakes as 'wake'."""
     req: dict[str, Any] = {"cmd": "machine", "action": action}
     if path is not None:
         req["path"] = path
     if node is not None:
         req["node"] = node
-    return MachineStatus(**_call(req))
+    timeout = 12.0
+    if action == "wait" and block_s is None:
+        block_s = 55.0
+    if block_s is not None and action in ("wait", "arm", "force"):
+        req["block_s"] = block_s
+        timeout = block_s + 15.0
+    return MachineStatus(**_call(req, timeout=timeout))
 
 
 @mcp.tool(title="Reset the sim", annotations=_RESET)

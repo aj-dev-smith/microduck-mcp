@@ -159,9 +159,30 @@ and chases the rebound when it doesn't. On the pitch the ball kicks off a
 metre from the goal line, where the mouth subtends ±11° and aiming is the
 difference between scoring and a throw-in.
 
+### Wake nodes: the machine wakes the agent
+
+The interrupt line runs the other way too. A node declaring `wake = "reason"`
+parks a **wake pack** on entry — reason, a snapshot of the sensed digest, the
+recent event tail — and a blocked `duck machine wait` (or `duck machine arm
+--block-s 300`, arm-and-listen in one call) returns it. The agent's loop
+becomes: block → wake into context → act (`force` a node, `reload` edited
+source, speak) → block again.
+
+A robot can't freeze like a paused game while the mind thinks, so the wake
+node's own behavior is the holding pattern, and every wake node must declare
+its no-answer default in source: either a transition guarded on `elapsed_s`
+(the deadline — the machine answers itself and the late listener finds that
+answer in the pack's `resolved` field) or an explicit
+`wake_hold = "why parking here forever is safe"`. Autonomous-first,
+mind-optional, by construction. [`machines/resident.toml`](machines/resident.toml)
+is the idle-life machine built around this; `striker.toml` wakes on `won`
+(come celebrate) and `down` (no stand-up policy — bring `duck_reset`).
+
 The design lineage: deterministic behaviors under guarded transitions, machine
-source in a git repo, hot-swapped live — a pattern borrowed from an MCP
-instrument built for playing *Ocarina of Time*, ported from Hyrule to a robot.
+source in a git repo, hot-swapped live, and blocking wake delivery — the
+machine decides what deserves a mind's attention — all patterns borrowed from
+an MCP instrument built for playing *Ocarina of Time*, ported from Hyrule to
+a robot.
 
 ## Filming a match
 

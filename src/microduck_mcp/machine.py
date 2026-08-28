@@ -13,6 +13,17 @@ repo the agent edits and hot-swaps via the `machine` socket command family.
 Guards are expression strings compiled through the ast module against a strict
 whitelist: dotted digest paths, numeric/string/bool literals, comparisons,
 and/or/not. Nothing else parses, so nothing else runs.
+
+WAKE NODES (ocarina's wake, robot-adapted): a node may declare
+`wake = "reason"` — entering it parks a wake pack on the sim server, where a
+blocked `machine wait` picks it up (the mind's interrupt line). A robot cannot
+freeze the world like a paused game, so the wake node's own behavior is the
+holding pattern while the mind thinks, and ocarina's mandatory non-wake
+default becomes source you can read: every wake node must either carry a
+transition guarded on elapsed_s (the deadline default that runs if no answer
+ever comes) or declare `wake_hold = "why parking here forever is safe"` (the
+explicit hold — a fallen duck with no stand-up policy has nothing better to
+do). The machine stays autonomous-first, mind-optional, by construction.
 """
 
 import ast
@@ -142,6 +153,19 @@ def compile_guard(expr: str):
         return bool(ev(tree))
 
     return evaluate
+
+
+def guard_paths(expr: str) -> set:
+    """The digest paths a guard reads. Parse-only — call after (or alongside)
+    compile_guard, which owns validation."""
+    tree = ast.parse(expr, mode="eval")
+    paths = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            p = _path_of(node)
+            if p in GUARD_PATHS:
+                paths.add(p)
+    return paths
 
 
 # ---------- behaviors (the leaves) ----------
@@ -502,9 +526,26 @@ class Machine:
                 trans.append({"when": t["when"],
                               "guard": compile_guard(t["when"]),
                               "to": t["to"]})
+            wake = n.get("wake")
+            wake_hold = n.get("wake_hold")
+            for key, val in (("wake", wake), ("wake_hold", wake_hold)):
+                if val is not None and not isinstance(val, str):
+                    raise MachineError(f"node {name!r}: {key} must be a string")
+            if wake_hold is not None and wake is None:
+                raise MachineError(
+                    f"node {name!r}: wake_hold without wake — the hold is the "
+                    f"declared default for a wake nobody answered")
+            if wake is not None and wake_hold is None and not any(
+                    "elapsed_s" in guard_paths(t["when"]) for t in trans):
+                raise MachineError(
+                    f"wake node {name!r} has no deadline: add a transition "
+                    f"guarded on elapsed_s (the default that runs if the mind "
+                    f"never answers) or an explicit wake_hold = \"why parking "
+                    f"here forever is safe\"")
             self.nodes[name] = {"behavior": bname,
                                 "params": n.get("params", {}),
-                                "transitions": trans}
+                                "transitions": trans,
+                                "wake": wake, "wake_hold": wake_hold}
         # machine-level transitions (checked before the node's own — the
         # "fell over" escape hatch lives here)
         self.global_transitions = []
@@ -549,7 +590,9 @@ class Machine:
     def status(self) -> dict:
         return {"name": self.name, "source": self.source_path,
                 "armed": self.armed, "node": self.current,
-                "nodes": sorted(self.nodes)}
+                "nodes": sorted(self.nodes),
+                "wake_nodes": sorted(n for n, v in self.nodes.items()
+                                     if v["wake"] is not None)}
 
     def tick(self, sim, digest: dict):
         """One 50 Hz step: transitions first (global, then node, in order),
