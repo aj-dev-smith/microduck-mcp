@@ -18,6 +18,7 @@ Library (`request()`) plus a small CLI:
     duck mouth 0.6
     duck say "hello A J" --voice-bank bank/
     duck chirp inquire --voice-bank bank/    # nonverbal: one call from the bank
+    duck emote head_tilt | duck emote --list # authored gestures (see emotes/)
 
 Every subcommand but `film`, `say` and `chirp` is a one-shot intent over the
 socket; `film` runs its own headless sim and writes an mp4 (see film.py), and
@@ -86,6 +87,12 @@ def main():
                    "for the first wake after the jump.")
     mo = sub.add_parser("mouth", help="set the beak opening")
     mo.add_argument("opening", type=float, help="0 (closed) to 1 (open)")
+    em = sub.add_parser("emote", help="play an authored gesture")
+    em.add_argument("name", nargs="?", default=None,
+                    help="emote name — the file stem in the server's emote "
+                    "directory (head_tilt, nod, perk_up, droop)")
+    em.add_argument("--list", action="store_true", dest="list_emotes",
+                    help="list the server's emotes and whether they parse")
     # `film`, `say` and `chirp` are not plain socket intents — film boots its
     # own headless sim, the two voices play audio host-side and then perform
     # it — so their flags live next to their implementations.
@@ -122,6 +129,11 @@ def main():
             req["angle_deg"] = args.angle_deg
     elif args.command == "mouth":
         req = {"cmd": "mouth", "opening": args.opening}
+    elif args.command == "emote":
+        # No name is the same question as --list: "what can it do?"
+        req = ({"cmd": "emote", "name": args.name}
+               if args.name and not args.list_emotes
+               else {"cmd": "emote", "action": "list"})
     elif args.command == "machine":
         req = {"cmd": "machine", "action": args.action}
         if args.action == "load":

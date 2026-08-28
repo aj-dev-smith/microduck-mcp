@@ -312,6 +312,52 @@ def duck_chirp(tag: str, variant: int = 0,
     return DuckState(**_call({"cmd": "state"}))
 
 
+class EmoteResult(BaseModel):
+    """An emote played, or the directory listed."""
+
+    ok: bool
+    emote: str | None = Field(default=None, description="The gesture that started")
+    duration_s: float | None = Field(default=None, description="How long it "
+                                     "plays; the head is yours again after")
+    sound: str | None = Field(default=None, description="Voice-bank tag the "
+                              "gesture fires at t=0, if any")
+    note: str | None = Field(default=None, description="Why the sound did not "
+                             "play, when it didn't (no bank, already talking)")
+    dir: str | None = Field(default=None, description="The server's emote "
+                            "directory — edit the TOML in it and the next "
+                            "trigger plays the edit")
+    emotes: list[dict[str, Any]] | None = Field(
+        default=None, description="action='list': every emote in the "
+        "directory, with duration, sound, and whether it parses")
+    playing: str | None = Field(default=None, description="The gesture "
+                                "playing right now, if any")
+
+
+@mcp.tool(title="Emote", annotations=_EPISODIC)
+def duck_emote(name: str | None = None, action: str = "play") -> EmoteResult:
+    """Play an authored gesture: a keyframed head pose (and sometimes beak,
+    and sometimes a voice-bank call) from the server's `emotes/` directory.
+    Shipped: 'head_tilt' (curiosity), 'nod' (yes), 'perk_up' (alert),
+    'droop' (dejected). action='list' shows what a given server has, with
+    durations and whether each file parses — emotes are TOML you can edit
+    while the duck stands there, and the next trigger plays the edit.
+
+    Returns as soon as the gesture STARTS; it plays out on the sim's own clock
+    (a second or two) and then hands the head back exactly where it found it.
+
+    Who owns what, so a refusal reads as a fact rather than a failure: a
+    gesture is refused while another is playing (a duck restarting a nod looks
+    broken), and while an armed machine is running approach_ball or kick —
+    those behaviors steer by the head camera and need the head level to swing.
+    The beak yields to speech: emote under a duck_say and the head still
+    moves, the beak just keeps lip-syncing the words."""
+    if action == "list":
+        return EmoteResult(**_call({"cmd": "emote", "action": "list"}))
+    if not name:
+        raise ToolError("which emote? (action='list' shows what this server has)")
+    return EmoteResult(**_call({"cmd": "emote", "name": name}))
+
+
 @mcp.tool(title="Duck camera", annotations=_READ)
 def duck_camera(view: str = "follow", distance: float = 0.7) -> Image:
     """Render a camera frame of the sim. Views: 'head' (the duck's POV, from

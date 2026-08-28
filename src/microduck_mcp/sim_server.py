@@ -22,7 +22,9 @@ import math
 import os
 import queue
 import random
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -32,6 +34,7 @@ from collections import deque
 import mujoco
 import numpy as np
 
+from .emote import HEAD_CHANNELS, EmoteError, EmoteLibrary
 from .machine import Machine, MachineError
 
 # Nm/A for the Dynamixel XL330 (BAM m6 model). Used for the firmware
@@ -149,6 +152,19 @@ MOUTH_MAX_RAD = 0.45
 WHEEE_TAG = "wheee"
 WHEEE_REFUSAL = ("the wheee is for a goal the duck actually scored, and the "
                  "referee has none on the board this episode")
+
+# Behaviors that own the head outright, and may not be interrupted to look
+# expressive: approach_ball STEERS by what the head camera can see (a floor
+# ball drops out of frame above ~0.15 m with the head level), and the kick
+# policy fed a bowed head does not swing at all — measured, 1.3-1.5 m level
+# against 0.00 m at 0.5 rad down. A gesture over either is not expression, it
+# is a missed ball.
+HEAD_BOUND_BEHAVIORS = ("approach_ball", "kick")
+
+# How long a `mouth` intent keeps the beak: `duck say` streams openings at
+# 40 Hz while it talks, so a gap wider than this means the stream ended rather
+# than paused, and an emote may have the beak back.
+MOUTH_HELD_S = 0.5
 
 
 def load_infer_policy_module(rl_repo: str):
@@ -503,10 +519,19 @@ class DuckSim:
         # applied to the mocap plate every tick. Purely cosmetic — the plate
         # has no dynamics and the policy never sees it.
         self.mouth_opening = 0.0
+        # Wall clock of the last `mouth` intent off the socket — how the sim
+        # knows the beak is somebody else's right now (see _say_owns_mouth).
+        self._mouth_intent_t = 0.0
         # A voice.SayPlayer if this host can talk (set by main); None means a
         # machine's `say` lines are annotations only — the honest default for
         # a robot whose speaker lives on somebody else's computer.
         self.voice = None
+        # The emote directory and the gesture playing out of it right now
+        # (both set by main / start_emote). Emotes are data the sim reads, so
+        # a server started without a directory simply has no body language.
+        self.emotes = None
+        self.voice_bank = None
+        self._emote = None
         self._mouth_mocap_id = -1
         self._mouth_head_id = -1
         if mouth_ok:
@@ -719,6 +744,137 @@ class DuckSim:
             print(f"GOAL! #{self.referee.count} at t="
                   f"{self.referee.last_goal_sim_time_s}s  "
                   f"ball=({x:.3f}, {y:.3f}, {z:.3f})")
+
+    # ---------- emotes (sim thread only) ----------
+
+    def _set_head_offset(self, vals):
+        """Point the head through the policy's gaze command — the same path
+        the `look` intent and the behaviors' _set_head use, so the balance
+        policy compensates for the pose instead of being surprised by it.
+        Order is (neck_pitch, head_pitch, head_yaw, head_roll), clamped."""
+        p = self.policy
+        p.head_offset[:] = np.clip(np.asarray(vals, dtype=np.float32),
+                                   -p.head_max, p.head_max)
+        p._update_command()
+
+    def _say_owns_mouth(self) -> bool:
+        """Is the beak busy being a voice? Two ways it can be: the machine's
+        own SayPlayer is mid-line, or a `duck say` somewhere else is streaming
+        `mouth` intents at us. Either way an emote's beak channel yields —
+        words beat gestures on that one channel, because a beak fighting a
+        sentence reads as a glitch, not as a mood."""
+        if self.voice is not None and self.voice.busy:
+            return True
+        return time.time() - self._mouth_intent_t < MOUTH_HELD_S
+
+    def _head_bound_node(self):
+        """The node whose behavior currently needs the head, or None."""
+        m = self.machine
+        if m is None or not m.armed:
+            return None
+        if m.nodes[m.current]["behavior"] in HEAD_BOUND_BEHAVIORS:
+            return m.current
+        return None
+
+    def start_emote(self, name: str, machine: bool = False) -> dict:
+        """Begin a gesture — or say who has the head instead.
+
+        Channel ownership lives here, in one place: say > emote for the beak,
+        emote > behavior for the head, but only where the behavior can spare
+        it. A MACHINE-triggered emote skips the ownership check, because the
+        machine's author already made that call in source — that is the
+        difference between an interruption and a decision.
+
+        A gesture arriving mid-gesture is refused rather than queued or
+        restarted, the same honesty as SayPlayer's dropped line: a duck that
+        keeps restarting a nod looks broken, not busy.
+        """
+        if self.emotes is None:
+            return {"ok": False, "error": "this server has no emote directory "
+                    "(start duck-sim with --emotes DIR)"}
+        try:
+            emote = self.emotes.get(name)
+        except EmoteError as e:
+            return {"ok": False, "error": str(e)}
+        if self._emote is not None:
+            return {"ok": False, "error": f"mid-emote ({self._emote['name']}) "
+                    f"— a duck restarting a gesture looks broken"}
+        node = None if machine else self._head_bound_node()
+        if node is not None:
+            return {"ok": False, "error": f"the head belongs to {node!r} right "
+                    f"now — that behavior steers by the head camera, so it "
+                    f"keeps the head until it is done"}
+        traj = emote.render(CONTROL_HZ)
+        self._emote = {
+            "name": emote.name, "t0": self.sim_time, "traj": traj,
+            "n": len(traj["mouth"]),
+            # Where the head was when the gesture borrowed it. Restored on
+            # completion: an emote is a detour, not a new resting pose.
+            "restore": np.array(self.policy.head_offset, dtype=np.float32),
+        }
+        note = self._play_bank_sound(emote.sound) if emote.sound else ""
+        return {"ok": True, "emote": emote.name, "sound": emote.sound,
+                "duration_s": round(emote.duration, 3), "note": note}
+
+    def _play_bank_sound(self, tag: str) -> str:
+        """Launch an emote's voice-bank call off the sim thread. Never raises.
+
+        Same rule as every other noise the duck makes: audio is the host's job
+        and best-effort, and the reasons it might not happen (no bank, no
+        afplay, the duck already talking) are notes on the event, not errors.
+        Returns that note, empty when the sound went out.
+        """
+        if self._say_owns_mouth():
+            return f"{tag} skipped: the duck is already talking"
+        from . import voice
+        try:
+            path = voice.bank_wav_path(self.voice_bank, tag)
+        except voice.VoiceError as e:
+            return f"{tag} skipped: {e}"
+        player = shutil.which("afplay")
+        if player is None:
+            return f"{tag} skipped: no `afplay` on this host"
+        threading.Thread(target=subprocess.run, args=([player, path],),
+                         kwargs={"check": False}, daemon=True,
+                         name="duck-emote-sound").start()
+        return ""
+
+    def emote_tick(self):
+        """One control step of the gesture that is playing, if one is.
+
+        Called AFTER machine_tick, and that order IS the arbitration for the
+        head: whatever the current behavior just asked the head to do this
+        tick, the emote overwrites. The beak goes the other way — a voice owns
+        it while it has something to say.
+        """
+        e = self._emote
+        if e is None:
+            return
+        i = int(round((self.sim_time - e["t0"]) * CONTROL_HZ))
+        if i >= e["n"]:
+            self._end_emote(e)
+            return
+        traj = e["traj"]
+        self._set_head_offset([traj[c][i] for c in HEAD_CHANNELS])
+        if not self._say_owns_mouth():
+            self.mouth_opening = float(traj["mouth"][i])
+
+    def _end_emote(self, e: dict):
+        """Hand the head back to whoever had it, and shut the beak."""
+        self._set_head_offset(e["restore"])
+        if not self._say_owns_mouth():
+            self.mouth_opening = 0.0
+        self._emote = None
+
+    def _handle_emote(self, req: dict) -> dict:
+        if req.get("action") == "list":
+            if self.emotes is None:
+                return {"ok": False, "error": "this server has no emote "
+                        "directory (start duck-sim with --emotes DIR)"}
+            return {"ok": True, "dir": self.emotes.dir,
+                    "emotes": self.emotes.listing(),
+                    "playing": self._emote["name"] if self._emote else None}
+        return self.start_emote(str(req.get("name", "")))
 
     # ---------- the behavior machine (sim thread only) ----------
 
@@ -1000,9 +1156,7 @@ class DuckSim:
             return self._handle_trick(req.get("name", ""),
                                       stage_ball=bool(req.get("stage_ball", True)))
         if cmd == "look":
-            vals = [req.get(k, 0.0) for k in ("neck_pitch", "head_pitch", "head_yaw", "head_roll")]
-            p.head_offset[:] = np.clip(np.array(vals, dtype=np.float32), -p.head_max, p.head_max)
-            p._update_command()
+            self._set_head_offset([req.get(k, 0.0) for k in HEAD_CHANNELS])
             return self.get_state()
         if cmd == "push":
             mag = float(np.clip(req.get("magnitude", 1.0), 0.0, 2.0))
@@ -1013,8 +1167,10 @@ class DuckSim:
         if cmd == "mouth":
             # robot.mouth semantics: a continuous opening intent, clamped.
             # Ambient (streamed at ~40 Hz by `duck say`), so _log_event skips
-            # it — the say annotation below is the loggable act.
+            # it — the say annotation below is the loggable act. The timestamp
+            # is how an emote knows the beak is spoken for.
             self.mouth_opening = float(np.clip(req.get("opening", 0.0), 0.0, 1.0))
+            self._mouth_intent_t = time.time()
             return {"ok": True, "mouth": round(self.mouth_opening, 3)}
         if cmd == "say":
             # Annotation only: speech is rendered and played host-side (the
@@ -1025,6 +1181,8 @@ class DuckSim:
                     "duration_s": req.get("duration_s")}
         if cmd == "chirp":
             return self._handle_chirp(str(req.get("tag", "")))
+        if cmd == "emote":
+            return self._handle_emote(req)
         if cmd == "camera":
             return self._handle_camera(req)
         if cmd == "camera_web":
@@ -1113,6 +1271,9 @@ class DuckSim:
         p.set_vel_cmd(0.0, 0.0, 0.0)  # selects the standing policy
         self.data.ctrl[:] = p.default_pose
         self.mouth_opening = 0.0
+        # A gesture is about the episode it was made in; the head it would
+        # restore belongs to a world that no longer exists.
+        self._emote = None
         self.mouth_tick()
         mujoco.mj_forward(self.model, self.data)
         self.sim_time = 0.0
@@ -1306,6 +1467,8 @@ def run_loop(sim: DuckSim, viewer=None, realtime: bool = True, stop: threading.E
         sim.sense()
         sim.referee_tick()
         sim.machine_tick()
+        sim.emote_tick()  # after the machine: a gesture outranks the behavior
+                          # for the head, for as long as it lasts
         if viewer is not None:
             viewer.sync()
         if realtime:
@@ -1342,9 +1505,19 @@ def main():
                         metavar="DIR",
                         help="Voice-bank wavs for the duck's chirps (see "
                              "`duck say --voice-bank`)")
+    parser.add_argument("--emotes", metavar="DIR",
+                        default=os.environ.get("DUCK_EMOTES", "emotes"),
+                        help="Directory of emote TOML files (default: emotes/ "
+                             "under the working directory). Edits are picked "
+                             "up live, like machine source")
     args = parser.parse_args()
 
     sim = DuckSim(args.rl_repo, args.policies, args.scene, args.frames_dir)
+    sim.voice_bank = args.voice_bank
+    sim.emotes = EmoteLibrary(args.emotes)
+    if not os.path.isdir(sim.emotes.dir):
+        print(f"note: no emote directory at {sim.emotes.dir} — the duck has "
+              f"no body language this session (--emotes DIR)")
     if not args.no_voice:
         from . import voice
         sim.voice = voice.SayPlayer.available(bank_dir=args.voice_bank)

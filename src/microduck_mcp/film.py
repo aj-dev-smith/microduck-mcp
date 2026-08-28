@@ -218,6 +218,10 @@ def feed_lines(events):
             # A speaking node's line. Not a transition: it carries no guard,
             # and must not blank the one the feed is already showing.
             text = f'say "{args.get("text", "")}"'
+        elif client == "machine" and ev["cmd"] == "emote":
+            # A gesture the node fired. Same deal as a line: an annotation
+            # riding along with the transition, not one of its own.
+            text = f'emote {args.get("name", "")}'
         elif client == "machine":
             text = f"{args.get('from')} {ev['cmd']}"
             guard = args.get("when")
