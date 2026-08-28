@@ -9,7 +9,7 @@ from collections import deque
 import numpy as np
 
 from microduck_mcp.machine import (
-    GUARD_PATHS, GuardError, Machine, MachineError, compile_guard)
+    GUARD_PATHS, MOOD_NAMES, GuardError, Machine, MachineError, compile_guard)
 from microduck_mcp.sim_server import DuckSim
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -251,6 +251,79 @@ class SpeakingNodes(unittest.TestCase):
                     self.assertNotIn("wheee", (spec["say"] or "").lower())
 
 
+class SpokenMoods(unittest.TestCase):
+    """`say_mood = "excited"`: the weather on a node's line.
+
+    A separate key rather than a table-valued `say`, and that IS the design —
+    a server too old to know the mood speaks the line neutral, where a table
+    would have made the line itself unreadable. The roster is closed, though:
+    a mood is a fixed vocabulary the renderer implements, not free-form
+    content like an emote name.
+    """
+
+    @staticmethod
+    def _spec(node):
+        return {"machine": {"name": "t", "initial": "a"},
+                "node": [{"name": "a", "behavior": "idle",
+                          "transition": [{"when": "upright", "to": "s"}]},
+                         node]}
+
+    def test_a_line_can_carry_a_mood(self):
+        m = Machine(self._spec({"name": "s", "behavior": "idle",
+                                "say": "Goal!", "say_mood": "excited"}))
+        self.assertEqual(m.nodes["s"]["say_mood"], "excited")
+        self.assertEqual(m.status()["say_mood_nodes"], ["s"])
+
+    def test_a_plain_line_has_no_mood_and_that_is_neutral(self):
+        m = Machine(self._spec({"name": "s", "behavior": "idle",
+                                "say": "Goal!"}))
+        self.assertIsNone(m.nodes["s"]["say_mood"])
+        self.assertEqual(m.status()["say_nodes"], ["s"])
+        self.assertEqual(m.status()["say_mood_nodes"], [])
+
+    def test_non_string_refused(self):
+        with self.assertRaisesRegex(MachineError, "string"):
+            Machine(self._spec({"name": "s", "behavior": "idle",
+                                "say": "hi", "say_mood": 2}))
+
+    def test_a_mood_nobody_implements_is_refused_at_load(self):
+        # Unlike an emote name, which the server may or may not have: the
+        # moods are a closed roster, so a typo is a load error and not a line
+        # that quietly comes out flat.
+        with self.assertRaisesRegex(MachineError, "unknown say_mood"):
+            Machine(self._spec({"name": "s", "behavior": "idle",
+                                "say": "hi", "say_mood": "furious"}))
+
+    def test_the_roster_is_the_voices_own(self):
+        # Spelled out here (like MAX_SAY_CHARS) so the grammar needs no audio
+        # stack to validate a machine — but it must not drift from the voice.
+        from microduck_mcp.voice import MOODS
+        self.assertEqual(MOOD_NAMES, frozenset(MOODS))
+
+    def test_a_mood_with_nothing_to_say_is_refused(self):
+        with self.assertRaisesRegex(MachineError, "nothing to say"):
+            Machine(self._spec({"name": "s", "behavior": "idle",
+                                "say_mood": "sad"}))
+
+    def test_every_mood_in_the_roster_loads(self):
+        for mood in sorted(MOOD_NAMES):
+            with self.subTest(mood=mood):
+                m = Machine(self._spec({"name": "s", "behavior": "idle",
+                                        "say": "hi", "say_mood": mood}))
+                self.assertEqual(m.nodes["s"]["say_mood"], mood)
+
+    def test_the_striker_celebrates_in_a_mood(self):
+        m = Machine.load(os.path.join(REPO, "machines", "striker.toml"))
+        self.assertEqual(m.status()["say_mood_nodes"], ["celebrate"])
+        self.assertEqual(m.nodes["celebrate"]["say_mood"], "excited")
+
+    def test_the_other_shipped_machines_speak_neutral(self):
+        for name in ("soccer.toml", "resident.toml"):
+            with self.subTest(machine=name):
+                m = Machine.load(os.path.join(REPO, "machines", name))
+                self.assertEqual(m.status()["say_mood_nodes"], [])
+
+
 class EmotingNodes(unittest.TestCase):
     """`emote = "..."` on a node: `say`'s parallel, and just as ignorant.
 
@@ -380,10 +453,12 @@ class _Ear:
 
     def __init__(self, boom=False):
         self.heard = []
+        self.moods = []
         self.boom = boom
 
-    def speak(self, text, sim=None):
+    def speak(self, text, sim=None, mood="neutral"):
         self.heard.append(text)
+        self.moods.append(mood)
         if self.boom:
             raise RuntimeError("no speaker on this host")
         return True
@@ -394,6 +469,7 @@ SPEAKING_SPEC = {
     "node": [{"name": "play", "behavior": "idle",
               "transition": [{"when": "goal.scored", "to": "won"}]},
              {"name": "won", "behavior": "idle", "say": "Goal!",
+              "say_mood": "excited",
               "wake": "a goal deserves company",
               "wake_hold": "parked and safe"}],
 }
@@ -448,6 +524,21 @@ class SpokenOnEntry(unittest.TestCase):
         sim = speaking_sim(voice=ear)
         sim._say_line("won", "Goal!")
         self.assertEqual(ear.heard, ["Goal!"])
+        self.assertEqual(ear.moods, ["neutral"])
+
+    def test_the_mood_rides_the_line_to_the_voice(self):
+        ear = _Ear()
+        sim = speaking_sim(voice=ear)
+        sim._say_line("won", "Goal!", "excited")
+        self.assertEqual(ear.moods, ["excited"])
+
+    def test_the_feed_notes_a_mood_only_when_there_is_one(self):
+        # A feed that annotates the ordinary case stops being readable.
+        sim = speaking_sim()
+        sim._say_line("won", "Goal!")
+        sim._say_line("won", "Goal!", "excited")
+        self.assertNotIn("mood", self.says(sim)[0]["args"])
+        self.assertEqual(self.says(sim)[1]["args"]["mood"], "excited")
 
     def test_a_voice_that_throws_does_not_reach_the_control_loop(self):
         # _say_line runs in the 50 Hz sim thread. Nothing about talking is
@@ -466,6 +557,7 @@ class SpokenOnEntry(unittest.TestCase):
         sim.machine_tick()
         self.assertEqual(sim.machine.current, "won")
         self.assertEqual(ear.heard, ["Goal!"])
+        self.assertEqual(ear.moods, ["excited"])   # the node's say_mood
         # ...and the wake it also carries is untouched by the speaking
         self.assertEqual([e["cmd"] for e in sim.events],
                          ["-> won", "say", "wake"])

@@ -480,6 +480,10 @@ class MachineStatus(BaseModel):
     say_nodes: list[str] | None = Field(default=None, description="Nodes that "
                                         "speak a line on entry (say = \"...\" "
                                         "in the machine source)")
+    say_mood_nodes: list[str] | None = Field(default=None, description="Nodes "
+                                             "whose line carries a mood "
+                                             "(say_mood = \"excited\"); the "
+                                             "rest speak neutral")
     emote_nodes: list[str] | None = Field(default=None, description="Nodes "
                                           "that play a gesture on entry "
                                           "(emote = \"...\" in the source)")

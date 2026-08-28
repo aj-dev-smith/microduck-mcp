@@ -30,7 +30,9 @@
 # And it talks: `celebrate` and `won` carry a `say` line, forwarded on entry
 # through the sim's `say` annotation verb and voiced host-side when the session
 # has a voice. Annotation, not behavior — the guards, the physics and the
-# match play out identically on a server that ignores the key.
+# match play out identically on a server that ignores the key. `celebrate`
+# also carries a `say_mood`, and a server too old to know that key just speaks
+# the goal line neutral: still the right line, one notch calmer.
 
 [machine]
 name = "striker"
@@ -167,6 +169,8 @@ behavior = "celebrate"          # the headstand (a roulade, honestly)
 # itself and nowhere else. A sound reserved for earned goals stays reserved by
 # living in exactly one place.
 say = "Goal! I aimed that one myself."
+say_mood = "excited"            # the one line in the repo that earned a mood:
+                                # the duck is mid-roulade over a goal it aimed.
 [node.params]
 trick = "roulade"
 [[node.transition]]
