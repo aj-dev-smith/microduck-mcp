@@ -76,6 +76,13 @@ class BallSeen(BaseModel):
     est_left_m: float | None = Field(
         default=None, description="Estimated ball position, trunk yaw frame, "
         "meters to the left")
+    speed_mps: float | None = Field(
+        default=None, description="Estimated ball ground speed, m/s, from "
+        "differencing the sighting's world-frame estimate across detector "
+        "ticks (own-kinematics odometry cancels the duck's motion). Null "
+        "until the ball has been tracked for ~0.25 s. Noisy while walking "
+        "(the camera bias breathes with the gait); a parked ball reads "
+        "near 0, a freshly kicked one ~1 m/s.")
     age_s: float = Field(description="Sim seconds since the detector last ran "
                          "(it runs at ~5 Hz, so normally <=0.2)")
 

@@ -53,7 +53,14 @@ to = "backoff"
 # STATIONARY duck reads ~true, so a too-far static stance (true >= 0.10)
 # lands above the 0.125 ceiling and cannot enter: momentum is part of the
 # guard. Left is forgiving (-0.02 to -0.08 true all connect).
-when = "ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.est_forward_m > 0.100 and ball_seen.est_forward_m < 0.125 and ball_seen.est_left_m > -0.082 and ball_seen.est_left_m < -0.020 and elapsed_s > 2.0"
+#
+# speed_mps < 0.25: don't kick a BALL that is rolling — a hard toe-poke
+# sends it through the pocket at 0.3+ and kicking where it was is a certain
+# whiff (5 s of settle + abort + backoff wasted). Generous ceiling on
+# purpose: a parked ball reads <= ~0.04 mid-walk but a just-nudged one
+# drifting at ~0.1-0.15 still gets kicked cleanly, so only clear rolling is
+# rejected. (Null speed — ball visible < 0.45 s — also blocks, correctly.)
+when = "ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.est_forward_m > 0.100 and ball_seen.est_forward_m < 0.125 and ball_seen.est_left_m > -0.082 and ball_seen.est_left_m < -0.020 and ball_seen.speed_mps < 0.25 and elapsed_s > 2.0"
 to = "kick"
 
 [[node]]
@@ -69,7 +76,11 @@ settle_s = 0.8
 # (~2-3 cm, the standing policy re-centering) is normal and the swing
 # tolerates it, so the ceiling here is generous; the tight decision was
 # made by the entry guard, at speed.
-when = "elapsed_s > 0.6 and elapsed_s < 0.75 and ball_seen.visible and (ball_seen.est_forward_m > 0.135 or ball_seen.est_forward_m < 0.050 or ball_seen.est_left_m > -0.012 or ball_seen.est_left_m < -0.10)"
+# speed_mps > 0.08: the duck is stopped here, the camera static (noise
+# floor <= 0.03), so this is the one place a rolling ball reads clean —
+# a ball still escaping the pocket aborts even while its position is
+# momentarily inside the bounds.
+when = "elapsed_s > 0.6 and elapsed_s < 0.75 and ball_seen.visible and (ball_seen.est_forward_m > 0.135 or ball_seen.est_forward_m < 0.050 or ball_seen.est_left_m > -0.012 or ball_seen.est_left_m < -0.10 or ball_seen.speed_mps > 0.08)"
 to = "backoff"
 [[node.transition]]
 # The swing is done (settle 0.8 s + 3 s trick) and the ball is STILL at the

@@ -87,6 +87,8 @@ BALL_ROLL_FRICTION = 0.002
 DET_W, DET_H = 320, 240
 DET_EVERY = 10  # control steps between detections -> 5 Hz at 50 Hz control
 DET_MIN_PX = 6
+DET_SPEED_WINDOW_S = 0.6   # baseline for the ball-speed estimate
+DET_SPEED_MIN_DT_S = 0.25  # publish null speed until the track spans this
 
 
 def load_infer_policy_module(rl_repo: str):
@@ -114,7 +116,7 @@ def quat_to_rpy(q):
 
 NOT_SEEN = {"visible": False, "distance_m": None, "ground_distance_m": None,
             "bearing_deg": None, "elevation_deg": None,
-            "est_forward_m": None, "est_left_m": None}
+            "est_forward_m": None, "est_left_m": None, "speed_mps": None}
 
 
 def detect_ball_pixels(px, fovy_deg: float = HEAD_CAM_FOVY_DEG,
@@ -220,6 +222,7 @@ class DuckSim:
         self._det_step = 0
         self._ball_seen = dict(NOT_SEEN)
         self._ball_seen_t = 0.0
+        self._ball_track = deque()  # (t, x, y) world estimates -> speed_mps
         self.machine = None  # loaded behavior machine (machine.py), or None
         # Command-feed ring buffer for the AX debug page (webui.py).
         self.events = deque(maxlen=500)
@@ -310,6 +313,21 @@ class DuckSim:
             c, s = math.cos(yaw), math.sin(yaw)
             seen["est_forward_m"] = round(c * dx + s * dy, 3)
             seen["est_left_m"] = round(-s * dx + c * dy, 3)
+            # Ball speed, honestly: difference the world-frame estimate across
+            # detector ticks. The estimate already folds in the robot's own
+            # kinematics, so the duck's motion cancels and a parked ball reads
+            # ~0 even mid-stride. The camera bias wobbles with the gait, hence
+            # a multi-tick baseline; a fresh sighting publishes null until the
+            # track spans DET_SPEED_MIN_DT_S (guards treat null as "not < x").
+            seen["speed_mps"] = None
+            self._ball_track.append((self.sim_time, float(ball_w[0]), float(ball_w[1])))
+            while self.sim_time - self._ball_track[0][0] > DET_SPEED_WINDOW_S:
+                self._ball_track.popleft()
+            t0, x0, y0 = self._ball_track[0]
+            if self.sim_time - t0 >= DET_SPEED_MIN_DT_S:
+                seen["speed_mps"] = round(
+                    math.hypot(float(ball_w[0]) - x0, float(ball_w[1]) - y0)
+                    / (self.sim_time - t0), 3)
         self._ball_seen = seen
         self._ball_seen_t = self.sim_time
 
@@ -329,6 +347,7 @@ class DuckSim:
             "ball_seen.elevation_deg": bs["elevation_deg"],
             "ball_seen.est_forward_m": bs.get("est_forward_m"),
             "ball_seen.est_left_m": bs.get("est_left_m"),
+            "ball_seen.speed_mps": bs.get("speed_mps"),
             "ball_seen.age_s": round(self.sim_time - self._ball_seen_t, 3),
             "upright": bool(proj_g[2] < -0.7),
             "sitting": bool(self.policy.sit_mode),
@@ -510,6 +529,10 @@ class DuckSim:
                 self.data.qvel[vadr:vadr + 6] = ball_qvel
             else:
                 p.trigger_behavior(name)
+                if p.ball_qpos_adr is not None:
+                    # Staging teleported the ball; don't let the detector's
+                    # speed track read the jump as a 2 m/s ball.
+                    self._ball_track.clear()
             started = p.behavior_mode == name
         else:
             return {"ok": False, "error": f"unknown trick {name!r} "
@@ -540,6 +563,7 @@ class DuckSim:
         self._det_step = 0
         self._ball_seen = dict(NOT_SEEN)
         self._ball_seen_t = 0.0
+        self._ball_track.clear()  # sim clock rewound; stale points are future-dated
         self._detect_ball()  # so state right after a reset is not stale
         return self.get_state()
 

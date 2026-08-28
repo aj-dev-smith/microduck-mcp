@@ -106,7 +106,11 @@ publishes `{visible, distance_m, bearing_deg, elevation_deg, age_s}` — the
 same *derived features, not frames* contract the real Microduck's `mediad`
 service uses (`microduck` docs, architecture §2.4). Distance comes from the
 blob's solid angle (mean error ~6% out to 1.4 m); a ball behind the duck is
-honestly invisible, which makes *searching* for it a real behavior. Prefer
+honestly invisible, which makes *searching* for it a real behavior. The
+detector also derives `speed_mps` by differencing its own world-frame
+estimate across ticks — the robot's kinematics cancel its own motion, so a
+parked ball reads ~0 even mid-stride while a kicked one reads ~1 m/s, which
+is how a machine can decline to kick a rolling ball. Prefer
 `ball_seen` when you want sim work to transfer to hardware.
 
 ## The behavior machine

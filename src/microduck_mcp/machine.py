@@ -27,7 +27,7 @@ import numpy as np
 GUARD_PATHS = {
     "ball_seen.visible", "ball_seen.distance_m", "ball_seen.ground_distance_m",
     "ball_seen.bearing_deg", "ball_seen.elevation_deg", "ball_seen.age_s",
-    "ball_seen.est_forward_m", "ball_seen.est_left_m",
+    "ball_seen.est_forward_m", "ball_seen.est_left_m", "ball_seen.speed_mps",
     "upright", "sitting", "active_policy", "behavior",
     "elapsed_s", "sim_time_s", "node",
 }

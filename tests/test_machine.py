@@ -58,6 +58,14 @@ class GuardGrammar(unittest.TestCase):
         for p in GUARD_PATHS:
             compile_guard(f"{p} == {p}")
 
+    def test_speed_guard_null_means_no_kick(self):
+        # speed_mps is null until the detector has tracked the ball ~0.25 s;
+        # a "speed_mps < x" entry guard must treat unknown as "don't kick".
+        g = compile_guard("ball_seen.speed_mps < 0.25")
+        self.assertTrue(g({"ball_seen.speed_mps": 0.04}))
+        self.assertFalse(g({"ball_seen.speed_mps": 0.4}))
+        self.assertFalse(g({"ball_seen.speed_mps": None}))
+
 
 class MachineValidation(unittest.TestCase):
     BASE = {"machine": {"name": "t", "initial": "a"},
