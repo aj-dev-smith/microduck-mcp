@@ -86,6 +86,7 @@ PAGE = """<!DOCTYPE html>
       <button data-v="front">front</button>
       <button data-v="side">side</button>
       <button data-v="top">top</button>
+      <button data-v="head">head</button>
       <span style="margin-left:auto"><label>fps <select id="fps">
         <option>1</option><option selected>3</option><option>5</option>
       </select></label></span>

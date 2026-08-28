@@ -14,7 +14,7 @@ the model should see and recover from are raised as ToolError.
 """
 
 import time
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -43,6 +43,33 @@ class BodyVelocity(BaseModel):
     lateral: float = Field(description="Body-frame leftward velocity, m/s")
 
 
+class BallSeen(BaseModel):
+    """What the head camera saw, NOT where the ball actually is.
+
+    Derived from an orange-blob detection on a 320x240 render from the duck's
+    own camera at ~5 Hz — the honest signal the real robot will have, standing
+    in for its mediad service. Angles are measured from the camera's optical
+    axis, which is mounted 20 deg below the head's forward axis, so a ball on
+    the floor a few steps ahead reads elevation ~-20 deg, not 0. Ball out of
+    frame, behind the duck, or occluded -> visible false and null fields;
+    duck_look pans the camera, so a null is an invitation to look around.
+    """
+
+    visible: bool = Field(description="True if the ball was in the last frame")
+    distance_m: float | None = Field(
+        description="Range from the camera to the ball centre, meters, from the "
+        "blob's apparent size. Within ~10% out to 1.5 m; reads long when the "
+        "blob is clipped by the frame edge.")
+    bearing_deg: float | None = Field(
+        description="Horizontal angle off the optical axis, degrees, positive "
+        "to the duck's left — same sign as the wz yaw-rate command, so a "
+        "positive bearing means turn with positive wz to face the ball.")
+    elevation_deg: float | None = Field(
+        description="Vertical angle off the optical axis, degrees, positive up")
+    age_s: float = Field(description="Sim seconds since the detector last ran "
+                         "(it runs at ~5 Hz, so normally <=0.2)")
+
+
 class DuckState(BaseModel):
     """Snapshot of the robot. Positions are world-frame; velocities body-frame."""
 
@@ -64,8 +91,16 @@ class DuckState(BaseModel):
     sitting: bool
     behavior: str | None = Field(description="Episodic trick currently running, else null")
     ground_pick: bool
+    ball_seen: BallSeen | None = Field(
+        default=None, description="Camera-derived ball sighting — the sensed "
+        "view. Prefer it over ball_position_m when you want the robot to act "
+        "on what it can actually perceive.")
     ball_position_m: list[float] | None = Field(
         default=None, description="Ball world position [x, y, z], meters (ball scene only)")
+    ball_offset_m: dict[str, float] | None = Field(
+        default=None, description="Ball offset from the trunk in the robot's yaw "
+        "frame: {forward, left}, meters. Kick staging puts the ball at "
+        "forward=0.09, left=±0.042 — aim for that spot before an unstaged kick.")
 
 
 def _call(req: dict, retries_note: str = "") -> dict[str, Any]:
@@ -98,7 +133,9 @@ def duck_drive(vx: float, vy: float = 0.0, wz: float = 0.0,
                duration_s: float | None = None) -> DuckState:
     """Set the walking velocity intent. vx: forward m/s (max ±0.3; the policy
     tracks ~half the commanded speed, so command 0.25+ for a brisk walk),
-    vy: leftward m/s (max ±0.2), wz: counterclockwise yaw rate rad/s (max ±1.5).
+    vy: leftward m/s (max ±0.2; lateral tracking is nearly useless — prefer
+    turning), wz: counterclockwise yaw rate rad/s (max ±1.5; below ~1.2 the
+    duck barely turns in place, so command ±1.5 for point turns — ~45 deg/s).
     Nonzero engages the walking policy; all-zero hands back to standing.
 
     With duration_s (max 10): drive for that long, then stop and return the
@@ -122,13 +159,18 @@ def duck_stop() -> DuckState:
 
 
 @mcp.tool(title="Do a trick", annotations=_EPISODIC)
-def duck_trick(name: str) -> DuckState:
+def duck_trick(name: str, stage_ball: bool = True) -> DuckState:
     """Trigger a trick: 'sit', 'stand', 'ground_pick' (touch beak to floor),
     'kick_left'/'kick_right' (stages the ball at that foot, then kicks), or
     'roulade' (forward roll — NOTE: usually ends with the duck down, since no
     stand-up policy ships yet; follow with duck_reset). Episodic tricks hand
-    control back to standing automatically after a few seconds."""
-    resp = _call({"cmd": "trick", "name": name})
+    control back to standing automatically after a few seconds.
+
+    stage_ball=False makes kicks honest: the ball is NOT teleported to the
+    foot, so the kick connects only if you've already walked the ball into
+    position — check ball_offset_m in duck_state and aim for forward≈0.09,
+    left≈+0.042 (kick_left) or -0.042 (kick_right) before triggering."""
+    resp = _call({"cmd": "trick", "name": name, "stage_ball": stage_ball})
     if not resp.get("started", True):
         raise ToolError(resp.get("error", f"{name} refused"))
     return DuckState(**_state_after())
@@ -148,9 +190,11 @@ def duck_look(neck_pitch: float = 0.0, head_pitch: float = 0.0,
 
 @mcp.tool(title="Duck camera", annotations=_READ)
 def duck_camera(view: str = "follow", distance: float = 0.7) -> Image:
-    """Render a camera frame of the sim. Views: 'follow' (behind the duck),
-    'front' (facing it), 'side', 'top'. `distance` in meters (0.4 close-up
-    to ~1.5 wide). Pair with duck_state for pose numbers."""
+    """Render a camera frame of the sim. Views: 'head' (the duck's POV, from
+    its own head camera — what duck_state's ball_seen is computed from; pans
+    with duck_look), 'follow' (behind the duck), 'front' (facing it), 'side',
+    'top'. `distance` in meters (0.4 close-up to ~1.5 wide) for the external
+    views; 'head' ignores it. Pair with duck_state for pose numbers."""
     resp = _call({"cmd": "camera", "view": view, "distance": distance})
     return Image(path=resp["frame"])
 
@@ -164,6 +208,86 @@ def duck_push(magnitude: float = 1.0, angle_deg: float | None = None) -> DuckSta
         req["angle_deg"] = angle_deg
     _call(req)
     return DuckState(**_state_after(0.6))
+
+
+class SeqStep(BaseModel):
+    """One step of a duck_sequence: issue a command, then hold for `seconds`."""
+
+    do: Literal["drive", "stop", "trick", "look"]
+    seconds: float = Field(default=0.0, ge=0.0, le=10.0,
+                           description="How long to hold this step before the next "
+                           "(drive keeps walking, trick keeps playing out)")
+    vx: float = 0.0
+    vy: float = 0.0
+    wz: float = 0.0
+    name: str | None = Field(default=None, description="Trick name (do='trick')")
+    stage_ball: bool = True
+    neck_pitch: float = 0.0
+    head_pitch: float = 0.0
+    head_yaw: float = 0.0
+    head_roll: float = 0.0
+
+
+class SequenceResult(BaseModel):
+    steps_run: int
+    aborted: str | None = Field(description="Why the sequence stopped early, else null")
+    state: DuckState
+
+
+MAX_SEQ_SECONDS = 30.0
+
+
+@mcp.tool(title="Run a command sequence", annotations=_EPISODIC)
+def duck_sequence(steps: list[SeqStep]) -> SequenceResult:
+    """Run steps back-to-back with no client round-trips between them — motion
+    flows continuously instead of stop-and-settle after every call. Each step
+    issues its command, then holds `seconds` before the next: drive steps keep
+    walking through the transition (chain them for arcs and S-curves), 'stop'
+    zeroes velocity (give it ~0.5s before a trick), 'trick' waits out its hold
+    (kicks need ~3.2s before the next trick is accepted), 'look' aims the head.
+
+    The sequence is OPEN LOOP from the state you planned it on — keep chains
+    short (a few seconds), then re-check duck_state and trim. Aborts early if
+    the duck falls or a trick is refused; velocity is always zeroed at the end.
+    Max 20 steps / 30 s total. Example — walk an arc, stop, honest kick, then
+    a roulade celebration:
+      [{do: drive, vx: 0.3, wz: 0.8, seconds: 2}, {do: stop, seconds: 0.5},
+       {do: trick, name: kick_right, stage_ball: false, seconds: 3.2},
+       {do: trick, name: roulade, seconds: 2.5}]"""
+    if len(steps) > 20:
+        raise ToolError("Too many steps (max 20)")
+    if sum(s.seconds for s in steps) > MAX_SEQ_SECONDS:
+        raise ToolError(f"Total hold time exceeds {MAX_SEQ_SECONDS:.0f}s")
+    aborted = None
+    n = 0
+    try:
+        for s in steps:
+            if s.do == "drive":
+                _call({"cmd": "set_velocity", "vx": s.vx, "vy": s.vy, "wz": s.wz})
+            elif s.do == "stop":
+                _call({"cmd": "set_velocity", "vx": 0.0, "vy": 0.0, "wz": 0.0})
+            elif s.do == "trick":
+                if not s.name:
+                    raise ToolError("trick step needs a name")
+                resp = _call({"cmd": "trick", "name": s.name,
+                              "stage_ball": s.stage_ball})
+                if not resp.get("started", True):
+                    aborted = f"step {n}: {s.name} refused (busy)"
+                    break
+            elif s.do == "look":
+                _call({"cmd": "look", "neck_pitch": s.neck_pitch,
+                       "head_pitch": s.head_pitch, "head_yaw": s.head_yaw,
+                       "head_roll": s.head_roll})
+            n += 1
+            if s.seconds:
+                time.sleep(s.seconds)
+            if not _call({"cmd": "state"}).get("upright", True):
+                aborted = f"step {n - 1}: duck fell"
+                break
+    finally:
+        _call({"cmd": "set_velocity", "vx": 0.0, "vy": 0.0, "wz": 0.0})
+    return SequenceResult(steps_run=n, aborted=aborted,
+                          state=DuckState(**_state_after(0.2)))
 
 
 @mcp.tool(title="Reset the sim", annotations=_RESET)

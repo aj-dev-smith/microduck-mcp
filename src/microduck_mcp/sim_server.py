@@ -57,7 +57,25 @@ POLICY_FILES = {
     "roulade": "roulade.onnx",
 }
 
-CAMERA_VIEWS = ("follow", "front", "side", "top")
+CAMERA_VIEWS = ("follow", "front", "side", "top", "head")
+
+# Head camera. The model ships a `head_camera` on the jaw_soft body, but as
+# exported it sits inside the lens-housing mesh and looks backwards, so we
+# re-pose it at load: nudged forward clear of the beak, aimed along the head's
+# forward axis (-z of that body, +x is up), and pitched down so the floor in
+# front of the feet is in frame — the real camera has to see the ball at its
+# feet, and a level 70 deg lens 25 cm up does not reach it.
+HEAD_CAM_FORWARD_M = 0.012
+HEAD_CAM_PITCH_DEG = 20.0
+HEAD_CAM_FOVY_DEG = 70.0
+
+# "fake mediad": the ball detector that runs on head-camera pixels. Stands in
+# for the real robot's mediad service, which owns the camera and publishes
+# derived features rather than raw frames.
+BALL_RADIUS_M = 0.035  # matches ball.xml's geom size
+DET_W, DET_H = 320, 240
+DET_EVERY = 10  # control steps between detections -> 5 Hz at 50 Hz control
+DET_MIN_PX = 6
 
 
 def load_infer_policy_module(rl_repo: str):
@@ -83,6 +101,45 @@ def quat_to_rpy(q):
     return roll, pitch, yaw
 
 
+NOT_SEEN = {"visible": False, "distance_m": None, "bearing_deg": None,
+            "elevation_deg": None}
+
+
+def detect_ball_pixels(px, fovy_deg: float = HEAD_CAM_FOVY_DEG,
+                       radius_m: float = BALL_RADIUS_M) -> dict:
+    """Find the orange ball in an RGB frame -> visible/distance/bearing/elevation.
+
+    Pure pixels + pinhole geometry, no scene access: this is everything the
+    real mediad could know from one camera frame. Bearing and elevation come
+    from the blob centroid's ray (bearing positive to the robot's left, to
+    match the yaw-rate sign convention). Range comes from the solid angle the
+    blob covers — a sphere of angular radius a covers 2*pi*(1-cos a), and
+    sin a = r/d. Solid angle rather than a pixel radius because the projection
+    of an off-axis sphere is a stretched ellipse: a flat pixel-radius model
+    reads ~30% short by 40 deg off-centre.
+    """
+    h, w = px.shape[:2]
+    f = px.astype(np.int16)
+    r, g, b = f[:, :, 0], f[:, :, 1], f[:, :, 2]
+    mask = (r > 100) & (r - b > 70) & (r - g > 40)
+    if int(mask.sum()) < DET_MIN_PX:
+        return dict(NOT_SEEN)
+    ys, xs = np.nonzero(mask)
+    fl = (h / 2) / math.tan(math.radians(fovy_deg) / 2)  # focal length, pixels
+    u = (xs + 0.5 - w / 2) / fl  # +u right, +v up, in focal lengths
+    v = (h / 2 - ys - 0.5) / fl
+    omega = float(np.sum((1.0 + u * u + v * v) ** -1.5)) / (fl * fl)
+    cos_a = min(1.0, max(-1.0, 1.0 - omega / (2 * math.pi)))
+    sin_a = math.sqrt(max(1e-12, 1.0 - cos_a * cos_a))
+    uc, vc = float(u.mean()), float(v.mean())
+    return {
+        "visible": True,
+        "distance_m": round(radius_m / sin_a, 3),
+        "bearing_deg": round(-math.degrees(math.atan(uc)), 3),
+        "elevation_deg": round(math.degrees(math.atan(vc / math.sqrt(1 + uc * uc))), 3),
+    }
+
+
 class DuckSim:
     def __init__(self, rl_repo: str, policies_dir: str, scene: str, frames_dir: str):
         self.rl_repo = os.path.abspath(rl_repo)
@@ -97,6 +154,7 @@ class DuckSim:
         self.model.opt.timestep = TIMESTEP
         self.data = mujoco.MjData(self.model)
         self._apply_current_limit(DEFAULT_CURRENT_LIMIT)
+        self._head_cam_id = self._setup_head_camera()
 
         paths = {}
         for role, fname in POLICY_FILES.items():
@@ -144,9 +202,31 @@ class DuckSim:
         self._renderer = None
         self._frame_count = 0
         self.sim_time = 0.0
+        self._det_renderer = None
+        self._det_off = False
+        self._det_step = 0
+        self._ball_seen = dict(NOT_SEEN)
+        self._ball_seen_t = 0.0
         # Command-feed ring buffer for the AX debug page (webui.py).
         self.events = deque(maxlen=500)
         self._event_id = 0
+
+    def _setup_head_camera(self) -> int:
+        """Re-pose the model's head_camera (see HEAD_CAM_* above)."""
+        cid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "head_camera")
+        if cid < 0:
+            print("note: model has no head_camera — view='head' unavailable")
+            return -1
+        # Head body: -z forward, +x up. Rotate -90 deg about z to line the
+        # camera frame up with that, then pitch down about its own x axis.
+        a, b = math.radians(-90) / 2, math.radians(-HEAD_CAM_PITCH_DEG) / 2
+        q = np.zeros(4)
+        mujoco.mju_mulQuat(q, np.array([math.cos(a), 0.0, 0.0, math.sin(a)]),
+                           np.array([math.cos(b), math.sin(b), 0.0, 0.0]))
+        self.model.cam_quat[cid] = q
+        self.model.cam_pos[cid, 2] -= HEAD_CAM_FORWARD_M
+        self.model.cam_fovy[cid] = HEAD_CAM_FOVY_DEG
+        return int(cid)
 
     def _apply_current_limit(self, amps: float):
         try:
@@ -159,6 +239,31 @@ class DuckSim:
         self.model.actuator_forcerange[:, 1] = limit
         self.model.actuator_forcelimited[:] = 1
         print(f"Current limit {amps:.2f} A -> torque clamp ±{limit:.4f} Nm (kt={kt:.4f})")
+
+    # ---------- sensing (sim thread only) ----------
+
+    def sense(self):
+        """Run the head-camera ball detector on its own, slower cadence."""
+        self._det_step += 1
+        if self._det_step % DET_EVERY == 0:
+            self._detect_ball()
+
+    def _detect_ball(self):
+        # No ball in the scene -> nothing the detector could ever find, so skip
+        # the render rather than burn 15 ms of the control period on it.
+        if self._det_off or self._head_cam_id < 0 or self.policy.ball_qpos_adr is None:
+            return
+        try:
+            if self._det_renderer is None:
+                self._det_renderer = mujoco.Renderer(self.model, height=DET_H, width=DET_W)
+            self._det_renderer.update_scene(self.data, camera=self._head_cam_id)
+            px = self._det_renderer.render()
+        except Exception as e:
+            self._det_off = True
+            print(f"note: head-camera detector disabled ({e})")
+            return
+        self._ball_seen = detect_ball_pixels(px)
+        self._ball_seen_t = self.sim_time
 
     # ---------- state ----------
 
@@ -186,10 +291,21 @@ class DuckSim:
             "sitting": bool(p.sit_mode),
             "behavior": p.behavior_mode,
             "ground_pick": bool(p.ground_pick_mode),
+            # Camera-derived, unlike ball_position_m below: what the head
+            # camera actually saw, as the real robot's mediad would report it.
+            "ball_seen": {**self._ball_seen,
+                          "age_s": round(self.sim_time - self._ball_seen_t, 3)},
         }
         if p.ball_qpos_adr is not None:
             b = self.data.qpos[p.ball_qpos_adr:p.ball_qpos_adr + 3]
             state["ball_position_m"] = [round(float(v), 3) for v in b]
+            # Ball offset in the robot's yaw frame — the frame kick training
+            # uses (x forward, y left). Kick staging places the ball at
+            # x=0.09, y=±0.042; an unstaged kick needs it near there.
+            dx, dy = float(b[0] - pos[0]), float(b[1] - pos[1])
+            c, s = math.cos(yaw), math.sin(yaw)
+            state["ball_offset_m"] = {"forward": round(c * dx + s * dy, 3),
+                                      "left": round(-s * dx + c * dy, 3)}
         return state
 
     # ---------- request handlers (sim thread only) ----------
@@ -208,7 +324,8 @@ class DuckSim:
             p.set_vel_cmd(vx, vy, wz)
             return self.get_state()
         if cmd == "trick":
-            return self._handle_trick(req.get("name", ""))
+            return self._handle_trick(req.get("name", ""),
+                                      stage_ball=bool(req.get("stage_ball", True)))
         if cmd == "look":
             vals = [req.get(k, 0.0) for k in ("neck_pitch", "head_pitch", "head_yaw", "head_roll")]
             p.head_offset[:] = np.clip(np.array(vals, dtype=np.float32), -p.head_max, p.head_max)
@@ -228,7 +345,7 @@ class DuckSim:
             return self._handle_reset()
         return {"ok": False, "error": f"unknown cmd {cmd!r}"}
 
-    def _handle_trick(self, name: str) -> dict:
+    def _handle_trick(self, name: str, stage_ball: bool = True) -> dict:
         p = self.policy
         if name == "sit":
             if not p.sit_mode:
@@ -244,7 +361,18 @@ class DuckSim:
             p.trigger_ground_pick()
             started = p.ground_pick_mode
         elif name in ("kick_left", "kick_right", "roulade"):
-            p.trigger_behavior(name)
+            if not stage_ball and p.ball_qpos_adr is not None:
+                # Honest mode: trigger_behavior teleports the ball to the foot
+                # (matching the training reset); snapshot and restore so the
+                # kick runs against wherever the ball actually is.
+                adr, vadr = p.ball_qpos_adr, p.ball_qvel_adr
+                ball_qpos = self.data.qpos[adr:adr + 7].copy()
+                ball_qvel = self.data.qvel[vadr:vadr + 6].copy()
+                p.trigger_behavior(name)
+                self.data.qpos[adr:adr + 7] = ball_qpos
+                self.data.qvel[vadr:vadr + 6] = ball_qvel
+            else:
+                p.trigger_behavior(name)
             started = p.behavior_mode == name
         else:
             return {"ok": False, "error": f"unknown trick {name!r} "
@@ -272,6 +400,10 @@ class DuckSim:
         self.data.ctrl[:] = p.default_pose
         mujoco.mj_forward(self.model, self.data)
         self.sim_time = 0.0
+        self._det_step = 0
+        self._ball_seen = dict(NOT_SEEN)
+        self._ball_seen_t = 0.0
+        self._detect_ball()  # so state right after a reset is not stale
         return self.get_state()
 
     def _handle_camera(self, req: dict, live: bool = False) -> dict:
@@ -283,20 +415,25 @@ class DuckSim:
                 w = min(640, int(self.model.vis.global_.offwidth))
                 h = min(480, int(self.model.vis.global_.offheight))
                 self._renderer = mujoco.Renderer(self.model, height=h, width=w)
-            cam = mujoco.MjvCamera()
-            trunk = self.data.qpos[self.qpos_adr:self.qpos_adr + 3]
-            quat = self.data.qpos[self.qpos_adr + 3:self.qpos_adr + 7]
-            yaw_deg = math.degrees(quat_to_rpy(quat)[2])
-            cam.lookat[:] = [trunk[0], trunk[1], max(0.08, float(trunk[2]))]
-            cam.distance = float(req.get("distance", 0.7))
-            if view == "follow":
-                cam.azimuth, cam.elevation = yaw_deg, -20
-            elif view == "front":
-                cam.azimuth, cam.elevation = yaw_deg + 180, -15
-            elif view == "side":
-                cam.azimuth, cam.elevation = yaw_deg + 90, -10
-            elif view == "top":
-                cam.azimuth, cam.elevation = yaw_deg, -89
+            if view == "head":
+                if self._head_cam_id < 0:
+                    return {"ok": False, "error": "model has no head_camera"}
+                cam = self._head_cam_id
+            else:
+                cam = mujoco.MjvCamera()
+                trunk = self.data.qpos[self.qpos_adr:self.qpos_adr + 3]
+                quat = self.data.qpos[self.qpos_adr + 3:self.qpos_adr + 7]
+                yaw_deg = math.degrees(quat_to_rpy(quat)[2])
+                cam.lookat[:] = [trunk[0], trunk[1], max(0.08, float(trunk[2]))]
+                cam.distance = float(req.get("distance", 0.7))
+                if view == "follow":
+                    cam.azimuth, cam.elevation = yaw_deg, -20
+                elif view == "front":
+                    cam.azimuth, cam.elevation = yaw_deg + 180, -15
+                elif view == "side":
+                    cam.azimuth, cam.elevation = yaw_deg + 90, -10
+                elif view == "top":
+                    cam.azimuth, cam.elevation = yaw_deg, -89
             self._renderer.update_scene(self.data, camera=cam)
             pixels = self._renderer.render()
             from PIL import Image
@@ -412,6 +549,7 @@ def run_loop(sim: DuckSim, viewer=None, realtime: bool = True, stop: threading.E
         for _ in range(DECIMATION):
             mujoco.mj_step(sim.model, sim.data)
         sim.sim_time += control_dt
+        sim.sense()
         if viewer is not None:
             viewer.sync()
         if realtime:

@@ -55,7 +55,8 @@ def main():
     for a in ("neck_pitch", "head_pitch", "head_yaw", "head_roll"):
         lk.add_argument(a, type=float, nargs="?", default=0.0)
     c = sub.add_parser("cam")
-    c.add_argument("view", nargs="?", default="follow", choices=["follow", "front", "side", "top"])
+    c.add_argument("view", nargs="?", default="follow",
+                   choices=["follow", "front", "side", "top", "head"])
     c.add_argument("--distance", type=float, default=0.7)
     ps = sub.add_parser("push")
     ps.add_argument("magnitude", type=float, nargs="?", default=1.0)

@@ -86,14 +86,27 @@ the agent rarely needs a follow-up poll.
 
 | Tool | What it does |
 |---|---|
-| `duck_state` | Position, orientation, body-frame velocity, active policy, upright? |
+| `duck_state` | Position, orientation, body-frame velocity, active policy, upright?, plus `ball_seen` — the camera-derived ball sighting |
 | `duck_drive(vx, vy, wz, duration_s?)` | Velocity intent; with `duration_s`, drives then stops and reports — one call instead of drive/poll/stop |
 | `duck_stop` | Zero commands → standing policy |
-| `duck_trick(name)` | `sit`, `stand`, `ground_pick`, `kick_left`, `kick_right`, `roulade` |
-| `duck_look(...)` | Point the head (it's a command to the policy, not a servo write) |
-| `duck_camera(view, distance)` | Rendered frame: `follow`, `front`, `side`, `top` |
+| `duck_trick(name, stage_ball?)` | `sit`, `stand`, `ground_pick`, `kick_left`, `kick_right`, `roulade`. `stage_ball=False` makes kicks **honest**: no ball teleport — the agent has to walk the ball into the kick pocket first (`ball_offset_m` in state), or it kicks air |
+| `duck_look(...)` | Point the head (it's a command to the policy, not a servo write) — also pans the head camera |
+| `duck_sequence(steps)` | Chain drive/stop/trick/look steps server-side — motion flows through transitions with no client round-trips (arcs, an approach, kick + celebration as one call) |
+| `duck_camera(view, distance)` | Rendered frame: `head` (the duck's own POV), `follow`, `front`, `side`, `top` |
 | `duck_push(magnitude, angle_deg)` | Shove the trunk; tests push recovery |
 | `duck_reset` | Back to origin, default stance (`destructive_hint` — it ends the episode) |
+
+## Honest sensing (fake mediad)
+
+The sim exposes two views of the ball. `ball_position_m` is God-mode ground
+truth. `ball_seen` is what the robot could actually know: an orange-blob
+detector runs on the duck's own 320×240 head-camera render at 5 Hz and
+publishes `{visible, distance_m, bearing_deg, elevation_deg, age_s}` — the
+same *derived features, not frames* contract the real Microduck's `mediad`
+service uses (`microduck` docs, architecture §2.4). Distance comes from the
+blob's solid angle (mean error ~6% out to 1.4 m); a ball behind the duck is
+honestly invisible, which makes *searching* for it a real behavior. Prefer
+`ball_seen` when you want sim work to transfer to hardware.
 
 ## AX debug page
 
