@@ -1426,7 +1426,9 @@ class DuckSim:
         elif cmd in ("set_velocity", "reset", "state", "look", "push"):
             note = f"{resp.get('active_policy', '')}{'' if resp.get('upright', True) else ' DOWN'}"
         else:
-            note = ""
+            # Whatever the handler wanted said about a success: which emote
+            # played and why its sound stayed home, what a machine load did.
+            note = str(resp.get("note") or "")
         self._event_id += 1
         self.events.append({
             "id": self._event_id, "t": time.time(), "client": client, "cmd": cmd,

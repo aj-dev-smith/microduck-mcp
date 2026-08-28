@@ -253,6 +253,13 @@ class EmotingNodes(unittest.TestCase):
         self.assertEqual(said["args"]["node"], "spotted")
         self.assertTrue(said["ok"])
 
+    def test_a_sound_that_stayed_home_says_so_on_the_feed(self):
+        # There is no voice bank on a test host, so the gesture plays silently
+        # — and the feed carries the reason rather than swallowing it.
+        sim = self.sim()
+        sim.machine_tick()
+        self.assertIn("no voice bank", sim.events[-1]["note"])
+
     def test_the_machine_gets_the_head_a_client_would_be_refused(self):
         # The author wrote the gesture on the node; declining it here would be
         # second-guessing source.
