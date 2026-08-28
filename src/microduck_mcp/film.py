@@ -214,6 +214,10 @@ def feed_lines(events):
         if client == "mcp":
             text = (f"duck machine {args.get('action', '')} "
                     f"{args.get('path', '') or ''}").rstrip()
+        elif client == "machine" and ev["cmd"] == "say":
+            # A speaking node's line. Not a transition: it carries no guard,
+            # and must not blank the one the feed is already showing.
+            text = f'say "{args.get("text", "")}"'
         elif client == "machine":
             text = f"{args.get('from')} {ev['cmd']}"
             guard = args.get("when")

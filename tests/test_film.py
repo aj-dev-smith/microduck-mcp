@@ -121,6 +121,20 @@ class ControlSurfaceFeed(unittest.TestCase):
                   "args": {"from": "approach",
                            "when": "ball_seen.est_left_m < -0.056"}}
     GOAL = {"client": "referee", "cmd": "GOAL!", "args": {"count": 1}}
+    SAY = {"client": "machine", "cmd": "say",
+           "args": {"node": "celebrate", "text": "Goal!"}}
+
+    def test_a_speaking_node_puts_its_line_on_the_feed(self):
+        lines, _ = feed_lines(deque([self.SAY]))
+        self.assertEqual(lines[0][0].strip(), "machine>")
+        self.assertIn('say "Goal!"', lines[0][1])
+
+    def test_a_spoken_line_does_not_blank_the_guard(self):
+        # A say carries no `when`. Reading one as a transition would wipe the
+        # guard expression the feed is showing — the whole point of the feed.
+        lines, guard = feed_lines(deque([self.TRANSITION, self.SAY]))
+        self.assertEqual(guard, self.TRANSITION["args"]["when"])
+        self.assertEqual(len(lines), 2)
 
     def test_mcp_lines_read_like_the_command_a_human_would_type(self):
         lines, _ = feed_lines([self.MCP])
