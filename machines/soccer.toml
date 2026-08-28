@@ -38,10 +38,22 @@ behavior = "approach_ball"      # the session-tested controller, 50 Hz
 when = "not ball_seen.visible and elapsed_s > 1.0"
 to = "search"
 [[node.transition]]
+# No kick within 6 s means the duck is parked in the dead band — too close
+# to rebuild momentum (commanded creep from standstill moves millimeters),
+# too far for the guard. Back out and take another run at it.
+when = "elapsed_s > 6.0"
+to = "backoff"
+[[node.transition]]
 # The kick pocket, in sensed TRUNK-frame estimates (camera ray + the robot's
-# own kinematics): right foot wants the ball ~9 cm ahead, ~4 cm right.
-# Tolerances match what connected in live MCP piloting.
-when = "ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.est_forward_m > 0.06 and ball_seen.est_forward_m < 0.13 and ball_seen.est_left_m > -0.085 and ball_seen.est_left_m < -0.015 and elapsed_s > 1.0"
+# own kinematics). Calibrated to fire MID-STRIDE: the camera reads ~3.5 cm
+# long while walking (gait pitch), so sensed 0.10-0.125 during a real walk
+# is true ~0.07-0.09 — exactly the measured connect band — and the stop's
+# forward slide plus settle back-drift are already priced into that band
+# (the sweep connects from placed-at-stop 0.06-0.09 including drift). A
+# STATIONARY duck reads ~true, so a too-far static stance (true >= 0.10)
+# lands above the 0.125 ceiling and cannot enter: momentum is part of the
+# guard. Left is forgiving (-0.02 to -0.08 true all connect).
+when = "ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.est_forward_m > 0.100 and ball_seen.est_forward_m < 0.125 and ball_seen.est_left_m > -0.082 and ball_seen.est_left_m < -0.020 and elapsed_s > 2.0"
 to = "kick"
 
 [[node]]
@@ -52,12 +64,32 @@ foot = "right"
 stage_ball = false
 settle_s = 0.8
 [[node.transition]]
-# Settle drifted the ball out of the pocket? Line it up again, don't kick air.
-when = "elapsed_s > 0.6 and elapsed_s < 0.75 and ball_seen.visible and ball_seen.est_left_m > -0.01"
-to = "approach"
+# Post-settle sanity check: only reject CLEARLY bad stances — a poked,
+# still-rolling ball or a stop that slid way past. The settle back-drift
+# (~2-3 cm, the standing policy re-centering) is normal and the swing
+# tolerates it, so the ceiling here is generous; the tight decision was
+# made by the entry guard, at speed.
+when = "elapsed_s > 0.6 and elapsed_s < 0.75 and ball_seen.visible and (ball_seen.est_forward_m > 0.135 or ball_seen.est_forward_m < 0.050 or ball_seen.est_left_m > -0.012 or ball_seen.est_left_m < -0.10)"
+to = "backoff"
 [[node.transition]]
-when = "elapsed_s > 4.2"
+# The swing is done (settle 0.8 s + 3 s trick) and the ball is STILL at the
+# feet: a whiff. The ball leaves the tilted camera's frame during the kick
+# choreography but is back in view right after, so this is a sensed check —
+# no celebrating a miss. Back off to rebuild momentum, then line up again.
+when = "elapsed_s > 3.9 and ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.est_forward_m < 0.3"
+to = "backoff"
+[[node.transition]]
+when = "elapsed_s > 4.4"
 to = "celebrate"
+
+[[node]]
+name = "backoff"
+behavior = "drive"              # walk backward: the gait needs distance to
+[node.params]                   # rebuild momentum — creep from a standstill
+vx = -0.3                       # moves millimeters, and the pocket guard
+[[node.transition]]             # only accepts a duck arriving at speed.
+when = "elapsed_s > 4.0"        # 4 s: backward walking pays the same
+to = "approach"                 # spin-up tax — 2 s barely moved the duck
 
 [[node]]
 name = "celebrate"

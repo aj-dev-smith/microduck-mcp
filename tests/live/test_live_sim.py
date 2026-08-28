@@ -142,7 +142,10 @@ class TestLiveSim(unittest.TestCase):
         time.sleep(3.5)
         b = rq({"cmd": "state"})["ball_position_m"]
         moved = math.hypot(b[0] - BALL_HOME[0], b[1] - BALL_HOME[1])
-        self.assertGreater(moved, 1.0, f"staged kick barely moved the ball: {b}")
+        # Roll-out with the ball's rolling friction enabled (sim_server fixes
+        # the geom's condim at load): a clean kick runs ~0.9-1.8 m and STOPS,
+        # instead of the old frictionless 3-4 m glide to infinity.
+        self.assertGreater(moved, 0.5, f"staged kick barely moved the ball: {b}")
 
     def test_5_reset_restores_duck_and_ball(self):
         self.drive(vx=0.3, wz=0.6, secs=2.0)

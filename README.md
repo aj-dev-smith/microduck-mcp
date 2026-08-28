@@ -113,9 +113,10 @@ honestly invisible, which makes *searching* for it a real behavior. Prefer
 
 The agent doesn't have to drive every step. A **machine** — TOML source, see
 [`machines/soccer.toml`](machines/soccer.toml) — binds nodes to deterministic
-behaviors (`search_ball`, `approach_ball`, `kick`, `celebrate`, `idle`)
-executed at 50 Hz on the sim thread, with transitions guarded by expressions
-over the **sensed digest only**: `ball_seen.*`, `upright`, `elapsed_s`. The
+behaviors (`search_ball`, `approach_ball`, `kick`, `celebrate`, `drive`,
+`idle`) executed at 50 Hz on the sim thread, with transitions guarded by
+expressions over the **sensed digest only**: `ball_seen.*`, `upright`,
+`elapsed_s`. The
 guard grammar is a strict whitelist (paths, literals, comparisons,
 `and/or/not` — validated at load, nothing else parses), and ground-truth ball
 position is *not in the vocabulary*: an armed machine plays fair by
@@ -143,6 +144,11 @@ happens on the sim thread via the same intent queue as every other client.
 
 ## Notes
 
+- The sim enables the ball's rolling friction at model load (the shipped spec
+  declares it but leaves the geom at `condim=3`, where it never applies — a
+  kicked ball glided 27 m and never stopped). With it, a kick runs ~1-2 m and
+  stops; an accidental toe-poke dies in centimeters, which is what makes
+  dribbling and retrying possible at all.
 - The sim server executes all MuJoCo calls on one thread; socket clients only
   enqueue intents. Multiple clients are fine (MCP + CLI simultaneously).
 - Policies hot-swap behind the shared 61-dim observation contract exactly as

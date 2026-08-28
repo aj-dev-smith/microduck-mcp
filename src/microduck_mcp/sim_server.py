@@ -78,6 +78,12 @@ HEAD_CAM_FOVY_DEG = 70.0
 # for the real robot's mediad service, which owns the camera and publishes
 # derived features rather than raw frames.
 BALL_RADIUS_M = 0.035  # matches ball.xml's geom size
+# ball.xml specifies rolling friction but leaves the geom at MuJoCo's default
+# condim=3 (sliding only), so rolling resistance never enters any contact and
+# a nudged ball rolls forever (26.9 m measured from one kick, never stopping).
+# Enable the full friction cone and use a floorball-on-floor coefficient:
+# a 1.5 m/s kick runs ~1.8 m and stops; an accidental toe-poke dies in ~9 cm.
+BALL_ROLL_FRICTION = 0.002
 DET_W, DET_H = 320, 240
 DET_EVERY = 10  # control steps between detections -> 5 Hz at 50 Hz control
 DET_MIN_PX = 6
@@ -160,6 +166,7 @@ class DuckSim:
         self.model.opt.timestep = TIMESTEP
         self.data = mujoco.MjData(self.model)
         self._apply_current_limit(DEFAULT_CURRENT_LIMIT)
+        self._fix_ball_contact()
         self._head_cam_id = self._setup_head_camera()
 
         paths = {}
@@ -217,6 +224,14 @@ class DuckSim:
         # Command-feed ring buffer for the AX debug page (webui.py).
         self.events = deque(maxlen=500)
         self._event_id = 0
+
+    def _fix_ball_contact(self):
+        """Give the ball real rolling resistance (see BALL_ROLL_FRICTION)."""
+        gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "ball_geom")
+        if gid < 0:
+            return
+        self.model.geom_condim[gid] = 6
+        self.model.geom_friction[gid, 2] = BALL_ROLL_FRICTION
 
     def _setup_head_camera(self) -> int:
         """Re-pose the model's head_camera (see HEAD_CAM_* above)."""

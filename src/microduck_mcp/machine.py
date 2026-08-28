@@ -159,6 +159,19 @@ def bhv_idle(sim, params, mem, digest):
         mem["zeroed"] = True
 
 
+def bhv_drive(sim, params, mem, digest):
+    """Constant velocity intent (params vx, vy, wz) — the building block for
+    open-loop maneuvers. Example: a backoff node that walks backward for a
+    couple of seconds after a failed kick, because the gait needs distance to
+    rebuild real momentum — commanded creep from a standstill moves the duck
+    millimeters, not centimeters."""
+    if not mem.get("set"):
+        sim.policy.set_vel_cmd(float(params.get("vx", 0.0)),
+                               float(params.get("vy", 0.0)),
+                               float(params.get("wz", 0.0)))
+        mem["set"] = True
+
+
 def bhv_search_ball(sim, params, mem, digest):
     """Rotate in place until a guard sees the ball. wz below ~1.2 is a dead
     zone, so search always turns at full rate. Head level: a level camera
@@ -200,31 +213,53 @@ def bhv_approach_ball(sim, params, mem, digest):
     elif d > 0.60:
         mem["tilted"] = False
     _set_head(sim, head_down if mem.get("tilted") else 0.0)
-    tgt_b = math.radians(float(params.get("pocket_bearing_deg", -25.0)))
-    tgt_d = float(params.get("pocket_distance_m", 0.099))
-    e_d, e_b = d - tgt_d, b - tgt_b
+    # Kick sweep (measured): forward is the critical axis — the ball connects
+    # hard at true forward <= 0.09 m, dies at 0.10-0.12. The camera reads
+    # ~1.5 cm long at point-blank (beak occlusion biases the blob), so the
+    # sensed stop target sits closer than the old 0.099.
     if d > 0.18:
+        tgt_b = math.radians(float(params.get("pocket_bearing_deg", -25.0)))
         if abs(b) > math.radians(35):
             vx, wz = 0.0, math.copysign(1.5, b)
         else:
             vx, wz = 0.3, _clip(2.5 * b, -1.0, 1.0)
     else:
-        wz = math.copysign(1.5, e_b) if abs(e_b) > math.radians(15) else 0.0
-        vx = 0.25 if e_d > 0.035 else (-0.25 if e_d < -0.035 else 0.0)
+        # Fine range: servo est_forward/est_left into the pocket guard's
+        # window, so "controller satisfied" implies "guard fires". The creep
+        # deliberately stops OUTSIDE the walking foot's reach (contact
+        # forensics: the swinging right foot pokes any ball nearer than
+        # ~0.09 true / ~0.11 sensed) — the kick guard fires while still
+        # creeping, and the stop's own forward slide delivers the last
+        # ~3 cm with feet planted. The stop closes the gap, not a step.
+        vx = 0.2 if fwd > 0.110 else (-0.2 if fwd < 0.085 else 0.0)
+        wz = 1.5 if left > -0.020 else (-1.5 if left < -0.080 else 0.0)
     sim.policy.set_vel_cmd(vx, 0.0, wz)
 
 
 def bhv_kick(sim, params, mem, digest):
-    """Stop, settle, then one honest kick. Guards decide when this node is
-    entered (the pocket check) and when it is left (elapsed)."""
+    """Stop, LOOK UP, settle, one honest kick, then look back down to verify.
+
+    The head MUST be level for the swing: head_pose is part of the policy
+    command vector, and the kick policy fed a bowed head does not swing at
+    all (measured: 1.3-1.5 m with the head level, 0.00 m at 0.5 rad down,
+    same ball, same stance). So the duck lines up watching the ball, looks
+    up to kick like a striker, and glances down afterwards so the whiff
+    guard has fresh eyes on where the ball ended up."""
     settle_s = float(params.get("settle_s", 0.8))
     if not mem.get("stopped"):
         sim.policy.set_vel_cmd(0.0, 0.0, 0.0)
+        _set_head(sim, 0.0)
         mem["stopped"] = True
     if digest["elapsed_s"] >= settle_s and not mem.get("kicked"):
         mem["kicked"] = True
         foot = params.get("foot", "right")
         sim._handle_trick(f"kick_{foot}", stage_ball=bool(params.get("stage_ball", False)))
+    # Swing done (trick auto-returns 3 s after trigger): look down again so
+    # the whiff-check guard gets a fresh sighting of the pocket.
+    if mem.get("kicked") and not mem.get("verified") \
+            and digest["elapsed_s"] >= settle_s + 2.9:
+        _set_head(sim, float(params.get("head_down", 0.5)))
+        mem["verified"] = True
 
 
 def bhv_celebrate(sim, params, mem, digest):
@@ -235,6 +270,7 @@ def bhv_celebrate(sim, params, mem, digest):
 
 BEHAVIORS = {
     "idle": bhv_idle,
+    "drive": bhv_drive,
     "search_ball": bhv_search_ball,
     "approach_ball": bhv_approach_ball,
     "kick": bhv_kick,
