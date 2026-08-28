@@ -95,6 +95,37 @@ class TestLiveWake(unittest.TestCase):
         cls.proc.wait(timeout=10)
         cls.log.close()
 
+    def test_reset_reenters_machine_node(self):
+        """A reset rewinds the sim clock and the world; the machine must
+        re-enter its current node (fresh per-node memory, fresh entry clock).
+        Regression: before the fix, entered_at outlived the rewound clock, so
+        elapsed_s went negative and every timed guard froze — observed live
+        as post-reset ghost detours to stale world-frame targets."""
+        self.assertTrue(machine("load", path=self.machine_path)["ok"])
+        self.assertTrue(machine("arm")["ok"])
+        time.sleep(4.0)  # machine settles: quiet -> notice -> parked
+        # Jump back into notice, giving it a LARGE entered_at, then drain
+        # every parked pack (notice's, parked's, and this entry wake).
+        self.assertTrue(machine("force", node="notice")["ok"])
+        for _ in range(10):
+            if machine("wait", block_s=0.0).get("no_wake"):
+                break
+        else:
+            self.fail("wake latch would not drain")
+        # Reset within notice's 2 s deadline window: the sim clock rewinds
+        # to ~0 while entered_at reads several seconds.
+        self.assertTrue(rq({"cmd": "reset"})["ok"])
+        status = machine("status")
+        self.assertTrue(status["armed"])
+        self.assertEqual(status["node"], "notice")  # same node, fresh entry
+        # Fixed: the re-entered deadline fires ~2 s after the reset and
+        # parks. Broken: elapsed_s is negative and 6 s of listening times out.
+        resp = machine("wait", block_s=6.0)
+        self.assertIsNotNone(resp.get("wake"),
+                             f"deadline never fired after reset: {resp}")
+        self.assertEqual(resp["wake"]["reason"], "parked for good")
+        self.assertTrue(machine("disarm")["ok"])
+
     def test_wake_loop(self):
         with self.subTest("load reports wake nodes"):
             resp = machine("load", path=self.machine_path)

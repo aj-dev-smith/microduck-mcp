@@ -1068,6 +1068,17 @@ class DuckSim:
         self._goal_azimuth_w = None  # rewound: start the episode's memory clean
         if self.referee is not None:
             self.referee.reset()  # new episode, new scoreboard
+        if self.machine is not None:
+            # The machine rides into the new episode, but not its old head:
+            # re-enter the current node so per-node memory and the entry clock
+            # start clean. Otherwise the aiming approach's cached world-frame
+            # detour targets outlive the world they were measured in (live-
+            # observed: post-reset ghost detours herding the ball into the
+            # same far corner), and elapsed_s goes negative against the
+            # rewound sim clock, freezing every timed guard. A deliberate
+            # non-wake: the reset was mind- or human-initiated, so re-entering
+            # a wake node here does not latch a pack.
+            self.machine.enter(self.machine.current, self.sim_time)
         self._detect_ball()  # so state right after a reset is not stale
         return self.get_state()
 
