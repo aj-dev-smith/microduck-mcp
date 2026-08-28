@@ -42,7 +42,6 @@ stderr. Audio is an enhancement to `duck film`, never a new way for it to die.
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 from typing import NamedTuple
 
