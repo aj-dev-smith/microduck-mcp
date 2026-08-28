@@ -125,6 +125,23 @@ GOAL_MOUTH_OUTER_W = 0.432  # outer post faces, m -> range from angular width
 # metre out the mouth is ±11 deg and the duck has to actually aim.
 PITCH_BALL_SPAWN = (-0.40, 0.0)
 
+# The mouth. The real robot has a mouth servo (one of the five neck/head/mouth
+# XL330s) and a `robot.mouth` verb: opening 0 (closed) to 1 (open), sent as a
+# continuous notification. The shipped MJCF has no mouth joint — the soft
+# mouth plate (`soft_mouth_top`, the pink part that drops out of the bill,
+# BD-X style) is a fixed visual geom on the head body — so at load time the
+# model is rebuilt with that geom moved onto a mocap body, posed every tick
+# from the head's own kinematics plus the commanded opening. Mocap means no
+# new qpos/dof: the walk policy, kick pockets and every recorded address are
+# byte-identical to the stock model. Hinge placement was tuned against
+# rendered frames: the plate pivots at the back of the mouth slit and swings
+# down up to ~29 deg.
+MOUTH_BODY = "jaw_soft"
+MOUTH_MESH = "soft_mouth_top"
+MOUTH_HINGE_POS = (0.0, 0.0, -0.050)  # in the head body frame
+MOUTH_HINGE_AXIS = (0.0, 1.0, 0.0)
+MOUTH_MAX_RAD = 0.5
+
 
 def load_infer_policy_module(rl_repo: str):
     """Import microduck_rl's scripts/infer_policy.py as a module."""
@@ -138,6 +155,56 @@ def load_infer_policy_module(rl_repo: str):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def load_model_with_mouth(xml_path: str):
+    """Compile the scene with the mouth plate moved onto a mocap body.
+
+    Returns (model, mouth_ok). Any failure — an MJCF without the head body or
+    plate mesh, an older mujoco without MjSpec — falls back to the stock model
+    with the mouth disabled, never a broken sim.
+    """
+    try:
+        spec = mujoco.MjSpec.from_file(xml_path)
+        plate = None
+        for body in spec.bodies:
+            if body.name == MOUTH_BODY:
+                for geom in body.geoms:
+                    if geom.meshname == MOUTH_MESH:
+                        plate = geom
+        if plate is None:
+            raise ValueError(f"no {MOUTH_MESH} geom on body {MOUTH_BODY!r}")
+        pos, quat, mat = plate.pos.copy(), plate.quat.copy(), plate.material
+        spec.delete(plate)
+        mouth = spec.worldbody.add_body(name="mouth_plate", mocap=True)
+        mouth.add_geom(type=mujoco.mjtGeom.mjGEOM_MESH, meshname=MOUTH_MESH,
+                       pos=pos, quat=quat, material=mat,
+                       contype=0, conaffinity=0, group=0)
+        return spec.compile(), True
+    except Exception as e:
+        print(f"note: mouth disabled ({e}) — loading stock model")
+        return mujoco.MjModel.from_xml_path(xml_path), False
+
+
+def mouth_pose(head_pos, head_quat, opening: float):
+    """World pose for the mouth plate's mocap body.
+
+    The plate's home pose coincides with the head body; opening it is a hinge
+    rotation about MOUTH_HINGE_AXIS at MOUTH_HINGE_POS (head frame), so
+    opening=0 reproduces the stock model exactly.
+    """
+    theta = float(np.clip(opening, 0.0, 1.0)) * MOUTH_MAX_RAD
+    qh = np.zeros(4)
+    mujoco.mju_axisAngle2Quat(qh, np.asarray(MOUTH_HINGE_AXIS, dtype=np.float64), theta)
+    hinge = np.asarray(MOUTH_HINGE_POS, dtype=np.float64)
+    swung = np.zeros(3)
+    mujoco.mju_rotVecQuat(swung, hinge, qh)
+    local = hinge - swung  # translation that keeps the hinge point fixed
+    quat = np.zeros(4)
+    mujoco.mju_mulQuat(quat, np.asarray(head_quat, dtype=np.float64), qh)
+    offset = np.zeros(3)
+    mujoco.mju_rotVecQuat(offset, local, np.asarray(head_quat, dtype=np.float64))
+    return np.asarray(head_pos, dtype=np.float64) + offset, quat
 
 
 def quat_to_rpy(q):
@@ -340,7 +407,7 @@ class DuckSim:
 
         xml_path = os.path.join(self.rl_repo, SCENES[scene])
         print(f"Loading MuJoCo model: {xml_path}")
-        self.model = mujoco.MjModel.from_xml_path(xml_path)
+        self.model, mouth_ok = load_model_with_mouth(xml_path)
         self.model.opt.timestep = TIMESTEP
         self.data = mujoco.MjData(self.model)
         self._apply_current_limit(DEFAULT_CURRENT_LIMIT)
@@ -422,6 +489,19 @@ class DuckSim:
             print(f"Goal in scene (geom {goal_geom!r}) — scoring on: line "
                   f"x>{GOAL_LINE_X + BALL_RADIUS_M:.3f}, |y|<{GOAL_HALF_WIDTH_Y}, "
                   f"z<{GOAL_HEIGHT_Z}")
+        # The mouth: a commanded opening in [0, 1] (robot.mouth semantics),
+        # applied to the mocap plate every tick. Purely cosmetic — the plate
+        # has no dynamics and the policy never sees it.
+        self.mouth_opening = 0.0
+        self._mouth_mocap_id = -1
+        self._mouth_head_id = -1
+        if mouth_ok:
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "mouth_plate")
+            self._mouth_mocap_id = int(self.model.body_mocapid[bid])
+            self._mouth_head_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, MOUTH_BODY)
+            self.mouth_tick()  # park the plate on the head before first render
+            mujoco.mj_forward(self.model, self.data)
         # Command-feed ring buffer for the AX debug page (webui.py).
         self.events = deque(maxlen=500)
         self._event_id = 0
@@ -450,6 +530,20 @@ class DuckSim:
         self.model.cam_pos[cid, 2] -= HEAD_CAM_FORWARD_M
         self.model.cam_fovy[cid] = HEAD_CAM_FOVY_DEG
         return int(cid)
+
+    def mouth_tick(self):
+        """Pose the mouth plate from the head's kinematics + the opening.
+
+        Runs before each control step (and once at init/reset), so the next
+        mj_step folds the mocap pose into xpos for the viewer and renderers.
+        """
+        if self._mouth_mocap_id < 0:
+            return
+        pos, quat = mouth_pose(self.data.xpos[self._mouth_head_id],
+                               self.data.xquat[self._mouth_head_id],
+                               self.mouth_opening)
+        self.data.mocap_pos[self._mouth_mocap_id] = pos
+        self.data.mocap_quat[self._mouth_mocap_id] = quat
 
     def _apply_current_limit(self, amps: float):
         try:
@@ -730,6 +824,8 @@ class DuckSim:
             "ground_pick": bool(p.ground_pick_mode),
             # Camera-derived, unlike ball_position_m below: what the head
             # camera actually saw, as the real robot's mediad would report it.
+            "mouth": (round(self.mouth_opening, 3)
+                      if self._mouth_mocap_id >= 0 else None),
             "ball_seen": {**self._ball_seen,
                           "age_s": round(self.sim_time - self._ball_seen_t, 3)},
             "machine": ({"name": self.machine.name, "armed": self.machine.armed,
@@ -785,6 +881,19 @@ class DuckSim:
             self.data.qvel[self.qvel_adr + 0] = mag * math.cos(angle)
             self.data.qvel[self.qvel_adr + 1] = mag * math.sin(angle)
             return {"ok": True, "pushed": {"magnitude": mag, "angle_deg": round(math.degrees(angle), 1)}}
+        if cmd == "mouth":
+            # robot.mouth semantics: a continuous opening intent, clamped.
+            # Ambient (streamed at ~40 Hz by `duck say`), so _log_event skips
+            # it — the say annotation below is the loggable act.
+            self.mouth_opening = float(np.clip(req.get("opening", 0.0), 0.0, 1.0))
+            return {"ok": True, "mouth": round(self.mouth_opening, 3)}
+        if cmd == "say":
+            # Annotation only: speech is rendered and played host-side (the
+            # sim has no speaker); this puts the act on the control surface —
+            # the event feed and the film's feed — like any other intent.
+            text = str(req.get("text", ""))[:200]
+            return {"ok": True, "text": text,
+                    "duration_s": req.get("duration_s")}
         if cmd == "camera":
             return self._handle_camera(req)
         if cmd == "camera_web":
@@ -852,6 +961,8 @@ class DuckSim:
         p.behavior_mode = None
         p.set_vel_cmd(0.0, 0.0, 0.0)  # selects the standing policy
         self.data.ctrl[:] = p.default_pose
+        self.mouth_opening = 0.0
+        self.mouth_tick()
         mujoco.mj_forward(self.model, self.data)
         self.sim_time = 0.0
         self._det_step = 0
@@ -936,7 +1047,7 @@ class DuckSim:
 
     def _log_event(self, client: str, req: dict, resp: dict):
         cmd = req.get("cmd", "?")
-        if cmd in ("camera_web", "ping"):  # ambient page traffic, not agent intent
+        if cmd in ("camera_web", "ping", "mouth"):  # ambient traffic, not agent intent
             return
         if not resp.get("ok"):
             note = resp.get("error", "error")
@@ -1008,6 +1119,7 @@ def run_loop(sim: DuckSim, viewer=None, realtime: bool = True, stop: threading.E
         sim.policy.update_behavior(dt)
         action = sim.policy.infer()
         sim.policy.apply_action(action)
+        sim.mouth_tick()
         for _ in range(DECIMATION):
             mujoco.mj_step(sim.model, sim.data)
         sim.sim_time += control_dt

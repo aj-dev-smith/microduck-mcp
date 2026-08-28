@@ -70,6 +70,7 @@ uv run duck drive 0.2          # walk forward at 0.2 m/s
 uv run duck trick roulade      # forward roll
 uv run duck cam follow         # render a frame, prints the PNG path
 uv run duck push               # shove it, watch it recover
+uv run duck say "hello!"       # speak: audio host-side, beak in the sim
 ```
 
 Register the MCP server with Claude Code:
@@ -95,6 +96,8 @@ the agent rarely needs a follow-up poll.
 | `duck_camera(view, distance)` | Rendered frame: `head` (the duck's own POV), `follow`, `front`, `side`, `top` |
 | `duck_push(magnitude, angle_deg)` | Shove the trunk; tests push recovery |
 | `duck_machine(action, ...)` | Load/arm/hot-reload a **behavior machine** — autonomy between the agent's decisions (see below) |
+| `duck_mouth(opening)` | Beak opening 0..1 — the real robot's `robot.mouth` verb, in the sim (expressive only, no physics) |
+| `duck_say(text, voice_bank?)` | **Speak as the duck**: renders the duck's voice, plays it on the host's speakers, lip-syncs the beak live in the sim (see below) |
 | `duck_reset` | Back to origin, default stance (`destructive_hint` — it ends the episode) |
 
 ## Honest sensing (fake mediad)
@@ -193,6 +196,49 @@ subcommand, `film` does **not** talk to a running `duck-sim`: filming wants raw
 frame buffers, per-take resets and chosen spawns, none of which are socket
 intents, so it boots its own headless sim (`--rl-repo`/`--policies`, same
 defaults as `duck-sim`) and leaves any sim you have running alone.
+
+## The voice (`duck say`)
+
+The duck speaks, and its beak moves while it does:
+
+```bash
+uv run mjpython -m microduck_mcp.sim_server --viewer   # watchable sim
+uv run duck say "hello A J — watch the beak"
+uv run duck say "now with chirps" --voice-bank bank/
+```
+
+The voice is built to be *honestly synthetic* — an AI in a duck, not a person
+in a duck suit. Text goes through TTS (macOS `say` for now; the TTS stage is
+a one-function boundary meant for a phoneme-timed engine later), gets pitched
+~2 semitones up, and is run through the **modulation parameters of the duck's
+own synthesized personality** — the vibrato and amplitude-wobble rates that
+seed 42 of the real robot's voice synth uses for its calls. Then **chirp
+grains are blended into the stressed syllables**: a loudness envelope finds
+the syllable nuclei with the sharpest attack, and a 90 ms grain of a real
+voice-bank chirp rides each one, shaped by the word's own envelope — chirps
+as an accent living in the words, not punctuation between them.
+
+The **beak lip-sync comes from the same envelope**: fast attack, slower
+release (a beak snaps open and eases shut), streamed to the sim as `mouth`
+intents (0 closed → 1 open, the real robot's `robot.mouth` semantics) against
+the audio playback clock with absolute deadlines, so the two cannot drift.
+The shipped MJCF has no mouth joint, so at load time the sim rebuilds the
+model with the soft mouth plate on a mocap body — no new degrees of freedom,
+the walk policy sees a byte-identical world — and hinges it from the head's
+own kinematics every tick.
+
+The chirp bank is rendered by the real robot's voice code
+([pollen-robotics/microduck](https://github.com/pollen-robotics/microduck)'s
+`sounds` crate):
+
+```bash
+cargo run -p sounds -- render chirp bank/chirp.wav --seed 42
+```
+
+No bank? The duck still talks, just chirpless (with a note). `--audio-only`
+skips the sim, `--wav-out` keeps the render, and `duck mouth 0.6` holds an
+expression by hand. Requires `say`, `ffmpeg` and `afplay` on the host —
+speech is rendered and played host-side; the sim gets only the beak.
 
 ## AX debug page
 

@@ -13,9 +13,13 @@ Library (`request()`) plus a small CLI:
     duck machine load machines/soccer.toml
     duck machine arm | disarm | status | reload | force <node>
     duck film -o match.mp4
+    duck mouth 0.6
+    duck say "hello A J" --voice-bank bank/
 
-Every subcommand but `film` is a one-shot intent over the socket; `film` runs
-its own headless sim and writes an mp4 (see film.py).
+Every subcommand but `film` and `say` is a one-shot intent over the socket;
+`film` runs its own headless sim and writes an mp4 (see film.py), and `say`
+renders the duck's voice, plays it host-side and streams the beak to the
+running sim (see voice.py).
 """
 
 import argparse
@@ -73,15 +77,22 @@ def main():
                                       "disarm", "force"])
     m.add_argument("arg", nargs="?", default=None,
                    help="path for load, node name for force")
-    # `film` is the one subcommand that is not a socket intent — it boots its
-    # own headless sim — so its flags live next to the shoot, in film.py.
-    from . import film
+    mo = sub.add_parser("mouth", help="set the beak opening")
+    mo.add_argument("opening", type=float, help="0 (closed) to 1 (open)")
+    # `film` and `say` are not plain socket intents — film boots its own
+    # headless sim, say renders audio and then performs it — so their flags
+    # live next to their implementations.
+    from . import film, voice
     film.add_arguments(sub.add_parser("film",
                                       help="film an autonomous match to an mp4"))
+    voice.add_arguments(sub.add_parser("say",
+                                       help="speak: audio host-side, beak in sim"))
     args = p.parse_args()
 
     if args.command == "film":
         sys.exit(film.run(args))
+    if args.command == "say":
+        sys.exit(voice.run(args))
 
     if args.command == "drive":
         req = {"cmd": "set_velocity", "vx": args.vx, "vy": args.vy, "wz": args.wz}
@@ -98,6 +109,8 @@ def main():
         req = {"cmd": "push", "magnitude": args.magnitude}
         if args.angle_deg is not None:
             req["angle_deg"] = args.angle_deg
+    elif args.command == "mouth":
+        req = {"cmd": "mouth", "opening": args.opening}
     elif args.command == "machine":
         req = {"cmd": "machine", "action": args.action}
         if args.action == "load":

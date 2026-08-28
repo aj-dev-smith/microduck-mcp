@@ -13,6 +13,8 @@ primitive every client supports. Results use typed structured output; errors
 the model should see and recover from are raised as ToolError.
 """
 
+import os
+import subprocess
 import time
 from typing import Any, Literal
 
@@ -139,6 +141,9 @@ class DuckState(BaseModel):
     sitting: bool
     behavior: str | None = Field(description="Episodic trick currently running, else null")
     ground_pick: bool
+    mouth: float | None = Field(
+        default=None, description="Beak opening intent, 0 (closed) to 1 "
+        "(open); null if the loaded model has no animatable mouth")
     ball_seen: BallSeen | None = Field(
         default=None, description="Camera-derived ball sighting — the sensed "
         "view. Prefer it over ball_position_m when you want the robot to act "
@@ -237,6 +242,45 @@ def duck_look(neck_pitch: float = 0.0, head_pitch: float = 0.0,
     _call({"cmd": "look", "neck_pitch": neck_pitch, "head_pitch": head_pitch,
            "head_yaw": head_yaw, "head_roll": head_roll})
     return DuckState(**_state_after())
+
+
+@mcp.tool(title="Open the beak", annotations=_INTENT)
+def duck_mouth(opening: float) -> DuckState:
+    """Set the beak opening: 0.0 closed to 1.0 open (clamped). Mirrors the
+    real robot's `robot.mouth` verb — a continuous, sticky intent, purely
+    expressive (no physics). duck_say drives it automatically while speaking;
+    use this directly for a held expression (gape, pant, grin)."""
+    _call({"cmd": "mouth", "opening": opening})
+    return DuckState(**_state_after(0.1))
+
+
+@mcp.tool(title="Speak", annotations=_EPISODIC)
+def duck_say(text: str, voice_bank: str | None = None) -> DuckState:
+    """Speak as the duck: text is rendered into the duck's voice (pitched,
+    personality-modulated, chirp grains blended into the stressed syllables),
+    played on the host's speakers, while the beak lip-syncs live in the sim
+    from the same loudness envelope. Blocks until the utterance finishes
+    (~1 s per 12 chars; max 400 chars — keep it punchy, it's a duck).
+
+    voice_bank: directory of voice-bank wavs rendered by the microduck
+    `sounds` crate (chirp*.wav is blended in); without it the voice still
+    works, just chirpless. Requires macOS `say`, `ffmpeg` and `afplay` on the
+    machine running this MCP server."""
+    from . import voice
+    try:
+        ffmpeg = voice.find_ffmpeg()
+        wav, traj, duration = voice.render_voice(text, ffmpeg,
+                                                 bank_dir=voice_bank)
+        try:
+            voice.speak(wav, traj, text, duration)
+        finally:
+            if os.path.exists(wav):
+                os.unlink(wav)
+    except (voice.FilmError, voice.VoiceError) as e:
+        raise ToolError(str(e)) from e
+    except subprocess.CalledProcessError as e:
+        raise ToolError(f"voice render failed: {e}") from e
+    return DuckState(**_call({"cmd": "state"}))
 
 
 @mcp.tool(title="Duck camera", annotations=_READ)
