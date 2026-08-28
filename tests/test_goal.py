@@ -16,9 +16,9 @@ import numpy as np
 from microduck_mcp.machine import GUARD_PATHS
 from microduck_mcp.sim_server import (BALL_RADIUS_M, GOAL_GEOM_NAMES,
                                       GOAL_HALF_WIDTH_Y, GOAL_HEIGHT_Z,
-                                      GOAL_LINE_X, GOAL_NOT_SEEN, DuckSim,
-                                      GoalReferee, ball_in_goal,
-                                      find_goal_geom)
+                                      GOAL_LINE_X, GOAL_NET_BACK_X,
+                                      GOAL_NOT_SEEN, DuckSim, GoalReferee,
+                                      ball_in_goal, find_goal_geom)
 
 IN = GOAL_LINE_X + BALL_RADIUS_M + 0.02  # comfortably over the line
 
@@ -66,6 +66,15 @@ class GoalPredicate(unittest.TestCase):
         # A ball that sails past the whole structure is not a goal, however
         # far behind the line it ends up.
         self.assertFalse(ball_in_goal(GOAL_LINE_X + 1.5, 0.5, BALL_RADIUS_M))
+
+    def test_behind_the_net_is_not(self):
+        # The one that fooled a filmed match: rolled wide, wrapped around the
+        # OUTSIDE of the net, and stopped behind the goal with |y| drifting
+        # under the post line. The scoring volume ends at the back of the
+        # net — only the mouth leads inside it.
+        self.assertFalse(ball_in_goal(1.115, 0.199, BALL_RADIUS_M))
+        self.assertFalse(ball_in_goal(GOAL_NET_BACK_X + 0.001, 0.0, BALL_RADIUS_M))
+        self.assertTrue(ball_in_goal(GOAL_NET_BACK_X - 0.05, 0.0, BALL_RADIUS_M))
 
     def test_radius_is_a_parameter(self):
         x = GOAL_LINE_X + 0.05

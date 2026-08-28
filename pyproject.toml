@@ -1,6 +1,6 @@
 [project]
 name = "microduck-mcp"
-version = "0.5.0"
+version = "0.5.1"
 description = "Drive the Pollen Robotics Microduck (simulation) from any MCP client"
 readme = "README.md"
 requires-python = ">=3.10"

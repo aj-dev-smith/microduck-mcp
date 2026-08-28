@@ -59,6 +59,12 @@ SCENES = {
 GOAL_LINE_X = 0.60
 GOAL_HALF_WIDTH_Y = 0.20
 GOAL_HEIGHT_Z = 0.18
+# Back of the net (the ground bar the back net slopes down to). The scoring
+# volume is the NET INTERIOR — without this bound a ball that rolls wide,
+# wraps around the outside of the net and stops behind the goal "scores"
+# the moment its |y| drifts under the post line (it happened: a filmed
+# match called a goal at x=1.11, half a metre behind the net).
+GOAL_NET_BACK_X = 0.82
 
 # Policy roles -> filenames as shipped in pollen-robotics/microduck's policies/
 POLICY_FILES = {
@@ -271,13 +277,16 @@ def find_goal_geom(model) -> str | None:
 
 def ball_in_goal(x: float, y: float, z: float,
                  radius_m: float = BALL_RADIUS_M) -> bool:
-    """Is the ball FULLY across the line and inside the mouth?
+    """Is the ball FULLY across the line and inside the NET?
 
     Fully across: the trailing edge of the ball has cleared the line, i.e. the
     centre is a whole radius past it. Inside: between the posts, under the
-    crossbar (a ball bouncing off the top of the frame is not a goal).
+    crossbar, and in front of the back of the net — the enclosed volume that
+    is physically reachable only through the mouth. A ball bouncing off the
+    top of the frame, or rolling around the outside and stopping BEHIND the
+    goal, is not a goal.
     """
-    return (x > GOAL_LINE_X + radius_m
+    return (GOAL_LINE_X + radius_m < x < GOAL_NET_BACK_X
             and abs(y) < GOAL_HALF_WIDTH_Y
             and z < GOAL_HEIGHT_Z)
 
