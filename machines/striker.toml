@@ -26,6 +26,11 @@
 # goal.scored/goal.count come from the referee (a goal-line sensor, world
 # infrastructure), not from the robot's eyes — the robot's own steering runs
 # entirely on ball_seen.* and goal_seen.*.
+#
+# And it talks: `celebrate` and `won` carry a `say` line, forwarded on entry
+# through the sim's `say` annotation verb and voiced host-side when the session
+# has a voice. Annotation, not behavior — the guards, the physics and the
+# match play out identically on a server that ignores the key.
 
 [machine]
 name = "striker"
@@ -156,6 +161,12 @@ to = "approach"
 [[node]]
 name = "celebrate"
 behavior = "celebrate"          # the headstand (a roulade, honestly)
+# Entering this node means the referee called a goal — both routes in are
+# guarded on goal.scored — so the line is earned by construction. The `wheee`
+# is NOT here: it belongs to `duck film`, which places it on the goal moment
+# itself and nowhere else. A sound reserved for earned goals stays reserved by
+# living in exactly one place.
+say = "Goal! I aimed that one myself."
 [node.params]
 trick = "roulade"
 [[node.transition]]
@@ -175,6 +186,9 @@ behavior = "idle"
 # goal deserves company (and someone to run duck_say).
 wake = "GOAL — match won, ball in the net"
 wake_hold = "parked and safe; the referee re-arms when the ball comes back out"
+# Said out loud as well as parked on the wake line: the mind may be busy, but
+# whoever is in the room with the duck should hear that it is done.
+say = "Ball is in the net. Someone should come and look."
 [[node.transition]]
 when = "not goal.scored"
 to = "search"

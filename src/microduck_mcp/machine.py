@@ -24,6 +24,16 @@ transition guarded on elapsed_s (the deadline default that runs if no answer
 ever comes) or declare `wake_hold = "why parking here forever is safe"` (the
 explicit hold — a fallen duck with no stand-up policy has nothing better to
 do). The machine stays autonomous-first, mind-optional, by construction.
+
+SPEAKING NODES: a node may also declare `say = "..."` — entering it puts that
+line on the control surface through the sim's existing `say` annotation verb,
+and the server speaks it host-side if it can (the robot has a mouth servo, not
+a speaker). It is an annotation in the same sense `wake` is: the machine says
+what it is doing, and whether anything is listening is somebody else's
+problem. Nothing about the behavior, the guards or the physics depends on it,
+and a server too old to know the key simply ignores it — an unknown node key
+has never been an error here, which is what makes a machine with a voice safe
+to hot-reload onto a server without one.
 """
 
 import ast
@@ -53,6 +63,11 @@ GUARD_PATHS = {
     "goal.scored", "goal.count",
     "elapsed_s", "sim_time_s", "node",
 }
+
+# A node's `say` line. Same ceiling as voice.MAX_SAY_CHARS, spelled out rather
+# than imported: the grammar deliberately knows nothing about audio, and this
+# module's imports stay light enough to validate a machine anywhere.
+MAX_SAY_CHARS = 400
 
 _ALLOWED_NODES = (
     ast.Expression, ast.BoolOp, ast.UnaryOp, ast.Not, ast.USub, ast.And, ast.Or,
@@ -528,9 +543,15 @@ class Machine:
                               "to": t["to"]})
             wake = n.get("wake")
             wake_hold = n.get("wake_hold")
-            for key, val in (("wake", wake), ("wake_hold", wake_hold)):
+            say = n.get("say")
+            for key, val in (("wake", wake), ("wake_hold", wake_hold),
+                             ("say", say)):
                 if val is not None and not isinstance(val, str):
                     raise MachineError(f"node {name!r}: {key} must be a string")
+            if say is not None and len(say) > MAX_SAY_CHARS:
+                raise MachineError(
+                    f"node {name!r}: say is {len(say)} chars (max "
+                    f"{MAX_SAY_CHARS}) — a behavior node is not a monologue")
             if wake_hold is not None and wake is None:
                 raise MachineError(
                     f"node {name!r}: wake_hold without wake — the hold is the "
@@ -545,7 +566,8 @@ class Machine:
             self.nodes[name] = {"behavior": bname,
                                 "params": n.get("params", {}),
                                 "transitions": trans,
-                                "wake": wake, "wake_hold": wake_hold}
+                                "wake": wake, "wake_hold": wake_hold,
+                                "say": say}
         # machine-level transitions (checked before the node's own — the
         # "fell over" escape hatch lives here)
         self.global_transitions = []
@@ -592,7 +614,9 @@ class Machine:
                 "armed": self.armed, "node": self.current,
                 "nodes": sorted(self.nodes),
                 "wake_nodes": sorted(n for n, v in self.nodes.items()
-                                     if v["wake"] is not None)}
+                                     if v["wake"] is not None),
+                "say_nodes": sorted(n for n, v in self.nodes.items()
+                                    if v["say"] is not None)}
 
     def tick(self, sim, digest: dict):
         """One 50 Hz step: transitions first (global, then node, in order),

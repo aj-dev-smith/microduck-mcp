@@ -1,12 +1,16 @@
-"""Offline tests for the behavior machine: guard grammar, validation, executor."""
+"""Offline tests for the behavior machine: guard grammar, validation, executor,
+and the annotations a node may carry on the way past."""
 
 import os
+import threading
 import unittest
+from collections import deque
 
 import numpy as np
 
 from microduck_mcp.machine import (
     GUARD_PATHS, GuardError, Machine, MachineError, compile_guard)
+from microduck_mcp.sim_server import DuckSim
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -164,6 +168,89 @@ class WakeNodes(unittest.TestCase):
         self.assertEqual(m.status()["wake_nodes"], ["down", "won"])
 
 
+class SpeakingNodes(unittest.TestCase):
+    """`say = "..."` on a node: an annotation in the same sense `wake` is.
+
+    The machine says what it is doing; whether anything is listening is
+    somebody else's problem. Nothing about the behavior, the guards or the
+    physics may depend on it.
+    """
+
+    @staticmethod
+    def _spec(node):
+        return {"machine": {"name": "t", "initial": "a"},
+                "node": [{"name": "a", "behavior": "idle",
+                          "transition": [{"when": "upright", "to": "s"}]},
+                         node]}
+
+    def test_a_node_can_carry_a_line(self):
+        m = Machine(self._spec({"name": "s", "behavior": "idle",
+                                "say": "Goal!"}))
+        self.assertEqual(m.nodes["s"]["say"], "Goal!")
+
+    def test_a_silent_node_says_none_not_nothing(self):
+        m = Machine(self._spec({"name": "s", "behavior": "idle"}))
+        self.assertIsNone(m.nodes["s"]["say"])
+        self.assertIsNone(m.nodes["a"]["say"])
+
+    def test_non_string_refused(self):
+        with self.assertRaisesRegex(MachineError, "string"):
+            Machine(self._spec({"name": "s", "behavior": "idle", "say": 3}))
+
+    def test_a_monologue_is_refused(self):
+        with self.assertRaisesRegex(MachineError, "monologue"):
+            Machine(self._spec({"name": "s", "behavior": "idle",
+                                "say": "la " * 300}))
+
+    def test_it_needs_no_wake_and_grants_none(self):
+        # Speaking and waking are independent: a node may do either, both or
+        # neither, and a `say` must not smuggle in a wake node's obligations.
+        m = Machine(self._spec({"name": "s", "behavior": "idle",
+                                "say": "just talking"}))
+        self.assertEqual(m.status()["wake_nodes"], [])
+        self.assertEqual(m.status()["say_nodes"], ["s"])
+
+    def test_a_machine_that_talks_still_runs_the_same_behavior(self):
+        quiet = Machine(self._spec({"name": "s", "behavior": "idle"}))
+        loud = Machine(self._spec({"name": "s", "behavior": "idle",
+                                   "say": "hello"}))
+        for m in (quiet, loud):
+            m.enter("s", 0.0)
+        self.assertEqual(quiet.nodes["s"]["behavior"], loud.nodes["s"]["behavior"])
+        self.assertEqual(quiet.nodes["s"]["params"], loud.nodes["s"]["params"])
+        self.assertEqual(len(quiet.nodes["s"]["transitions"]),
+                         len(loud.nodes["s"]["transitions"]))
+
+    def test_an_unknown_node_key_is_ignored(self):
+        # Why a machine with `say` is safe to hot-reload onto a server too old
+        # to know the key: unknown keys have never been an error here.
+        m = Machine(self._spec({"name": "s", "behavior": "idle",
+                                "sing": "not a real annotation"}))
+        self.assertEqual(m.nodes["s"]["behavior"], "idle")
+
+    def test_the_shipped_striker_speaks_only_where_it_earned_it(self):
+        m = Machine.load(os.path.join(REPO, "machines", "striker.toml"))
+        self.assertEqual(m.status()["say_nodes"], ["celebrate", "won"])
+        # Both routes into `celebrate` are guarded on the referee's call, so
+        # the celebration line cannot be said without a goal behind it.
+        into = [t["when"] for t in m.global_transitions
+                if t["to"] == "celebrate"]
+        into += [t["when"] for node in m.nodes.values()
+                 for t in node["transitions"] if t["to"] == "celebrate"]
+        self.assertTrue(into)
+        for when in into:
+            self.assertIn("goal.scored", when)
+
+    def test_no_shipped_line_plays_the_wheee(self):
+        # The wheee belongs to `duck film`, on the goal moment and nowhere
+        # else. The say pipeline speaks words; it does not fire bank sounds.
+        for name in ("striker.toml", "soccer.toml", "resident.toml"):
+            m = Machine.load(os.path.join(REPO, "machines", name))
+            for node, spec in m.nodes.items():
+                with self.subTest(machine=name, node=node):
+                    self.assertNotIn("wheee", (spec["say"] or "").lower())
+
+
 class _StubPolicy:
     def __init__(self):
         self.cmds = []
@@ -230,6 +317,112 @@ class Executor(unittest.TestCase):
         m.tick(sim, self._digest(0.1))
         m.tick(sim, self._digest(0.2))
         self.assertEqual(sim.policy.cmds, [(0.0, 0.0, 0.0)])
+
+
+class _Ear:
+    """A voice that only remembers what it was asked to say."""
+
+    def __init__(self, boom=False):
+        self.heard = []
+        self.boom = boom
+
+    def speak(self, text, sim=None):
+        self.heard.append(text)
+        if self.boom:
+            raise RuntimeError("no speaker on this host")
+        return True
+
+
+SPEAKING_SPEC = {
+    "machine": {"name": "t", "initial": "play"},
+    "node": [{"name": "play", "behavior": "idle",
+              "transition": [{"when": "goal.scored", "to": "won"}]},
+             {"name": "won", "behavior": "idle", "say": "Goal!",
+              "wake": "a goal deserves company",
+              "wake_hold": "parked and safe"}],
+}
+
+
+def speaking_sim(voice=None):
+    """A bare DuckSim: no MuJoCo, real event ring, real annotation plumbing."""
+    sim = DuckSim.__new__(DuckSim)
+    sim.policy = _StubPolicy()
+    sim.events = deque(maxlen=500)
+    sim._event_id = 0
+    sim.sim_time = 12.5
+    sim.voice = voice
+    sim.machine = Machine(SPEAKING_SPEC)
+    sim.machine.armed = True
+    sim._wake_cond = threading.Condition()
+    sim._wakes = deque(maxlen=16)
+    sim._wake_id = 0
+    return sim
+
+
+class SpokenOnEntry(unittest.TestCase):
+    """Entering a speaking node forwards the line through the `say` verb.
+
+    The same verb `duck say` uses, so a line the machine decided to say and
+    one a person asked for are indistinguishable on the event feed — which is
+    what puts machine speech on the film's control-surface feed for free.
+    """
+
+    def says(self, sim):
+        return [e for e in sim.events if e["cmd"] == "say"]
+
+    def test_the_line_lands_on_the_control_surface(self):
+        sim = speaking_sim()
+        sim._say_line("won", "Goal!")
+        said = self.says(sim)
+        self.assertEqual(len(said), 1)
+        self.assertEqual(said[0]["client"], "machine")
+        self.assertEqual(said[0]["args"]["text"], "Goal!")
+        self.assertEqual(said[0]["args"]["node"], "won")
+        self.assertTrue(said[0]["ok"])
+
+    def test_a_voiceless_session_still_logs_the_line(self):
+        # The robot has a mouth servo, not a speaker: speech is host-side and
+        # optional, the annotation is not.
+        sim = speaking_sim(voice=None)
+        sim._say_line("won", "Goal!")
+        self.assertEqual(len(self.says(sim)), 1)
+
+    def test_a_voice_gets_the_line(self):
+        ear = _Ear()
+        sim = speaking_sim(voice=ear)
+        sim._say_line("won", "Goal!")
+        self.assertEqual(ear.heard, ["Goal!"])
+
+    def test_a_voice_that_throws_does_not_reach_the_control_loop(self):
+        # _say_line runs in the 50 Hz sim thread. Nothing about talking is
+        # allowed to stall the walking.
+        ear = _Ear(boom=True)
+        sim = speaking_sim(voice=ear)
+        sim._say_line("won", "Goal!")
+        self.assertEqual(len(self.says(sim)), 1)   # still annotated
+        self.assertIsNone(sim.voice)               # and struck off for the session
+
+    def test_a_transition_into_a_speaking_node_speaks(self):
+        ear = _Ear()
+        sim = speaking_sim(voice=ear)
+        sim._machine_digest = lambda: {"sim_time_s": sim.sim_time,
+                                       "goal.scored": True}
+        sim.machine_tick()
+        self.assertEqual(sim.machine.current, "won")
+        self.assertEqual(ear.heard, ["Goal!"])
+        # ...and the wake it also carries is untouched by the speaking
+        self.assertEqual([e["cmd"] for e in sim.events],
+                         ["-> won", "say", "wake"])
+
+    def test_a_silent_node_says_nothing_at_all(self):
+        ear = _Ear()
+        sim = speaking_sim(voice=ear)
+        sim._machine_digest = lambda: {"sim_time_s": sim.sim_time,
+                                       "goal.scored": False}
+        sim.machine_tick()
+        self.assertEqual(sim.machine.current, "play")
+        self.assertEqual(ear.heard, [])
+        self.assertEqual(self.says(sim), [])
 
 
 if __name__ == "__main__":

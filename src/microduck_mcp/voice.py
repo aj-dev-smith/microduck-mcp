@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
 
@@ -312,6 +313,103 @@ def speak(wav_path: str, traj: np.ndarray, text: str, duration_s: float,
             sock.close()
         if player is not None:
             player.wait()
+
+
+# ---------- the machine's own voice ----------
+
+class SayPlayer:
+    """The duck talking on its own initiative, off the sim thread.
+
+    `duck say` is a performance a person asks for and waits through. This is
+    the same pipeline for lines the behavior machine decides to say while
+    nobody is asking: entering a node with a `say` annotation hands the line
+    here, and the 50 Hz control loop carries on within microseconds — the TTS
+    render alone takes about a second, which is fifty control steps the duck
+    is not allowed to spend on talking.
+
+    One line at a time. A line arriving while another is playing is DROPPED,
+    not queued: a duck that talks over itself sounds broken, and a backlog of
+    stale celebrations played after the fact is worse than silence.
+
+    The only thing the worker touches back in the sim is `mouth_opening` — a
+    mocap plate with no collision geometry and no dofs, exactly what the
+    socket `mouth` intent writes. The policy's observation never sees it, so a
+    talking duck and a silent one step identical physics.
+    """
+
+    def __init__(self, ffmpeg: str, bank_dir: str | None = None,
+                 tts_voice: str = DEFAULT_TTS_VOICE, player: str = None):
+        self.ffmpeg = ffmpeg
+        self.bank_dir = bank_dir
+        self.tts_voice = tts_voice
+        self.player = player or shutil.which("afplay")
+        self._busy = threading.Lock()
+
+    @classmethod
+    def available(cls, ffmpeg: str = "ffmpeg", bank_dir: str | None = None,
+                  tts_voice: str = DEFAULT_TTS_VOICE):
+        """A player, or None with a reason on stderr. Never raises.
+
+        A robot that cannot speak is a robot, not an error: every missing
+        piece of the toolchain means the machine's lines stay on the control
+        surface and out of the air.
+        """
+        try:
+            resolved = find_ffmpeg(ffmpeg)
+            find_say()
+            if shutil.which("afplay") is None:
+                raise VoiceError("no `afplay` to play the rendered voice")
+        except (FilmError, VoiceError) as e:
+            print(f"note: the duck has no voice this session ({e}) — machine "
+                  f"`say` lines will still show on the control surface",
+                  file=sys.stderr)
+            return None
+        return cls(resolved, bank_dir=bank_dir, tts_voice=tts_voice)
+
+    def speak(self, text: str, sim=None) -> bool:
+        """Start a line. False if the duck is already mid-sentence."""
+        if not self._busy.acquire(blocking=False):
+            return False
+        threading.Thread(target=self._run, args=(text, sim),
+                         daemon=True, name="duck-say").start()
+        return True
+
+    def _run(self, text: str, sim):
+        wav = None
+        try:
+            fd, wav = tempfile.mkstemp(prefix="duck-say-", suffix=".wav")
+            os.close(fd)
+            _, traj, _ = render_voice(text, self.ffmpeg, voice=self.tts_voice,
+                                      bank_dir=self.bank_dir, out_wav=wav)
+            self._perform(wav, traj, sim)
+        except Exception as e:
+            # The line is already on the control surface; failing to voice it
+            # must not take the sim down with it.
+            print(f"note: the duck could not say {text!r} ({e})",
+                  file=sys.stderr)
+        finally:
+            if wav and os.path.exists(wav):
+                os.unlink(wav)
+            self._busy.release()
+
+    def _perform(self, wav_path: str, traj: np.ndarray, sim,
+                 rate_hz: int = MOUTH_RATE_HZ):
+        """Play, and walk the beak against the same absolute clock as speak()."""
+        proc = subprocess.Popen([self.player, wav_path]) if self.player else None
+        try:
+            t0 = time.perf_counter()
+            for i, opening in enumerate(traj):
+                deadline = t0 + i / rate_hz
+                now = time.perf_counter()
+                if deadline > now:
+                    time.sleep(deadline - now)
+                if sim is not None:
+                    sim.mouth_opening = float(opening)
+        finally:
+            if sim is not None:
+                sim.mouth_opening = 0.0
+            if proc is not None:
+                proc.wait()
 
 
 # ---------- CLI ----------

@@ -496,6 +496,10 @@ class DuckSim:
         # applied to the mocap plate every tick. Purely cosmetic — the plate
         # has no dynamics and the policy never sees it.
         self.mouth_opening = 0.0
+        # A voice.SayPlayer if this host can talk (set by main); None means a
+        # machine's `say` lines are annotations only — the honest default for
+        # a robot whose speaker lives on somebody else's computer.
+        self.voice = None
         self._mouth_mocap_id = -1
         self._mouth_head_id = -1
         if mouth_ok:
@@ -766,11 +770,36 @@ class DuckSim:
             print(f"machine: {fired['from']} -> {fired['to']}  [{fired['when']}]")
             if self.machine.nodes[fired["from"]]["wake"] is not None:
                 self._resolve_wakes(fired["from"], fired)
+            say = self.machine.nodes[fired["to"]].get("say")
+            if say:
+                self._say_line(fired["to"], say)
             wake = self.machine.nodes[fired["to"]]["wake"]
             if wake is not None:
                 self._latch_wake(fired["to"], wake,
                                  {"from": fired["from"], "when": fired["when"]},
                                  digest)
+
+    def _say_line(self, node: str, text: str):
+        """A speaking node's line: onto the control surface, then into the air.
+
+        The annotation goes through the same `say` verb `duck say` uses, so a
+        line the machine decided to say and a line a person asked for look
+        identical on the event feed — and the film's control-surface feed
+        picks it up for free.
+
+        Speaking is best-effort and belongs to the host: the robot has a mouth
+        servo, not a speaker. Without a voice this session the line is still an
+        event, which is the point of it being an annotation.
+        """
+        resp = self.handle({"cmd": "say", "text": text})
+        self._log_event("machine", {"cmd": "say", "node": node, "text": text},
+                        resp)
+        if self.voice is not None:
+            try:
+                self.voice.speak(text, self)
+            except Exception as e:      # this runs in the 50 Hz control loop:
+                print(f"note: voice failed ({e})", file=sys.stderr)  # nothing
+                self.voice = None       # about talking may stall the walking
 
     def _latch_wake(self, node: str, reason: str, via: dict, digest: dict):
         """Sim thread: park a wake pack and release any blocked machine_wait.
@@ -1277,9 +1306,19 @@ def main():
     parser.add_argument("--fast", action="store_true", help="Run faster than realtime (headless only)")
     parser.add_argument("--web", type=int, default=8400, metavar="PORT",
                         help="Port for the AX debug page (0 disables; default 8400)")
+    parser.add_argument("--no-voice", action="store_true",
+                        help="Never speak a machine's `say` lines aloud "
+                             "(they stay on the control surface)")
+    parser.add_argument("--voice-bank", default=os.environ.get("DUCK_VOICE_BANK"),
+                        metavar="DIR",
+                        help="Voice-bank wavs for the duck's chirps (see "
+                             "`duck say --voice-bank`)")
     args = parser.parse_args()
 
     sim = DuckSim(args.rl_repo, args.policies, args.scene, args.frames_dir)
+    if not args.no_voice:
+        from . import voice
+        sim.voice = voice.SayPlayer.available(bank_dir=args.voice_bank)
     stop = threading.Event()
     server = serve_socket(sim, args.socket, stop)
     web_server = None

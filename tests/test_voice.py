@@ -179,6 +179,70 @@ class MouthPose(unittest.TestCase):
         self.assertAlmostEqual(angle, MOUTH_MAX_RAD, places=9)
 
 
+class TheMachinesVoice(unittest.TestCase):
+    """SayPlayer: the same pipeline, for lines nobody asked for out loud.
+
+    Still silent here — the player is exercised without ever reaching TTS or
+    a speaker. What matters is that it cannot stall or crash the 50 Hz control
+    loop that hands it a line.
+    """
+
+    def player(self):
+        import threading
+        p = voice.SayPlayer.__new__(voice.SayPlayer)
+        p._busy = threading.Lock()
+        p.ffmpeg, p.bank_dir, p.player = "ffmpeg", None, None
+        p.tts_voice = voice.DEFAULT_TTS_VOICE
+        return p
+
+    def test_the_duck_does_not_talk_over_itself(self):
+        p = self.player()
+        p._busy.acquire()               # pretend a line is playing
+        self.assertFalse(p.speak("second thoughts"))
+
+    def test_a_line_that_cannot_be_rendered_releases_the_lock(self):
+        # A duck that failed to say one thing must still be able to say the
+        # next one; a stuck lock would mute it for the rest of the session.
+        p = self.player()
+        p.ffmpeg = "/nonexistent/ffmpeg"
+        p._busy.acquire()               # as speak() would, before the worker
+        with redirect_stderr(io.StringIO()) as err:
+            p._run("hello", None)
+        self.assertIn("could not say", err.getvalue())
+        self.assertTrue(p._busy.acquire(blocking=False))
+
+    def test_a_host_that_cannot_speak_gets_no_player_and_a_note(self):
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertIsNone(voice.SayPlayer.available(ffmpeg="/nonexistent"))
+        self.assertIn("no voice this session", err.getvalue())
+
+    def test_the_beak_is_left_shut_when_a_line_ends(self):
+        import types
+        p = self.player()
+        sim = types.SimpleNamespace(mouth_opening=0.7)
+        p._perform("unused.wav", np.array([0.4, 0.8], dtype=np.float32), sim,
+                   rate_hz=1000)
+        self.assertEqual(sim.mouth_opening, 0.0)
+
+    def test_it_drives_the_beak_from_the_trajectory(self):
+        class Recorder:
+            """A sim that only remembers what its beak was told to do."""
+            def __init__(self):
+                self.seen = []
+
+            def __setattr__(self, name, value):
+                if name == "mouth_opening":
+                    self.seen.append(value)
+                else:
+                    object.__setattr__(self, name, value)
+
+        sim = Recorder()
+        self.player()._perform("unused.wav",
+                               np.array([0.25, 0.5], dtype=np.float32),
+                               sim, rate_hz=1000)
+        self.assertEqual(sim.seen, [0.25, 0.5, 0.0])
+
+
 class CliWiring(unittest.TestCase):
     def test_duck_parser_reaches_say_and_mouth(self):
         import contextlib
