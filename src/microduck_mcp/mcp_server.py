@@ -284,6 +284,34 @@ def duck_say(text: str, voice_bank: str | None = None) -> DuckState:
     return DuckState(**_call({"cmd": "state"}))
 
 
+@mcp.tool(title="Chirp", annotations=_EPISODIC)
+def duck_chirp(tag: str, variant: int = 0,
+               voice_bank: str | None = None) -> DuckState:
+    """React without words: play one call from the duck's own voice bank —
+    'alarm', 'greet', 'inquire', 'peck', 'chirp', 'coo', 'wheee' — on the
+    host's speakers, with the beak driven by that call's envelope. This is the
+    duck's native vocabulary; duck_say is the translation. Blocks for the
+    length of the call (a call is under a second, the wheee a few).
+
+    'wheee' is the goal celebration and the sim rations it: it is refused
+    unless the referee has a goal on the board this episode. Every other tag
+    is yours whenever you like.
+
+    variant picks between wavs when the bank holds several for a tag (sorted,
+    default the first). voice_bank: the directory of wavs rendered by the
+    microduck `sounds` crate; defaults to $DUCK_VOICE_BANK. Requires `afplay`
+    on the machine running this MCP server."""
+    from . import voice
+    bank = voice_bank or os.environ.get("DUCK_VOICE_BANK")
+    try:
+        wav, traj = voice.chirp_render(bank, tag, variant)
+        voice.perform(wav, traj, {"cmd": "chirp", "client": "mcp",
+                                  "tag": tag, "variant": variant})
+    except voice.VoiceError as e:
+        raise ToolError(str(e)) from e
+    return DuckState(**_call({"cmd": "state"}))
+
+
 @mcp.tool(title="Duck camera", annotations=_READ)
 def duck_camera(view: str = "follow", distance: float = 0.7) -> Image:
     """Render a camera frame of the sim. Views: 'head' (the duck's POV, from

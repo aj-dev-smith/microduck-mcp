@@ -143,6 +143,13 @@ MOUTH_HINGE_POS = (0.005, 0.0, -0.018)  # boss center, head body frame
 MOUTH_HINGE_AXIS = (0.0, 1.0, 0.0)
 MOUTH_MAX_RAD = 0.45
 
+# The one voice-bank tag the server rations. Every other call is a reaction
+# anybody may ask for; the wheee is the goal celebration, and a celebration
+# you can play whenever you like is not a celebration.
+WHEEE_TAG = "wheee"
+WHEEE_REFUSAL = ("the wheee is for a goal the duck actually scored, and the "
+                 "referee has none on the board this episode")
+
 
 def load_infer_policy_module(rl_repo: str):
     """Import microduck_rl's scripts/infer_policy.py as a module."""
@@ -1016,6 +1023,8 @@ class DuckSim:
             text = str(req.get("text", ""))[:200]
             return {"ok": True, "text": text,
                     "duration_s": req.get("duration_s")}
+        if cmd == "chirp":
+            return self._handle_chirp(str(req.get("tag", "")))
         if cmd == "camera":
             return self._handle_camera(req)
         if cmd == "camera_web":
@@ -1025,6 +1034,26 @@ class DuckSim:
         if cmd == "machine":
             return self._handle_machine(req)
         return {"ok": False, "error": f"unknown cmd {cmd!r}"}
+
+    def _handle_chirp(self, tag: str) -> dict:
+        """A voice-bank call, annotated — and the one call the server can veto.
+
+        Like `say`, the sound itself is played host-side and this is only the
+        act landing on the control surface. Unlike `say`, one tag is not the
+        caller's to spend: `wheee` belongs to a goal the duck actually scored,
+        so the server checks the referee's board rather than trusting whoever
+        is holding the socket. The film has had this rule since it had sound
+        (soundtrack.py: one goal, one wheee); here it stops being the film's
+        discipline and becomes the duck's.
+
+        No referee means no goal line means no earned goals — a scene without
+        a goal in it cannot produce one, so the answer there is no.
+        """
+        if tag == WHEEE_TAG:
+            if self.referee is None or self.referee.count == 0:
+                return {"ok": False, "error": WHEEE_REFUSAL}
+        return {"ok": True, "tag": tag,
+                "goals": self.referee.count if self.referee else 0}
 
     def _handle_trick(self, name: str, stage_ball: bool = True) -> dict:
         p = self.policy
