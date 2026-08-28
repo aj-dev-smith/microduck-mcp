@@ -936,6 +936,9 @@ class DuckSim:
             say = self.machine.nodes[fired["to"]].get("say")
             if say:
                 self._say_line(fired["to"], say)
+            emote = self.machine.nodes[fired["to"]].get("emote")
+            if emote:
+                self._emote_node(fired["to"], emote)
             wake = self.machine.nodes[fired["to"]]["wake"]
             if wake is not None:
                 self._latch_wake(fired["to"], wake,
@@ -963,6 +966,48 @@ class DuckSim:
             except Exception as e:      # this runs in the 50 Hz control loop:
                 print(f"note: voice failed ({e})", file=sys.stderr)  # nothing
                 self.voice = None       # about talking may stall the walking
+
+    def _emote_node(self, node: str, name: str):
+        """An emoting node's gesture: onto the control surface, then the head.
+
+        `say`'s twin, deliberately — the mouth says the line, the body plays
+        the gesture, and both land on the event feed as the same kind of act.
+        The machine's trigger outranks the head-ownership refusal a client
+        would meet (start_emote's `machine` flag): the author wrote this
+        gesture on this node, so declining it would be second-guessing source.
+
+        A gesture that cannot play — an emote nobody has, a directory that
+        isn't there, another gesture still running — is a note on the feed and
+        nothing more. The machine is mid-run; there is no one to raise at.
+        """
+        resp = self.start_emote(name, machine=True)
+        self._log_event("machine",
+                        {"cmd": "emote", "node": node, "name": name}, resp)
+        if not resp.get("ok"):
+            print(f"note: {node} could not emote {name!r} ({resp['error']})",
+                  file=sys.stderr)
+
+    def _emote_warnings(self, m: Machine) -> list:
+        """Which of a machine's gestures this server cannot actually play.
+
+        A lint, run at load and reload: the machine is valid either way (the
+        grammar knows nothing about emotes), but a duck that will silently not
+        startle is worth a line in the response before it doesn't.
+        """
+        out = []
+        for node in sorted(m.nodes):
+            name = m.nodes[node]["emote"]
+            if name is None:
+                continue
+            if self.emotes is None:
+                out.append(f"node {node!r} emotes {name!r}, but this server "
+                           f"has no emote directory")
+                continue
+            try:
+                self.emotes.get(name)
+            except EmoteError as e:
+                out.append(f"node {node!r}: {e}")
+        return out
 
     def _latch_wake(self, node: str, reason: str, via: dict, digest: dict):
         """Sim thread: park a wake pack and release any blocked machine_wait.
@@ -1046,7 +1091,8 @@ class DuckSim:
             except (MachineError, OSError) as e:
                 return {"ok": False, "error": f"machine rejected: {e}"}
             return {"ok": True, **self.machine.status(),
-                    "note": "loaded, disarmed — arm to run"}
+                    "note": "loaded, disarmed — arm to run",
+                    "warnings": self._emote_warnings(self.machine)}
         if m is None:
             return {"ok": False, "error": "no machine loaded (action=load first)"}
         if action == "reload":
@@ -1059,7 +1105,8 @@ class DuckSim:
             fresh.enter(fresh.initial if m.current not in fresh.nodes
                         else m.current, self.sim_time)
             self.machine = fresh
-            return {"ok": True, **fresh.status(), "note": "hot-swapped"}
+            return {"ok": True, **fresh.status(), "note": "hot-swapped",
+                    "warnings": self._emote_warnings(fresh)}
         if action == "arm":
             m.enter(m.initial, self.sim_time)
             m.armed = True

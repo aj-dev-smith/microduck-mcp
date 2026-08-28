@@ -473,6 +473,13 @@ class MachineStatus(BaseModel):
     say_nodes: list[str] | None = Field(default=None, description="Nodes that "
                                         "speak a line on entry (say = \"...\" "
                                         "in the machine source)")
+    emote_nodes: list[str] | None = Field(default=None, description="Nodes "
+                                          "that play a gesture on entry "
+                                          "(emote = \"...\" in the source)")
+    warnings: list[str] | None = Field(default=None, description="Lint from "
+        "load/reload: gestures this machine names that this server cannot "
+        "play. The machine still loaded — the missing emote is simply a node "
+        "that will enter quietly.")
     note: str | None = None
     wake: dict[str, Any] | None = Field(default=None, description="The wake "
         "pack (action='wait' or a blocking arm/force): reason, node, the "

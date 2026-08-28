@@ -213,6 +213,101 @@ class WhoOwnsTheBeak(unittest.TestCase):
         self.assertGreater(sim.mouth_opening, 0.1)
 
 
+NODE_SPEC = {
+    "machine": {"name": "t", "initial": "watch"},
+    "node": [{"name": "watch", "behavior": "idle",
+              "transition": [{"when": "ball_seen.visible", "to": "spotted"}]},
+             {"name": "spotted", "behavior": "idle",
+              "say": "oh!", "emote": "perk_up"}],
+}
+
+
+class EmotingNodes(unittest.TestCase):
+    """A node's gesture fires on entry, exactly where its line does."""
+
+    def sim(self, emote="perk_up", behavior="idle"):
+        spec = {**NODE_SPEC,
+                "node": [NODE_SPEC["node"][0],
+                         {**NODE_SPEC["node"][1], "emote": emote,
+                          "behavior": behavior}]}
+        sim = bare_sim(spec)
+        sim._machine_digest = lambda: {"sim_time_s": sim.sim_time,
+                                       "ball_seen.visible": True}
+        return sim
+
+    def cmds(self, sim):
+        return [e["cmd"] for e in sim.events]
+
+    def test_entering_the_node_plays_the_gesture(self):
+        sim = self.sim()
+        sim.machine_tick()
+        self.assertEqual(sim.machine.current, "spotted")
+        self.assertEqual(sim._emote["name"], "perk_up")
+
+    def test_the_mouth_says_it_and_the_body_plays_it(self):
+        sim = self.sim()
+        sim.machine_tick()
+        self.assertEqual(self.cmds(sim), ["-> spotted", "say", "emote"])
+        said = sim.events[-1]
+        self.assertEqual(said["args"]["name"], "perk_up")
+        self.assertEqual(said["args"]["node"], "spotted")
+        self.assertTrue(said["ok"])
+
+    def test_the_machine_gets_the_head_a_client_would_be_refused(self):
+        # The author wrote the gesture on the node; declining it here would be
+        # second-guessing source.
+        sim = self.sim(behavior="approach_ball")
+        sim.machine_tick()
+        self.assertEqual(sim._emote["name"], "perk_up")
+
+    def test_a_gesture_nobody_has_is_a_note_mid_run(self):
+        sim = self.sim(emote="moonwalk")
+        sim.machine_tick()
+        self.assertEqual(sim.machine.current, "spotted")   # the machine runs on
+        self.assertIsNone(sim._emote)
+        event = sim.events[-1]
+        self.assertEqual(event["cmd"], "emote")
+        self.assertFalse(event["ok"])
+        self.assertIn("moonwalk", event["note"])
+
+    def test_arming_onto_the_node_does_not_fire_it(self):
+        # Same as `say`: entry by arm/force is a jump, not a transition.
+        sim = self.sim()
+        sim._handle_machine({"action": "force", "node": "spotted"})
+        self.assertEqual(sim.machine.current, "spotted")
+        self.assertIsNone(sim._emote)
+
+
+class LoadTimeLint(unittest.TestCase):
+    """Naming a gesture the server does not have is a warning, never a
+    rejection — the grammar knows nothing about emotes, and a machine has to
+    survive landing on a server whose directory differs."""
+
+    def machine(self, emote):
+        return Machine({"machine": {"name": "t", "initial": "a"},
+                        "node": [{"name": "a", "behavior": "idle",
+                                  "emote": emote}]})
+
+    def test_a_gesture_the_server_has_is_quiet(self):
+        self.assertEqual(bare_sim()._emote_warnings(self.machine("nod")), [])
+
+    def test_a_gesture_it_does_not_have_is_named(self):
+        warnings = bare_sim()._emote_warnings(self.machine("moonwalk"))
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("'a'", warnings[0])
+        self.assertIn("moonwalk", warnings[0])
+
+    def test_a_server_with_no_emotes_at_all_says_which_it_cannot_play(self):
+        sim = bare_sim()
+        sim.emotes = None
+        warnings = sim._emote_warnings(self.machine("nod"))
+        self.assertIn("no emote directory", warnings[0])
+
+    def test_the_shipped_resident_names_a_gesture_that_ships(self):
+        m = Machine.load(os.path.join(REPO, "machines", "resident.toml"))
+        self.assertEqual(bare_sim()._emote_warnings(m), [])
+
+
 class Listing(unittest.TestCase):
     def test_it_reports_the_directory_and_what_is_playing(self):
         sim = bare_sim()

@@ -52,6 +52,10 @@ to = "rest"
 [[node]]
 name = "ball_spotted"
 behavior = "idle"                   # stand and look at it: the holding pattern
+emote = "perk_up"                   # ...and visibly notice it first: the
+                                    # startle plays while the wake goes out,
+                                    # so watching the duck tells you the mind
+                                    # is being called before any answer comes
 wake = "ball sighted — what do we do with it?"
 [[node.transition]]                 # the deadline default: lost interest
 when = "elapsed_s > 300.0"
