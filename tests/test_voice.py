@@ -247,10 +247,10 @@ class Moods(unittest.TestCase):
                 self.assertGreater(m.asetrate, SR)
 
     def test_the_filter_chain_is_built_from_the_mood(self):
-        for name, expected in (("excited", "asetrate=55600"),
-                               ("sad", "atempo=0.8"),
-                               ("alarmed", "tremolo=f=25.9:d=0.28"),
-                               ("smug", "d=0.15")):
+        for name, expected in (("excited", "asetrate=56800"),
+                               ("sad", "atempo=0.74"),
+                               ("alarmed", "tremolo=f=25.9:d=0.33"),
+                               ("smug", "vibrato=f=8.6:d=0.2,")):
             with self.subTest(mood=name):
                 self.assertIn(expected, modulation_chain(MOODS[name]))
         # and the rates are the personality's, in every mood
