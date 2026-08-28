@@ -178,6 +178,19 @@ mind-optional, by construction. [`machines/resident.toml`](machines/resident.tom
 is the idle-life machine built around this; `striker.toml` wakes on `won`
 (come celebrate) and `down` (no stand-up policy — bring `duck_reset`).
 
+### Speaking nodes: the machine says what it is doing
+
+A node may also declare `say = "..."`. Entering it forwards the line through
+the sim's `say` annotation verb — the same one `duck say` uses — so a line the
+machine decided to say and one a person asked for are indistinguishable on the
+event feed, and the server speaks it host-side if this session has a voice
+(`duck-sim --no-voice` to keep it quiet, `--voice-bank` for the chirps). It is
+an annotation in the same sense `wake` is: the guards, the behaviors and the
+physics play out identically without it, and a server too old to know the key
+simply ignores it. `striker.toml` speaks on `celebrate` and `won` — both
+reachable only through the referee's call, so the celebration line is earned
+by construction.
+
 The design lineage: deterministic behaviors under guarded transitions, machine
 source in a git repo, hot-swapped live, and blocking wake delivery — the
 machine decides what deserves a mind's attention — all patterns borrowed from
@@ -208,6 +221,29 @@ that never score are discarded, and the goal moment cold-opens the cut so it
 becomes the timeline thumbnail. `--keep-takes` keeps the rushes,
 `--cap-seconds` bounds a take, `--machine` films a machine other than
 `striker.toml`.
+
+### The soundtrack
+
+The film has a voice, and it is cut from the take's **own event timeline** on
+the same sim clock the frames are sampled on — not scored to the picture by
+ear. The duck speaks a line as the machine arms, chirps on the kick, and the
+referee's goal — *only* the referee's goal — gets the `wheee`, with the
+celebration line waiting behind it. That last rule is the one this film has,
+so it is a test rather than a habit: no `wheee` on the arm, on a kick, on any
+other node, and not a second one when the referee's latch stays lit. There is
+no music bed and no choir; every sound is the duck's own voice or its own
+voice bank.
+
+The lines are rendered before the shoot, which buys the lip-sync: the same
+trajectory that places the audio drives the beak on camera and the meter in
+the HUD, so picture and track come from one render. `--line-arm` and
+`--line-goal` rewrite the script (an empty string deletes a line),
+`--voice-bank` supplies the bank — without one the shoot renders its own with
+the `sounds` crate beside `--policies` — and `--no-audio` films silently.
+
+Sound is an enhancement, never a new way for a shoot to fail: no cargo, no
+crate, no TTS, a mux that errors — each is a note on stderr and a quieter
+film, and the goal you just filmed still gets cut.
 
 Two things to know. **ffmpeg** must be on `PATH` (`brew install ffmpeg`, or
 `--ffmpeg /path/to/it`) — frames are piped into it raw, and it is deliberately
