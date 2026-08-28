@@ -1,0 +1,130 @@
+# striker.toml — soccer.toml, but playing for the scoreboard.
+#
+# Same hunt (search -> approach -> honest kick, with the calibrations from
+# soccer.toml verbatim), different ending: the kick is not the achievement,
+# the goal is. After the swing the duck stands and WATCHES; it celebrates only
+# if the referee says the ball crossed the line, and chases the rebound if it
+# did not.
+#
+# Needs the pitch scene, which is where the goal lives:
+#
+#     duck-sim --scene pitch
+#     duck machine load machines/striker.toml
+#     duck machine arm
+#
+# goal.scored/goal.count come from the referee (a goal-line sensor, world
+# infrastructure), not from the robot's eyes — the ball_seen.* guards are
+# still the only thing steering the duck. On a goal-less scene goal.scored is
+# always false, so this machine kicks and chases forever and never celebrates:
+# run it on `pitch`.
+
+[machine]
+name = "striker"
+initial = "search"
+
+# Checked before any node's own transitions, every tick: the escape hatch.
+# There is no stand-up policy, so a fallen duck parks in `down` and waits
+# for the mind (or a human) to reset. `celebrate` is exempt — a roulade
+# passes through upright=false mid-roll by design.
+[[machine.transition]]
+when = "not upright and elapsed_s > 0.5 and node != 'celebrate'"
+to = "down"
+
+# A goal counts whenever the referee calls it, not just while watching: a slow
+# roller can cross the line long after the watch window closes (match #1 scored
+# at t=12.7s while the duck was back in `search`, spinning, and nobody
+# celebrated). Exempt: celebrate/won (already done) and down (no headstands
+# from the floor).
+[[machine.transition]]
+when = "goal.scored and node != 'celebrate' and node != 'won' and node != 'down'"
+to = "celebrate"
+
+[[node]]
+name = "search"
+behavior = "search_ball"        # full-rate point turn; wz < 1.2 is a dead zone
+[node.params]
+wz = 1.5
+[[node.transition]]
+when = "ball_seen.visible and ball_seen.age_s < 0.4"
+to = "approach"
+
+[[node]]
+name = "approach"
+behavior = "approach_ball"      # the session-tested controller, 50 Hz
+[[node.transition]]
+# Ball lost for real (not just one stale tick between detections).
+when = "not ball_seen.visible and elapsed_s > 1.0"
+to = "search"
+[[node.transition]]
+# The kick pocket, in sensed TRUNK-frame estimates (camera ray + the robot's
+# own kinematics): right foot wants the ball ~9 cm ahead, ~4 cm right.
+# Tolerances match what connected in live MCP piloting.
+when = "ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.est_forward_m > 0.06 and ball_seen.est_forward_m < 0.13 and ball_seen.est_left_m > -0.085 and ball_seen.est_left_m < -0.015 and elapsed_s > 1.0"
+to = "kick"
+
+[[node]]
+name = "kick"
+behavior = "kick"               # stop, settle, one honest kick_right
+[node.params]
+foot = "right"
+stage_ball = false
+settle_s = 0.8
+[[node.transition]]
+# Settle drifted the ball out of the pocket? Line it up again, don't kick air.
+when = "elapsed_s > 0.6 and elapsed_s < 0.75 and ball_seen.visible and ball_seen.est_left_m > -0.01"
+to = "approach"
+[[node.transition]]
+# Swing done. soccer.toml celebrates here; a striker waits to be told.
+when = "elapsed_s > 4.2"
+to = "watch"
+
+[[node]]
+name = "watch"
+behavior = "idle"               # stand still, head back to level: the ball is
+                                # rolling away, and the approach tilt aims the
+                                # camera at the duck's own feet.
+[[node.transition]]
+# The referee. `goal.scored` is the latch (true while the ball is in the net),
+# not the counter: `goal.count > 0` would stay true for the rest of the match
+# and re-fire on every later kick.
+when = "goal.scored"
+to = "celebrate"
+[[node.transition]]
+# No goal in three seconds — a slow roll has had time to cross by now, so it
+# missed, fell short, or hit the frame. Ball still in sight: go again from
+# wherever it stopped.
+when = "elapsed_s > 3.0 and ball_seen.visible and ball_seen.age_s < 0.4"
+to = "approach"
+[[node.transition]]
+# Rebound went somewhere the head camera cannot see it: turn and hunt.
+when = "elapsed_s > 3.0"
+to = "search"
+
+[[node]]
+name = "celebrate"
+behavior = "celebrate"          # the headstand (a roulade, honestly)
+[node.params]
+trick = "roulade"
+[[node.transition]]
+when = "elapsed_s > 3.5 and upright"
+to = "won"                      # stuck the landing: match over, not another lap
+[[node.transition]]
+when = "elapsed_s > 3.5 and not upright"
+to = "down"                     # flubbed it: comedy, then wait for help
+
+[[node]]
+name = "won"
+behavior = "idle"
+# The ball is IN the goal and `goal.scored` stays latched while it sits there,
+# so soccer.toml's "go again" would march the duck through the mouth after it.
+# Park instead, and let the scoreboard say when there is a match to play: the
+# referee re-arms once the ball is back out in front of the line, which is
+# exactly what a reset (or a hand putting the ball back) does.
+[[node.transition]]
+when = "not goal.scored"
+to = "search"
+
+[[node]]
+name = "down"
+behavior = "idle"
+# Terminal until the mind intervenes: no stand-up policy exists yet.

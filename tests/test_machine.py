@@ -77,6 +77,13 @@ class MachineValidation(unittest.TestCase):
         self.assertIn("kick", m.nodes)
         self.assertFalse(m.armed)
 
+    def test_shipped_striker_machine_loads(self):
+        # The scoreboard variant: same hunt, but it waits for the referee.
+        m = Machine.load(os.path.join(REPO, "machines", "striker.toml"))
+        self.assertEqual(m.initial, "search")
+        self.assertIn("watch", m.nodes)
+        self.assertIn("won", m.nodes)
+
     def test_unknown_behavior_refused(self):
         spec = {"machine": {"name": "t", "initial": "a"},
                 "node": [{"name": "a", "behavior": "moonwalk"}]}

@@ -29,6 +29,10 @@ GUARD_PATHS = {
     "ball_seen.bearing_deg", "ball_seen.elevation_deg", "ball_seen.age_s",
     "ball_seen.est_forward_m", "ball_seen.est_left_m", "ball_seen.speed_mps",
     "upright", "sitting", "active_policy", "behavior",
+    # The referee's scoreboard (goal scenes only; False/0 elsewhere). Not a
+    # fairness leak: a real pitch has a goal-line sensor, and "someone scored"
+    # is not "where the ball is".
+    "goal.scored", "goal.count",
     "elapsed_s", "sim_time_s", "node",
 }
 
