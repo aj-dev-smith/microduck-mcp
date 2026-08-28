@@ -71,6 +71,8 @@ uv run duck trick roulade      # forward roll
 uv run duck cam follow         # render a frame, prints the PNG path
 uv run duck push               # shove it, watch it recover
 uv run duck say "hello!"       # speak: audio host-side, beak in the sim
+uv run duck chirp inquire      # nonverbal: one call from its own voice bank
+uv run duck emote head_tilt    # an authored gesture, played in the sim
 ```
 
 Register the MCP server with Claude Code:
@@ -98,6 +100,8 @@ the agent rarely needs a follow-up poll.
 | `duck_machine(action, ...)` | Load/arm/hot-reload a **behavior machine** — autonomy between the agent's decisions (see below) |
 | `duck_mouth(opening)` | Beak opening 0..1 — the real robot's `robot.mouth` verb, in the sim (expressive only, no physics) |
 | `duck_say(text, voice_bank?)` | **Speak as the duck**: renders the duck's voice, plays it on the host's speakers, lip-syncs the beak live in the sim (see below) |
+| `duck_chirp(tag, variant?, voice_bank?)` | One call from the duck's own voice bank — `alarm`, `greet`, `inquire`, `peck`, `chirp`, `coo`, and `wheee`, which the sim grants only when the referee has a goal on the board |
+| `duck_emote(name, action?)` | Play an authored **gesture** — `head_tilt`, `nod`, `perk_up`, `droop` — or `action='list'` what a server has |
 | `duck_reset` | Back to origin, default stance (`destructive_hint` — it ends the episode) |
 
 ## Honest sensing (fake mediad)
@@ -189,7 +193,9 @@ an annotation in the same sense `wake` is: the guards, the behaviors and the
 physics play out identically without it, and a server too old to know the key
 simply ignores it. `striker.toml` speaks on `celebrate` and `won` — both
 reachable only through the referee's call, so the celebration line is earned
-by construction.
+by construction. A node may carry `emote = "..."` the same way, and the two
+fire together: mouth to say, body to emote (see
+[Emotes](#emotes-the-ducks-body-language)).
 
 The design lineage: deterministic behaviors under guarded transitions, machine
 source in a git repo, hot-swapped live, and blocking wake delivery — the
@@ -296,6 +302,79 @@ No bank? The duck still talks, just chirpless (with a note). `--audio-only`
 skips the sim, `--wav-out` keeps the render, and `duck mouth 0.6` holds an
 expression by hand. Requires `say`, `ffmpeg` and `afplay` on the host —
 speech is rendered and played host-side; the sim gets only the beak.
+
+### The nonverbal voice (`duck chirp`)
+
+Words are the borrowed part. The bank the chirp grains come from holds the
+duck's *own* vocabulary — `alarm`, `greet`, `inquire`, `peck`, `chirp`, `coo`,
+`wheee` — and `duck chirp <tag>` plays one straight, beak driven by that call's
+own envelope, no TTS and no ffmpeg in the path:
+
+```bash
+uv run duck chirp inquire --voice-bank bank/
+uv run duck chirp chirp --variant 1        # sorted, so a tag is the same wav
+```
+
+One tag is not the caller's to spend. `wheee` is the goal celebration, and the
+server **refuses it unless the referee has a goal on the board this episode** —
+no goal, no scene with a goal in it, no wheee, whoever is holding the socket.
+The film has had that rule since it had sound; here it stops being the film's
+discipline and becomes the duck's.
+
+## Emotes: the duck's body language
+
+The third channel has no sound in it at all. An **emote** is a short authored
+gesture — keyframed head pose plus beak, optionally a bank call over the top —
+living as TOML in [`emotes/`](emotes/), beside the machines that trigger it:
+
+```toml
+[emote]
+name = "head_tilt"
+sound = "inquire"
+
+[[key]]
+t = 0.0
+
+[[key]]                  # channels: neck_pitch, head_pitch, head_yaw,
+t = 0.4                  # head_roll (radians), mouth (0..1) — omit one and
+head_roll = 0.30         # it carries the previous key's value
+ease = "smooth"          # how to travel INTO this key: smooth | linear | hold
+```
+
+```bash
+uv run duck emote --list       # what this server has, and whether it parses
+uv run duck emote droop
+```
+
+Four ship: `head_tilt` (curiosity), `nod` (yes), `perk_up` (alert), `droop`
+(dejected). Signs follow the rest of the codebase — **positive pitch looks
+down** — and values are clamped to the policy's head limits when applied, so a
+file can be wrong about taste but not about the neck. The gesture renders to
+50 Hz channel arrays and is played by the sim against its own clock, writing
+`head_offset` through the same gaze command `duck_look` uses (the balance
+policy compensates) and the mouth plate the voice drives. Edit a file and the
+next trigger plays the edit — mtime-cached, no reload verb.
+
+**The head belongs to somebody**, which is the whole design: say beats emote
+for the beak, emote beats the behavior for the head, and an *externally*
+triggered gesture is refused outright while an armed machine is in
+`approach_ball` or `kick` (both steer by the head camera; the kick policy fed a
+bowed head does not swing at all). A gesture arriving mid-gesture is refused
+rather than restarted. Every start and every refusal lands on the event feed,
+so the film and the AX page get expressiveness for free.
+
+### Emoting nodes
+
+A node may declare `emote = "name"` alongside `say = "..."`, and both fire on
+entry — the mouth says the line, the body plays the gesture. A machine's own
+trigger bypasses the head-ownership refusal, because the author already made
+that call in source. The grammar validates that the name is a string and
+nothing more: naming a gesture the server does not have is a lint warning at
+load and a note at fire time, never a rejection, so a machine stays
+hot-reloadable onto a server whose `emotes/` differs.
+[`machines/resident.toml`](machines/resident.toml) startles with `perk_up` on
+`ball_spotted` — the duck visibly notices the ball while the wake pack goes
+out to the mind.
 
 ## AX debug page
 
