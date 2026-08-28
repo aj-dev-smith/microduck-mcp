@@ -17,6 +17,7 @@ Library (`request()`) plus a small CLI:
     duck film -o match.mp4
     duck mouth 0.6
     duck say "hello A J" --voice-bank bank/
+    duck say "we lost the ball" --mood sad   # same duck, different weather
     duck chirp inquire --voice-bank bank/    # nonverbal: one call from the bank
     duck emote head_tilt | duck emote --list # authored gestures (see emotes/)
 

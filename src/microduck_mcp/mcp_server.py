@@ -256,22 +256,29 @@ def duck_mouth(opening: float) -> DuckState:
 
 
 @mcp.tool(title="Speak", annotations=_EPISODIC)
-def duck_say(text: str, voice_bank: str | None = None) -> DuckState:
+def duck_say(text: str, voice_bank: str | None = None,
+             mood: str = "neutral") -> DuckState:
     """Speak as the duck: text is rendered into the duck's voice (pitched,
     personality-modulated, chirp grains blended into the stressed syllables),
     played on the host's speakers, while the beak lip-syncs live in the sim
     from the same loudness envelope. Blocks until the utterance finishes
     (~1 s per 12 chars; max 400 chars — keep it punchy, it's a duck).
 
+    mood: same duck, different weather — 'neutral', 'excited', 'sad',
+    'alarmed' or 'smug'. It leans on the pitch, the tempo, the modulation, the
+    voice-bank tag the grains are cut from and the beak; the duck's identity
+    does not move.
+
     voice_bank: directory of voice-bank wavs rendered by the microduck
-    `sounds` crate (chirp*.wav is blended in); without it the voice still
+    `sounds` crate (the mood's tag is blended in); without it the voice still
     works, just chirpless. Requires macOS `say`, `ffmpeg` and `afplay` on the
     machine running this MCP server."""
     from . import voice
     try:
         ffmpeg = voice.find_ffmpeg()
         wav, traj, duration = voice.render_voice(text, ffmpeg,
-                                                 bank_dir=voice_bank)
+                                                 bank_dir=voice_bank,
+                                                 mood=mood)
         try:
             voice.speak(wav, traj, text, duration)
         finally:

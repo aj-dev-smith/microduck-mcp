@@ -23,10 +23,11 @@ import numpy as np
 from microduck_mcp import voice
 from microduck_mcp.sim_server import (MOUTH_HINGE_POS, MOUTH_MAX_RAD,
                                       mouth_pose)
-from microduck_mcp.voice import (ENV_RATE, GRAIN_GAIN, MOUTH_RATE_HZ, SR,
-                                 VoiceError, blend_chirps, envelope,
-                                 load_chirp, load_wav48, mouth_trajectory,
-                                 save_wav48, syllable_peaks)
+from microduck_mcp.voice import (ENV_RATE, GRAIN_GAIN, MOODS, MOUTH_RATE_HZ,
+                                 SR, VoiceError, blend_chirps, envelope,
+                                 load_grain, load_wav48, modulation_chain,
+                                 mouth_trajectory, resolve_mood, save_wav48,
+                                 syllable_peaks)
 
 
 def tone_bursts(centers_s, dur_s=2.0, burst_s=0.12, freq=300.0):
@@ -124,16 +125,16 @@ class MouthTrajectory(unittest.TestCase):
 
 class VoiceBank(unittest.TestCase):
     def test_missing_dir_and_empty_dir_degrade_with_a_note(self):
-        self.assertIsNone(load_chirp(None))
+        self.assertIsNone(load_grain(None))
         with tempfile.TemporaryDirectory() as d, redirect_stderr(io.StringIO()) as err:
-            self.assertIsNone(load_chirp(d))
+            self.assertIsNone(load_grain(d))
         self.assertIn("without chirps", err.getvalue())
 
     def test_bank_chirp_round_trips_via_wav(self):
         ramp = np.linspace(-0.5, 0.5, SR // 10, dtype=np.float32)
         with tempfile.TemporaryDirectory() as d:
             save_wav48(os.path.join(d, "chirp.wav"), ramp)
-            chirp = load_chirp(d)
+            chirp = load_grain(d)
         self.assertEqual(len(chirp), SR // 10)
         np.testing.assert_allclose(chirp, ramp, atol=2 / 32767)
 
@@ -191,6 +192,150 @@ class ChirpBank(unittest.TestCase):
         self.assertEqual(len(traj), int(1.0 * MOUTH_RATE_HZ))
         self.assertGreater(traj.max(), 0.9)
         self.assertEqual(float(traj[-1]), 0.0)   # and shuts when the call ends
+
+
+class Moods(unittest.TestCase):
+    """Weather over the climate: a mood moves the recipe's knobs, nothing else.
+
+    The numbers in MOODS are meant to be retuned by ear, so nothing here
+    asserts a taste — it asserts that neutral is still literally the ratified
+    pipeline, that every mood resolves to a complete and playable parameter
+    set, and that the parameter set is what the stages actually read.
+    """
+
+    def test_neutral_is_the_ratified_recipe_verbatim(self):
+        # The one mood that is not allowed to be a change: `duck say` with no
+        # mood must render exactly what it rendered before moods existed.
+        legacy = (f"aresample={SR},asetrate={voice.PITCH_ASETRATE},"
+                  f"aresample={SR},atempo={voice.PITCH_TEMPO},"
+                  f"vibrato=f={voice.VIBRATO_HZ}:d={voice.VIBRATO_DEPTH},"
+                  f"tremolo=f={voice.TREMOLO_HZ}:d={voice.TREMOLO_DEPTH},"
+                  f"aformat=sample_rates={SR}:channel_layouts=mono")
+        self.assertEqual(modulation_chain(MOODS["neutral"]), legacy)
+        self.assertEqual(modulation_chain(), legacy)
+        neutral = MOODS["neutral"]
+        self.assertEqual(neutral.grain_gain, GRAIN_GAIN)
+        self.assertEqual(neutral.grain_tag, "chirp")
+        self.assertEqual(neutral.mouth_release_s, voice.MOUTH_RELEASE_S)
+        self.assertEqual(neutral.syllable_share, 0.5)
+
+    def test_neutral_keeps_the_old_top_half_syllable_count(self):
+        for centers in ([0.3, 0.9, 1.5], [0.3, 0.7, 1.1, 1.5, 1.9]):
+            with self.subTest(syllables=len(centers)):
+                env = envelope(tone_bursts(centers, dur_s=2.2))
+                self.assertEqual(len(syllable_peaks(env)),
+                                 max(2, len(syllable_peaks(
+                                     env, share=1.0)) // 2))
+
+    def test_every_mood_resolves_to_a_playable_parameter_set(self):
+        for name, m in MOODS.items():
+            with self.subTest(mood=name):
+                self.assertIs(resolve_mood(name), m)
+                # atempo's own domain: outside it ffmpeg refuses the filter.
+                self.assertGreaterEqual(m.tempo, 0.5)
+                self.assertLessEqual(m.tempo, 2.0)
+                for depth in (m.vibrato_depth, m.tremolo_depth):
+                    self.assertGreaterEqual(depth, 0.0)
+                    self.assertLessEqual(depth, 1.0)
+                self.assertGreater(m.syllable_share, 0.0)
+                self.assertLessEqual(m.syllable_share, 1.0)
+                self.assertTrue(m.grain_tag and m.grain_tag.isidentifier())
+                self.assertGreater(m.grain_gain, 0.0)
+                self.assertGreater(m.mouth_release_s, 0.0)
+                # Still a duck in every weather: the pitch-up never comes off,
+                # so no mood can land the voice back in human range.
+                self.assertGreater(m.asetrate, SR)
+
+    def test_the_filter_chain_is_built_from_the_mood(self):
+        for name, expected in (("excited", "asetrate=55600"),
+                               ("sad", "atempo=0.8"),
+                               ("alarmed", "tremolo=f=25.9:d=0.28"),
+                               ("smug", "d=0.15")):
+            with self.subTest(mood=name):
+                self.assertIn(expected, modulation_chain(MOODS[name]))
+        # and the rates are the personality's, in every mood
+        for m in MOODS.values():
+            self.assertIn(f"vibrato=f={voice.VIBRATO_HZ}", modulation_chain(m))
+
+    def test_the_mood_picks_the_grain_tag_out_of_the_one_bank_loader(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("chirp1.wav", "chirp2.wav", "coo1.wav", "alarm1.wav",
+                         "peck1.wav"):
+                save_wav48(os.path.join(d, name),
+                           np.linspace(-0.4, 0.4, SR // 20, dtype=np.float32))
+            for mood, wav in (("neutral", "chirp1.wav"), ("excited", "chirp1.wav"),
+                              ("sad", "coo1.wav"), ("alarmed", "alarm1.wav"),
+                              ("smug", "peck1.wav")):
+                with self.subTest(mood=mood):
+                    grain = load_grain(d, MOODS[mood].grain_tag)
+                    self.assertIsNotNone(grain)
+                    # the same sorted tag lookup `duck chirp` resolves with
+                    self.assertTrue(
+                        voice.bank_wav_path(d, MOODS[mood].grain_tag)
+                        .endswith(wav))
+
+    def test_a_bank_without_this_moods_tag_still_speaks(self):
+        # A duck that cannot coo should still be able to be sad out loud.
+        with tempfile.TemporaryDirectory() as d:
+            save_wav48(os.path.join(d, "chirp.wav"),
+                       np.linspace(-0.4, 0.4, SR // 20, dtype=np.float32))
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(load_grain(d, MOODS["sad"].grain_tag))
+        self.assertIn("no coo*.wav", err.getvalue())
+
+    def test_the_syllable_share_is_the_moods_and_the_floor_holds(self):
+        env = envelope(tone_bursts([0.3, 0.6, 0.9, 1.2, 1.5, 1.8], dur_s=2.2))
+        self.assertEqual(len(syllable_peaks(env, share=1.0)), 6)
+        counts = {name: len(syllable_peaks(env, share=m.syllable_share))
+                  for name, m in MOODS.items()}
+        self.assertEqual(counts["neutral"], 3)
+        self.assertEqual(counts["excited"], 4)   # two thirds, not 3.99 -> 3
+        self.assertEqual(counts["sad"], 2)
+        # ...and the floor of two survives any mood, on any short line
+        short = envelope(tone_bursts([0.3, 0.9, 1.5]))
+        self.assertEqual(len(syllable_peaks(short, share=1 / 3)), 2)
+
+    def test_the_grain_gain_and_the_beak_read_the_mood_too(self):
+        speech = tone_bursts([0.4, 1.2])
+        env = envelope(speech)
+        chirp = (0.5 * np.sin(2 * math.pi * 900 *
+                              np.arange(int(0.15 * SR)) / SR)).astype(np.float32)
+        loud, _ = blend_chirps(speech, chirp, env, MOODS["excited"])
+        quiet, _ = blend_chirps(speech, chirp, env, MOODS["smug"])
+        self.assertGreater(np.abs(loud - speech).max(),
+                           np.abs(quiet - speech).max())
+        # a sad beak droops shut: the long release keeps it open longer
+        long_line = envelope(tone_bursts([0.5], dur_s=1.6))
+        sad = mouth_trajectory(long_line, mood=MOODS["sad"])
+        keen = mouth_trajectory(long_line, mood=MOODS["excited"])
+        self.assertGreater(float(sad.sum()), float(keen.sum()))
+
+    def test_an_unknown_mood_is_a_clean_sentence_everywhere(self):
+        from unittest import mock
+        from microduck_mcp import client
+        with self.assertRaisesRegex(VoiceError, "is not a mood"):
+            resolve_mood("furious")
+        with self.assertRaisesRegex(VoiceError, "is not a mood"):
+            voice.render_voice("hello", ffmpeg="ffmpeg", mood="furious")
+        # the roster is in the message, so the fix is in the error
+        with self.assertRaisesRegex(VoiceError, "smug"):
+            resolve_mood("furious")
+        # CLI: argparse refuses it before anything renders
+        with mock.patch.object(client.sys, "argv",
+                               ["duck", "say", "hi", "--mood", "furious"]):
+            with redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as cm:
+                    client.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("furious", err.getvalue())
+
+    def test_the_mcp_tool_refuses_it_as_a_tool_error(self):
+        from unittest import mock
+        from mcp.server.mcpserver.exceptions import ToolError
+        from microduck_mcp import mcp_server
+        with mock.patch.object(voice, "find_ffmpeg", return_value="ffmpeg"):
+            with self.assertRaisesRegex(ToolError, "is not a mood"):
+                mcp_server.duck_say("hello", mood="furious")
 
 
 class TheWheeeIsEarned(unittest.TestCase):
@@ -307,6 +452,27 @@ class TheMachinesVoice(unittest.TestCase):
             self.assertIsNone(voice.SayPlayer.available(ffmpeg="/nonexistent"))
         self.assertIn("no voice this session", err.getvalue())
 
+    def test_a_line_carries_its_mood_to_the_render(self):
+        from unittest import mock
+        p = self.player()
+        with mock.patch.object(voice, "render_voice") as render:
+            with mock.patch.object(p, "_perform"):
+                p._busy.acquire()
+                p._run("we lost it", None, "sad")
+        self.assertEqual(render.call_args.kwargs["mood"], "sad")
+
+    def test_a_moods_typo_in_a_machine_never_reaches_the_control_loop(self):
+        # speak() is called from the 50 Hz sim thread. An author's bad mood
+        # name is a note on stderr from the worker, not an exception thrown
+        # into the walking.
+        p = self.player()
+        p._busy.acquire()
+        with redirect_stderr(io.StringIO()) as err:
+            p._run("hello", None, "furious")
+        self.assertIn("could not say", err.getvalue())
+        self.assertIn("is not a mood", err.getvalue())
+        self.assertTrue(p._busy.acquire(blocking=False))
+
     def test_the_beak_is_left_shut_when_a_line_ends(self):
         import types
         p = self.player()
@@ -346,6 +512,13 @@ class CliWiring(unittest.TestCase):
                     client.main()
         self.assertEqual(run.call_args[0][0].text, "hi")
         self.assertTrue(run.call_args[0][0].audio_only)
+        self.assertEqual(run.call_args[0][0].mood, "neutral")
+        with mock.patch.object(client.sys, "argv",
+                               ["duck", "say", "oh no", "--mood", "sad"]):
+            with mock.patch.object(voice, "run", return_value=0) as run:
+                with self.assertRaises(SystemExit):
+                    client.main()
+        self.assertEqual(run.call_args[0][0].mood, "sad")
         with mock.patch.object(client.sys, "argv",
                                ["duck", "chirp", "inquire", "--variant", "1",
                                 "--voice-bank", "bank/"]):
