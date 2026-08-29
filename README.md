@@ -102,6 +102,10 @@ the agent rarely needs a follow-up poll.
 | `duck_say(text, voice_bank?)` | **Speak as the duck**: renders the duck's voice, plays it on the host's speakers, lip-syncs the beak live in the sim (see below) |
 | `duck_chirp(tag, variant?, voice_bank?)` | One call from the duck's own voice bank — `alarm`, `greet`, `inquire`, `peck`, `chirp`, `coo`, and `wheee`, which the sim grants only when the referee has a goal on the board |
 | `duck_emote(name, action?)` | Play an authored **gesture** — `head_tilt`, `nod`, `perk_up`, `droop` — or `action='list'` what a server has |
+| `duck_train_tasks(refresh?)` | Task ids the GPU box can train — the live `list-envs` registry, cached |
+| `duck_train_start(task_id, ...)` | **Train a new behavior**: launches a run in its own tmux session on the GPU box (see below). `smoke=True` is the 64-env / 5-iteration validation run |
+| `duck_train_status(session?, tail?)` | List training sessions; for one, the wandb URL, latest iteration/reward/ETA, whether it's alive, and a diagnosis if it died |
+| `duck_train_stop(session)` | Ctrl-C the trainer, then kill the session (`destructive_hint` — it ends an experiment) |
 | `duck_reset` | Back to origin, default stance (`destructive_hint` — it ends the episode) |
 
 ## Honest sensing (fake mediad)
@@ -397,6 +401,56 @@ hot-reloadable onto a server whose `emotes/` differs.
 `ball_spotted` — the duck visibly notices the ball while the wake pack goes
 out to the mind.
 
+## Training new behaviors
+
+The tools above drive a duck that already knows things. These four grow it a
+new one: the agent trains a policy on a GPU box, reads the run, and ends up
+with the wandb path that `microduck_rl`'s `scripts/export.py` turns into the
+ONNX this sim hot-swaps.
+
+```bash
+uv run duck train tasks                                   # the live registry
+uv run duck train start Mjlab-StandUp-Flat-MicroDuck --smoke   # ALWAYS first
+uv run duck train start Mjlab-StandUp-Flat-MicroDuck --num-envs 4096
+uv run duck train status duck-train-standup-flat-microduck
+uv run duck train stop   duck-train-standup-flat-microduck
+```
+
+Everything runs over `ssh` on a box named by `$DUCK_TRAIN_HOST` (default
+`duck-4090-wsl`, an alias that lands directly in Linux). The scripts these
+tools build travel on **stdin** to `bash -l -s` — never as a quoted ssh
+argument — so no remote shell ever re-parses them; the tmux session likewise
+runs a `~/logs/<session>.sh` written on the box rather than an argument to
+`tmux new-session`. That is not fastidiousness: a training command is
+`cd && uv run train … | tee log` nested two shells deep, and the failure mode
+of getting it wrong is finding out twelve hours later.
+
+What the tools enforce, each because of a way this has actually gone wrong:
+
+- **One session per task**, named `duck-train-<slug>`. Starting a run for a
+  task that already has one is **refused**, never replaced.
+- **`--video True`, never a bare `--video`.** mjlab configures tyro with
+  `FlagConversionOff`, so booleans take a value; the bare flag is a parse
+  error that killed a 12-hour StandUp run at second one.
+- **Per-run logs** at `~/logs/train_<slug>_<timestamp>.log`, `tee`'d live
+  under `set -o pipefail` so the recorded exit code is the trainer's and not
+  `tee`'s, and so a re-run never clobbers the previous run's evidence.
+- **`smoke=True` is 64 envs / 5 iterations**, per `microduck_rl/AGENTS.md`:
+  minutes and cents, and it catches ~95% of config errors before you spend a
+  night of GPU time on them.
+- **Status is read-only** and safe to point at a live run. It parses rsl_rl's
+  own output — iteration, mean reward, episode length, ETA — plus the wandb
+  run path, and diagnoses the known deaths (CLI parse error, full disk, CUDA
+  OOM, traceback).
+- **Stop is honest about what survives**: the trainer has no interrupt
+  handler, so a Ctrl-C keeps the last periodic checkpoint (every 50
+  iterations by default) and nothing since.
+
+One caveat the tools report rather than hide: if the box's WSL distro does not
+run `systemd` as PID 1, WSL tears the distro down seconds after the last
+session ends and takes detached tmux with it. `duck_train_start` checks PID 1
+and returns a `warning` when a launch that "worked" is not going to survive.
+
 ## AX debug page
 
 `duck-sim` also serves an **Agent Experience debug page** at
@@ -433,6 +487,9 @@ happens on the sim thread via the same intent queue as every other client.
       `microduck` docs `design/architecture.md` §5.3) behind the same tools
 - [ ] Body-pose intents (crouch/lean while standing)
 - [ ] Optional StandUp policy slot so falls are recoverable without `duck_reset`
+- [ ] Close the training loop: a `duck_train_export` that takes a finished
+      run's `wandb_run_path` straight to an ONNX in the sim's policy dir, so
+      train → export → hot-swap needs no human hands
 
 ## License
 

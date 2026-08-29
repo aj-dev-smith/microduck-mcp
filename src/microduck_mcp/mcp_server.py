@@ -34,6 +34,14 @@ _EPISODIC = ToolAnnotations(read_only_hint=False, destructive_hint=False,
                             idempotent_hint=False, open_world_hint=False)
 _RESET = ToolAnnotations(read_only_hint=False, destructive_hint=True,
                          idempotent_hint=True, open_world_hint=False)
+# The training tools are the only ones that leave this machine — they drive a
+# GPU box over ssh — so they are the only ones that are open-world, and
+# stopping a run is destructive in the way that matters (hours of GPU time).
+_TRAIN_READ = ToolAnnotations(read_only_hint=True, open_world_hint=True)
+_TRAIN = ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                         idempotent_hint=False, open_world_hint=True)
+_TRAIN_STOP = ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                              idempotent_hint=True, open_world_hint=True)
 
 # How long to let an intent take effect before sampling the returned state.
 SETTLE_S = 0.3
@@ -545,6 +553,196 @@ def duck_machine(action: str, path: str | None = None,
         req["block_s"] = block_s
         timeout = block_s + 15.0
     return MachineStatus(**_call(req, timeout=timeout))
+
+
+class TrainSession(BaseModel):
+    """A training tmux session on the GPU box."""
+
+    session: str = Field(description="tmux session name — `duck-train-<slug>`")
+    slug: str | None = Field(default=None, description="The task the session "
+                             "was named for; null for a session started by "
+                             "hand, whose task cannot be read off its name")
+    created: str | None = Field(default=None, description="When the session "
+                                "was created, local time on the box")
+
+
+class TrainRun(BaseModel):
+    """A launched run: where it lives and where its output is going."""
+
+    ok: bool
+    session: str = Field(description="tmux session it runs in — pass this to "
+                         "duck_train_status and duck_train_stop")
+    task_id: str
+    logfile: str = Field(description="Log on the box, tee'd live")
+    num_envs: int
+    smoke: bool = Field(description="True if this was the cheap 64-env, "
+                        "5-iteration validation run, not a real one")
+    iterations: int | None = Field(default=None, description="--agent.max_iterations, "
+                                   "if capped; null means the task's own budget")
+    started: bool
+    note: str | None = None
+    distro_init: str | None = Field(default=None, description="PID 1 inside "
+                                    "the box's WSL distro")
+    warning: str | None = Field(default=None, description="Set when the run "
+                                "will not survive on its own — WSL tears the "
+                                "distro down (and detached tmux with it) "
+                                "unless systemd is PID 1")
+    script: str | None = Field(default=None, description="The exact shell "
+                               "script sent to the box (dry_run returns this "
+                               "and sends nothing)")
+
+
+class TrainStatus(BaseModel):
+    """What a training run is doing, read from tmux and its log."""
+
+    model_config = ConfigDict(extra="allow")
+
+    ok: bool
+    sessions: list[TrainSession] = Field(description="Every duck-train session "
+                                         "on the box right now")
+    session: str | None = Field(default=None, description="The session asked about")
+    alive: bool | None = Field(default=None, description="Whether that session "
+                               "still exists. False with a log present means "
+                               "the run ENDED — check exit_rc and failed.")
+    logfile: str | None = None
+    iteration: int | None = Field(default=None, description="Latest completed "
+                                  "learning iteration")
+    total_iterations: int | None = None
+    mean_reward: float | None = Field(default=None, description="Mean episode "
+                                      "return at that iteration. Rising total "
+                                      "reward can be pure regularizer — check "
+                                      "the task term in wandb before believing it.")
+    mean_episode_length: float | None = None
+    steps_per_second: float | None = None
+    total_steps: int | None = None
+    eta: str | None = Field(default=None, description="rsl_rl's own estimate, "
+                            "HH:MM:SS remaining")
+    elapsed: str | None = None
+    wandb_url: str | None = Field(default=None, description="The run's wandb page")
+    wandb_run_path: str | None = Field(
+        default=None, description="entity/project/run_id — the argument "
+        "`scripts/export.py --wandb-run-path` wants to turn this run into the "
+        "ONNX the sim hot-swaps")
+    exit_rc: int | None = Field(default=None, description="Exit code, once the "
+                                "run has finished (0 = clean)")
+    exit_at: str | None = None
+    failed: str | None = Field(default=None, description="A diagnosis, when the "
+                               "log contains one — a CLI parse error, a full "
+                               "disk, CUDA OOM, or a traceback")
+    tail: str | None = Field(default=None, description="The end of the log, "
+                             "verbatim — read it when `failed` is set")
+    note: str | None = None
+
+
+class TrainStopped(BaseModel):
+    ok: bool
+    session: str
+    stopped: bool = Field(description="False if the session survived the "
+                          "Ctrl-C — it may still be unwinding; call again")
+    note: str | None = None
+
+
+class TrainTasks(BaseModel):
+    ok: bool
+    tasks: list[str] = Field(description="Registered task ids on the box")
+    count: int
+    cached_at: str = Field(description="When the registry was last read; "
+                           "`list-envs` imports every env, so it is cached")
+
+
+def _train(verb: str, **kwargs) -> dict[str, Any]:
+    """Run a training verb; refusals reach the model as sentences.
+
+    The import is deferred so a client that never trains anything never pays
+    for it, exactly as duck_say defers the voice.
+    """
+    from . import train
+    try:
+        return getattr(train, verb)(**kwargs)
+    except train.TrainError as e:
+        raise ToolError(str(e)) from e
+
+
+@mcp.tool(title="Start a training run", annotations=_TRAIN)
+def duck_train_start(task_id: str, num_envs: int = 4096, video: bool = True,
+                     smoke: bool = False, iterations: int | None = None,
+                     extra_args: str | None = None,
+                     dry_run: bool = False) -> TrainRun:
+    """Train a NEW behavior on the GPU box: launches `uv run train <task_id>`
+    in its own tmux session on the 4090 and returns immediately. Nothing
+    blocks — a real run is hours; poll duck_train_status.
+
+    ALWAYS smoke test first. smoke=True runs 64 envs / 5 iterations (minutes,
+    cents) and catches ~95% of config errors — a bad reward sign, a joint
+    index that doesn't resolve, an env that won't build. Only then launch the
+    real one. Budgets for the real run: ~1000 iterations at 4096 envs for a
+    simple episodic trick, 4000-6000 for gaits and curriculum-heavy recovery.
+
+    One session per task (`duck-train-<slug>`) and it will NOT displace a
+    running one: if a run for this task is already going, you get a refusal
+    naming the session, not a replaced experiment. Output is tee'd to
+    ~/logs/train_<slug>_<timestamp>.log, so every run keeps its own evidence.
+
+    extra_args goes to the trainer verbatim (e.g.
+    "--agent.load-checkpoint model_1500.pt --agent.resume True" to continue a
+    run). Booleans need a VALUE — mjlab runs tyro with FlagConversionOff, so
+    it is `--video True`, never a bare `--video`.
+
+    dry_run=True returns the exact script without sending it anywhere."""
+    return TrainRun(**_train("start", task_id=task_id, num_envs=num_envs,
+                             video=video, extra_args=extra_args, smoke=smoke,
+                             iterations=iterations, dry_run=dry_run))
+
+
+@mcp.tool(title="Training run status", annotations=_TRAIN_READ)
+def duck_train_status(session: str | None = None,
+                      tail: int = 200) -> TrainStatus:
+    """Read the GPU box: which training sessions exist, and — with a session
+    name — how that run is doing. Read-only; safe to point at a live run.
+
+    Without a session it just lists them. With one it tails that run's log and
+    pulls out the wandb URL (and the entity/project/run_id path the ONNX
+    export wants), the latest iteration, mean reward, episode length and
+    rsl_rl's own ETA, whether the tmux session is still alive, and a diagnosis
+    if the log contains one.
+
+    alive=False with a logfile present means the run ENDED — read exit_rc and
+    `failed` before assuming it finished. A run says nothing for the first few
+    minutes (JIT + scene compile); an empty tail that early is normal.
+
+    What to watch, per microduck_rl's conventions: mean reward rising AND the
+    MAIN task term growing in wandb — total reward can climb on regularizers
+    alone while the trick never happens — and every Episode_Reward/<penalty>
+    must be <= 0, which is the infallible check for an inverted reward sign."""
+    return TrainStatus(**_train("status", session=session, tail=tail))
+
+
+@mcp.tool(title="Stop a training run", annotations=_TRAIN_STOP)
+def duck_train_stop(session: str) -> TrainStopped:
+    """Stop a training run: Ctrl-C into its tmux session, wait a few seconds
+    for the trainer to unwind, then kill the session.
+
+    This ENDS an experiment — hours of GPU time — so it takes an explicit
+    session name and never guesses. What survives is the last periodic
+    checkpoint (`save_interval`, every 50 iterations by default): the trainer
+    has no interrupt handler, so the iterations since that checkpoint are
+    lost, and a run stopped just after a save loses nothing worth having.
+    Resume later with duck_train_start's extra_args:
+    "--agent.load-checkpoint model_XXXX.pt --agent.resume True"."""
+    return TrainStopped(**_train("stop", session=session))
+
+
+@mcp.tool(title="Trainable tasks", annotations=_TRAIN_READ)
+def duck_train_tasks(refresh: bool = False) -> TrainTasks:
+    """The task ids the GPU box can actually train — `uv run list-envs` on the
+    box, which is the live registry, not a list anyone maintains by hand.
+
+    Cached, because listing imports every env (tens of seconds); refresh=True
+    re-reads it, which is what you want right after adding a new env cfg to
+    microduck_rl. Names are `Mjlab-<Family>-<Terrain>-MicroDuck`; a
+    `-Backlash-` variant is the same task on the backlash robot model, for
+    sim2real A/B."""
+    return TrainTasks(**_train("tasks", refresh=refresh))
 
 
 @mcp.tool(title="Reset the sim", annotations=_RESET)

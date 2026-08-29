@@ -20,11 +20,16 @@ Library (`request()`) plus a small CLI:
     duck say "we lost the ball" --mood sad   # same duck, different weather
     duck chirp inquire --voice-bank bank/    # nonverbal: one call from the bank
     duck emote head_tilt | duck emote --list # authored gestures (see emotes/)
+    duck train tasks                         # what the GPU box can train
+    duck train start <TASK_ID> --smoke       # 64 envs / 5 iters, always first
+    duck train start <TASK_ID> --num-envs 4096
+    duck train status [session] | duck train stop <session>
 
-Every subcommand but `film`, `say` and `chirp` is a one-shot intent over the
-socket; `film` runs its own headless sim and writes an mp4 (see film.py), and
-`say`/`chirp` play the duck's voice host-side while streaming the beak to the
-running sim (see voice.py).
+Every subcommand but `film`, `say`, `chirp` and `train` is a one-shot intent
+over the socket; `film` runs its own headless sim and writes an mp4 (see
+film.py), `say`/`chirp` play the duck's voice host-side while streaming the
+beak to the running sim (see voice.py), and `train` drives RL runs on the GPU
+box over ssh (see train.py) — it never touches the sim at all.
 """
 
 import argparse
@@ -94,16 +99,19 @@ def main():
                     "directory (head_tilt, nod, perk_up, droop)")
     em.add_argument("--list", action="store_true", dest="list_emotes",
                     help="list the server's emotes and whether they parse")
-    # `film`, `say` and `chirp` are not plain socket intents — film boots its
-    # own headless sim, the two voices play audio host-side and then perform
-    # it — so their flags live next to their implementations.
-    from . import film, voice
+    # `film`, `say`, `chirp` and `train` are not plain socket intents — film
+    # boots its own headless sim, the two voices play audio host-side and then
+    # perform it, and train drives the GPU box over ssh — so their flags live
+    # next to their implementations.
+    from . import film, train, voice
     film.add_arguments(sub.add_parser("film",
                                       help="film an autonomous match to an mp4"))
     voice.add_arguments(sub.add_parser("say",
                                        help="speak: audio host-side, beak in sim"))
     voice.add_chirp_arguments(sub.add_parser(
         "chirp", help="play one call from the duck's voice bank"))
+    train.add_arguments(sub.add_parser(
+        "train", help="launch and read RL runs on the GPU box"))
     args = p.parse_args()
 
     if args.command == "film":
@@ -112,6 +120,8 @@ def main():
         sys.exit(voice.run(args))
     if args.command == "chirp":
         sys.exit(voice.run_chirp(args))
+    if args.command == "train":
+        sys.exit(train.run(args))
 
     if args.command == "drive":
         req = {"cmd": "set_velocity", "vx": args.vx, "vy": args.vy, "wz": args.wz}
