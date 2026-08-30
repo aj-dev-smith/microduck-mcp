@@ -642,6 +642,31 @@ class TrainStopped(BaseModel):
     note: str | None = None
 
 
+class RolloutVerdict(BaseModel):
+    ok: bool
+    clip: str = Field(description="The rollout video judged, as a path on the "
+                      "GPU box")
+    step: int | None = Field(default=None, description="Env step the clip was "
+                             "recorded at (iteration ≈ step / 24)")
+    ducks_seen: int | None = None
+    per_duck: list[str] = Field(default_factory=list, description="One phrase "
+                                "per visible duck: start state -> what it did")
+    task_achieved: bool | None = Field(
+        default=None, description="True only if a duck starting OUTSIDE the "
+        "goal state visibly achieved the task — ducks that start standing "
+        "don't count for StandUp")
+    quality: int | None = Field(default=None, description="0-10 for the "
+                                "population")
+    failure_modes: list[str] = Field(default_factory=list)
+    cheating_suspected: bool | None = None
+    summary: str | None = Field(default=None, description="The judge's own "
+                                "2-3 sentences on what it saw")
+    model: str | None = Field(default=None, description="Which Gemini model "
+                              "answered")
+    local: str | None = Field(default=None, description="Local copy of the "
+                              "clip, for a second opinion on its frames")
+
+
 class TrainTasks(BaseModel):
     ok: bool
     tasks: list[str] = Field(description="Registered task ids on the box")
@@ -743,6 +768,35 @@ def duck_train_tasks(refresh: bool = False) -> TrainTasks:
     `-Backlash-` variant is the same task on the backlash robot model, for
     sim2real A/B."""
     return TrainTasks(**_train("tasks", refresh=refresh))
+
+
+@mcp.tool(title="Judge the newest rollout video", annotations=_TRAIN_READ)
+def duck_review_rollout(task: str, match: str | None = None,
+                        watch_for: list[str] | None = None) -> RolloutVerdict:
+    """Watch what the policy actually DOES: fetch the newest rollout video
+    the trainer recorded on the GPU box and have Gemini judge it against the
+    task, returning a structured verdict. The numbers lie in a specific way —
+    total reward climbs on regularizers while the trick never happens — and
+    this is the tool that catches it. Costs a fraction of a cent; use it
+    freely alongside duck_train_status.
+
+    task: one or two sentences saying what the policy is supposed to achieve,
+    including what does NOT count (e.g. "rise from the ground into a stable
+    stand — ducks that start upright and merely stay standing don't count").
+    The judge sees several parallel ducks per clip and reports per duck.
+
+    match narrows to a run whose log path mentions it (e.g. "microduck_stand")
+    when more than one run has recorded videos. watch_for adds task-specific
+    cheat patterns to the standing list (flail, freeze, jitter,
+    physics-surfing).
+
+    Needs GEMINI_API_KEY in the environment (free tier is plenty)."""
+    from . import judge, train
+    try:
+        return RolloutVerdict(**judge.latest(task, match=match,
+                                             watch_for=watch_for))
+    except (judge.JudgeError, train.TrainError) as e:
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool(title="Reset the sim", annotations=_RESET)
