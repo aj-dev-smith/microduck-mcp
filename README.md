@@ -451,6 +451,17 @@ run `systemd` as PID 1, WSL tears the distro down seconds after the last
 session ends and takes detached tmux with it. `duck_train_start` checks PID 1
 and returns a `warning` when a launch that "worked" is not going to survive.
 
+### Duck cam: watching a run live
+
+`scripts/box/launch_viewer.sh` (run on the box; see its header) starts mjlab's
+**viser** viewer in a `duck-viewer` tmux session beside training: a browser
+3D scene where the duck runs the newest checkpoint of the newest run, with a
+checkpoint panel that hot-loads later ones as training writes them. Tunnel it
+with `ssh -f -N -L 8080:localhost:8080 duck-4090-wsl` and open
+`http://localhost:8080`. Its companion `play_viser_patched.py` wraps `play`
+to skip command-GUI sliders whose degenerate ranges crash viser on some tasks
+(an mjlab bug; the sim itself is fine).
+
 ## AX debug page
 
 `duck-sim` also serves an **Agent Experience debug page** at
