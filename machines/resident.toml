@@ -21,10 +21,14 @@
 name = "resident"
 initial = "rest"
 
-# The fall reflex: wake once, from the floor. `fallen` excludes itself so
-# the wake cannot restorm; `down` is the post-deadline park.
+# The fall reflex — body first, mind second. A fall used to wake Claude from
+# the floor immediately; now the sitstand slot holds an actual getup policy
+# (and duck_policy can swap in a better one without a restart), so the
+# machine spends two honest stand attempts before it calls anyone. The
+# exclusion list is every node of the recovery path: re-firing this reflex
+# mid-recovery would reset the attempt counter forever.
 [[machine.transition]]
-when = "not upright and elapsed_s > 0.5 and node != 'fallen' and node != 'down'"
+when = "not upright and elapsed_s > 0.5 and node != 'fallen' and node != 'second_try' and node != 'down' and node != 'parked'"
 to = "fallen"
 
 [[node]]
@@ -73,16 +77,70 @@ behavior = "idle"
 when = "not ball_seen.visible and ball_seen.age_s > 10.0"
 to = "rest"
 
+# Attempt one. `trick` fires the sitstand policy once on entry; a refusal
+# (policy busy) never satisfies the upright guard, which is what the 8 s
+# deadline is for. The 1.5 s floor on the success guard is so a duck that
+# is merely mid-tumble through vertical doesn't count as recovered.
 [[node]]
 name = "fallen"
-behavior = "idle"
-wake = "I've fallen — no stand-up policy; duck_reset is the escape hatch"
-[[node.transition]]                 # deadline default: park quietly
-when = "elapsed_s > 300.0"
+behavior = "trick"
+[node.params]
+trick = "stand"
+[[node.transition]]
+when = "upright and elapsed_s > 1.5"
+to = "recovered"
+[[node.transition]]
+when = "elapsed_s > 8.0"
+to = "second_try"
+
+# Attempt two — a fresh node is a fresh trick firing. Two attempts, not
+# three: the current policy either rises inside a second or is parked in a
+# pose it will hold all day (the lean basin — see the meta-repo's
+# standup-reward-surgery note), so a third try buys nothing but delay
+# before the mind hears about it.
+[[node]]
+name = "second_try"
+behavior = "trick"
+[node.params]
+trick = "stand"
+[[node.transition]]
+when = "upright and elapsed_s > 1.5"
+to = "recovered"
+[[node.transition]]
+when = "elapsed_s > 8.0"
 to = "down"
 
+# Getting up is worth noticing: the same visible-acknowledgment rule as
+# ball_spotted. The body saved itself and says so, then goes back to work.
+[[node]]
+name = "recovered"
+behavior = "idle"
+emote = "perk_up"
+[[node.transition]]
+when = "elapsed_s > 2.0"
+to = "rest"
+
+# NOW the mind gets called — with what was already tried, so the wake reads
+# as a handoff rather than an alarm. External rescue (a reset, a brain swap
+# followed by someone commanding stand) satisfies the upright guard here
+# too, so an answered wake resumes the residency without a re-arm.
 [[node]]
 name = "down"
 behavior = "idle"
-# Terminal, and deliberately NOT a wake node: the `fallen` wake already
-# went out, and the global fall reflex excludes this park.
+wake = "down — two stand attempts failed; duck_reset, or duck_policy swap a better sitstand brain and trick stand"
+[[node.transition]]
+when = "upright and elapsed_s > 1.5"
+to = "recovered"
+[[node.transition]]                 # deadline default: park quietly
+when = "elapsed_s > 300.0"
+to = "parked"
+
+[[node]]
+name = "parked"
+behavior = "idle"
+# Terminal, and deliberately NOT a wake node: the `down` wake already went
+# out, and the global fall reflex excludes this park. Still watching for a
+# rescue, though — a parked duck that gets stood up rejoins the residency.
+[[node.transition]]
+when = "upright and elapsed_s > 1.5"
+to = "recovered"
