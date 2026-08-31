@@ -16,6 +16,9 @@ Library (`request()`) plus a small CLI:
     duck machine arm --block-s 300        # arm, then block for the first wake
     duck film -o match.mp4
     duck mouth 0.6
+    duck pet state                           # the desktop overlay's own pose
+    duck pet config --px-per-meter 656       # ...and the screen it thinks it is on
+    duck pet world                           # park every ledge (the undo)
     duck say "hello A J" --voice-bank bank/
     duck say "we lost the ball" --mood sad   # same duck, different weather
     duck chirp inquire --voice-bank bank/    # nonverbal: one call from the bank
@@ -93,6 +96,30 @@ def main():
                    "for the first wake after the jump.")
     mo = sub.add_parser("mouth", help="set the beak opening")
     mo.add_argument("opening", type=float, help="0 (closed) to 1 (open)")
+    # The desktop overlay's half of the socket, so `duck-pet` is inspectable
+    # the way `duck machine` is: what does the daemon think the screen looks
+    # like, and where does it think the duck is standing on it. `frame` costs
+    # a render like any other frame request and hands back the PNG's size
+    # rather than its bytes — this is a diagnostic, not a second viewer.
+    pet = sub.add_parser("pet", help="the desktop pet's view of the world")
+    # `world` with no --rects is the escape hatch: it parks every platform
+    # box. `reset` deliberately leaves the pet's world alone (it belongs to
+    # the screen, not to the run), so without this a badly-placed ledge could
+    # only be undone over HTTP.
+    pet.add_argument("action", choices=["state", "config", "frame", "world"])
+    pet.add_argument("--px-per-meter", type=float, default=None)
+    pet.add_argument("--screen-width-px", type=float, default=None)
+    pet.add_argument("--frame-px", type=int, default=None)
+    pet.add_argument("--supersample", type=int, default=None)
+    pet.add_argument("--wall-margin-m", type=float, default=None)
+    pet.add_argument("--corridor-m", type=float, default=None)
+    pet.add_argument("--floor-pad-px", type=int, default=None)
+    pet.add_argument("--size-px", type=int, default=None,
+                     help="frame: render at this size instead of the configured one")
+    pet.add_argument("--rects", default=None,
+                     help="world: a JSON list of {x, y, w, h} ledges in metres "
+                          "of screen floor (default: none, which parks them "
+                          "all — the way to undo a bad placement)")
     em = sub.add_parser("emote", help="play an authored gesture")
     em.add_argument("name", nargs="?", default=None,
                     help="emote name — the file stem in the server's emote "
@@ -145,6 +172,27 @@ def main():
         req = ({"cmd": "emote", "name": args.name}
                if args.name and not args.list_emotes
                else {"cmd": "emote", "action": "list"})
+    elif args.command == "pet":
+        req = {"cmd": f"pet_{args.action}"}
+        if args.action == "frame" and args.size_px is not None:
+            req["size_px"] = args.size_px
+        if args.action == "world":
+            try:
+                req["rects"] = json.loads(args.rects) if args.rects else []
+            except ValueError as e:
+                print(json.dumps({"ok": False,
+                                  "error": f"--rects is not JSON: {e}"}))
+                sys.exit(1)
+        if args.action == "config":
+            # Only the flags actually given: every key the daemon does not
+            # hear about keeps the value it has, so `duck pet config` on its
+            # own is a read, not a reset to argparse's idea of a screen.
+            for flag in ("px_per_meter", "screen_width_px", "frame_px",
+                         "supersample", "wall_margin_m", "corridor_m",
+                         "floor_pad_px"):
+                val = getattr(args, flag, None)
+                if val is not None:
+                    req[flag] = val
     elif args.command == "machine":
         req = {"cmd": "machine", "action": args.action}
         if args.action == "load":

@@ -401,6 +401,55 @@ hot-reloadable onto a server whose `emotes/` differs.
 `ball_spotted` — the duck visibly notices the ball while the wake pack goes
 out to the mind.
 
+## Desktop pet (`duck-pet`)
+
+`duck-pet` is a macOS overlay that puts the duck on the **top edge of your
+Dock**, where it walks around on its own while you work.
+
+<p align="center">
+  <img src="docs/images/pet_on_dock.png" alt="The duck mid-stride on the top edge of the Dock" width="420">
+</p>
+
+**Nothing about it is animated.** The app ships no sprites, no keyframes and
+no tweens: every frame is a physics step of the same MuJoCo sim, driven by the
+same shipped ONNX walk policy, served through the same `sim.submit` queue as
+`duck_camera`. The sim's ground plane *is* the Dock's top edge — the camera is
+orthographic, so metres-per-pixel is constant at every depth and the mapping is
+exact rather than exact-near-the-middle. The window tracks `base_x`, so when
+the controller stumbles the window stops and the duck face-plants on the Dock.
+Two invisible walls stand at the mapped screen edges; it physically cannot walk
+off. Stop the daemon and the duck freezes mid-step, tinted cool — proof of life,
+the same way an unplugged robot is proof of life.
+
+```bash
+uv run duck-sim --scene desktop        # headless; --viewer has no offscreen GL
+uv run duck machine load machines/pet.toml && uv run duck machine arm
+uv run duck-pet                        # both sides default to port 8400
+```
+
+[`machines/pet.toml`](machines/pet.toml) is the resident pattern aimed at a
+strip of screen: stroll, amble, pause, glance around, turn at the walls, doze
+off, and wake nodes for the two states a duck cannot talk itself out of —
+`fallen` (try `duck_trick stand`) and `stuck` (a shove would help). `stuck`
+escalates rather than nagging: it tries a leg away from the wall itself, then
+parks in a silent `wedged` node that wakes nobody and retries every ten
+minutes, because ambient software gets one chance to be interesting before it
+is an interruption.
+
+Because the overlay is a **viewer onto the ordinary daemon**, Claude
+inhabitation needs no new protocol at all: point the MCP server at the same
+sim, block on `duck machine wait`, and every `duck_drive` / `duck_trick` /
+`duck_say` plays out on the Dock in front of you. The pet daemon must own the
+*default* socket for that (a `--socket` instance is invisible to the MCP
+tools). Drag the duck with the mouse and it becomes a real `duck_push` —
+the controller staggers, and recovers or falls for real. Everywhere else the
+window is click-through, so the Dock underneath still works.
+
+Roughly 18 fps of picture over 50 Hz of physics at the shipped 512 px ×2
+supersampled frame; the ask drops to 1 fps on display sleep, screen lock and
+occlusion. `duck pet state` / `config` / `frame` / `world` inspect the same
+surface from the CLI without the GUI.
+
 ## Training new behaviors
 
 The tools above drive a duck that already knows things. These four grow it a

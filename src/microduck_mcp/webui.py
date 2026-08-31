@@ -10,12 +10,43 @@ Serves:  /            the dashboard
          /state       JSON state snapshot
          /log?since=N command-feed events after id N
          /frame.png?view=follow&distance=0.9   fresh camera render
+
+and the desktop pet's stream (notes/desktop-pet.md) — the same queue, no new
+protocol, nothing written to disk:
+
+         GET  /pet/frame?size_px=300   RGBA cutout; the pose it was rendered
+                                       at rides along in the X-Duck-Pet
+                                       response header, because the window has
+                                       to move to match the frame it shows and
+                                       a second round trip costs a sim tick
+         GET  /pet/state               pose, policy, and who has the wheel
+         POST /pet/config              the screen the duck is living on
+         POST /pet/world               screen rectangles -> platform ledges
+         POST /pet/push                a drag gesture -> a real shove
 """
 
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+# A drag arrives in frame pixels; the sim wants metres per second. Kept here
+# rather than in the app so the gesture means the same thing to every client.
+PET_DRAG_GAIN = 6.0
+PET_PUSH_MAX = 2.0
+# Cap on a POST body: these are all small JSON objects, and an HTTP server on
+# the sim's front door should not read an arbitrary number of bytes.
+MAX_BODY_BYTES = 64 * 1024
+# What a push gets when the daemon behind this port is not the pet's. Worded
+# like the sim's own refusal (sim_server._pet_not_a_pet_scene) because it is
+# the same fact: /pet/frame, /pet/config and /pet/world already say it, and
+# only /pet/push could reach a live non-pet session without it.
+PET_NOT_A_PET_SCENE = {
+    "ok": False,
+    "error": "this daemon has no pet geoms — start duck-sim with "
+             "--scene desktop (scenes/scene_desktop.xml); refusing to shove "
+             "the duck of whatever session owns this port",
+}
 
 PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>microduck AX debug</title>
@@ -179,7 +210,38 @@ pollLog(); pollState(); pollCam();
 def start_web(sim, port: int) -> ThreadingHTTPServer:
     """Serve the debug page on localhost:port from a daemon thread."""
 
+    # Is this daemon running a pet scene? Fixed for the daemon's life (it is
+    # decided from the compiled model at load), so it is worth exactly one
+    # `pet_state` submit — a submit costs a 50 Hz tick, and a shove that spent
+    # one to look up a number it was already handed would halve the gesture's
+    # latency budget for nothing.
+    known = {}
+
+    def _pet_scene(state=None):
+        if state is None and "is" not in known:
+            state = sim.submit({"cmd": "pet_state", "client": "web"})
+        # Only a definite answer is remembered: a probe that failed for some
+        # other reason must not latch "not a pet scene" for the daemon's life.
+        if isinstance(state, dict) and state.get("ok") and "pet_scene" in state:
+            known["is"] = bool(state["pet_scene"])
+        return known.get("is", False)
+
     class Handler(BaseHTTPRequestHandler):
+        # HTTP/1.1, i.e. keep-alive. The pet feed holds ONE connection and
+        # asks for a frame twenty times a second (pet_feed.PetFeed); under the
+        # stdlib default of HTTP/1.0 every one of those was a fresh TCP
+        # connect and a fresh ThreadingHTTPServer thread contending with the
+        # sim thread for the GIL. Safe because `_send` and `_pet_frame` both
+        # emit an exact Content-Length and `_body` reads exactly that many
+        # bytes, so no reply can desynchronise the next request.
+        protocol_version = "HTTP/1.1"
+        # ...and with keep-alive a handler thread otherwise blocks forever on
+        # a connection nobody intends to speak on again (or on a body that
+        # never arrives). BaseHTTPRequestHandler turns this into a socket
+        # timeout and closes the connection, which is the right answer to
+        # both.
+        timeout = 30.0
+
         def log_message(self, *args):  # keep the sim's stdout readable
             pass
 
@@ -193,6 +255,113 @@ def start_web(sim, port: int) -> ThreadingHTTPServer:
 
         def _json(self, obj, code=200):
             self._send(code, json.dumps(obj).encode(), "application/json")
+
+        def _body(self):
+            """The request's JSON object, or None (having already replied)."""
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = 0
+            if n > MAX_BODY_BYTES:
+                self._json({"ok": False, "error": "body too large"}, 413)
+                return None
+            # A negative Content-Length is not "no body": `rfile.read(-1)`
+            # reads to EOF, so a hostile local process could hold a handler
+            # thread on the sim's front door open indefinitely. Clamp rather
+            # than trust; the `timeout` above catches the short-body case
+            # (a header promising more than the client ever sends).
+            n = max(0, n)
+            raw = self.rfile.read(n) if n else b"{}"
+            try:
+                body = json.loads(raw or b"{}")
+            except ValueError as e:
+                self._json({"ok": False, "error": f"bad JSON body: {e}"}, 400)
+                return None
+            if not isinstance(body, dict):
+                self._json({"ok": False, "error": "body must be a JSON object"}, 400)
+                return None
+            return body
+
+        def _pet_frame(self, q):
+            """The cutout, plus its pose in a header.
+
+            The PNG bytes never touch the disk: `camera_web` writes a file per
+            request, which is fine three times a second and is not fine twenty
+            times a second. `sim.submit` is in-process, so the bytes come back
+            in the reply dict and go straight out the socket.
+            """
+            req = {"cmd": "pet_frame", "client": "web"}
+            for key in ("size_px", "supersample"):
+                if key in q:
+                    try:
+                        req[key] = int(q[key])
+                    except ValueError:
+                        self._json({"ok": False,
+                                    "error": f"{key} must be an integer"}, 400)
+                        return
+            resp = sim.submit(req)
+            png = resp.pop("png", None)
+            if not resp.get("ok") or png is None:
+                self._json(resp, 500)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "no-store")
+            # One header, one json.loads on the app side: base pose, upright,
+            # policy, inhabited. Small (a few hundred bytes) and it keeps the
+            # frame and the pose that produced it inseparable.
+            self.send_header("X-Duck-Pet", json.dumps(resp, separators=(",", ":")))
+            self.send_header("Content-Length", str(len(png)))
+            self.end_headers()
+            self.wfile.write(png)
+
+        def _pet_push(self, body):
+            """A drag on the duck -> the same `push` intent everything else uses.
+
+            The gesture is in the frame's pixels, in screen orientation: +dx
+            is rightwards (world +x) and +dy is DOWNWARDS, so a flick upwards
+            lifts the duck off the Dock. Nothing here is a special effect —
+            it lands in qvel and the real controller has to deal with it.
+
+            Two things this deliberately does NOT do. It does not shove a
+            duck that is not the pet's: `pet_state` answers on any scene by
+            design (a pose is a pose), and the pet's port is duck-sim's own
+            default, so an overlay pointed at the live MCP daemon would
+            otherwise render nothing and still be a remote shove button on
+            somebody else's session. And it does not spend a `pet_state`
+            submit — a whole 50 Hz tick — for a gesture that already arrived
+            in metres, which is every gesture the shipped app sends.
+            """
+            ppm = None
+            if "dx_m" not in body or "dy_m" not in body:
+                state = sim.submit({"cmd": "pet_state", "client": "web"})
+                if not state.get("ok"):
+                    self._json(state, 500)
+                    return
+                if not _pet_scene(state):
+                    self._json(PET_NOT_A_PET_SCENE, 400)
+                    return
+                ppm = state["config"]["px_per_meter"]
+            elif not _pet_scene():
+                self._json(PET_NOT_A_PET_SCENE, 400)
+                return
+            try:
+                gain = float(body.get("gain", PET_DRAG_GAIN))
+                dx_m = (float(body["dx_m"]) if "dx_m" in body
+                        else float(body.get("dx_px", 0.0)) / ppm)
+                dy_m = (float(body["dy_m"]) if "dy_m" in body
+                        else float(body.get("dy_px", 0.0)) / ppm)
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "dx_px/dy_px (or dx_m/dy_m) "
+                            "and gain must be numbers"}, 400)
+                return
+            vx = max(-PET_PUSH_MAX, min(PET_PUSH_MAX, dx_m * gain))
+            vz = max(-PET_PUSH_MAX, min(PET_PUSH_MAX, -dy_m * gain))
+            req = {"cmd": "push", "client": "web",
+                   "magnitude": abs(vx), "angle_deg": 0.0 if vx >= 0 else 180.0,
+                   "vz": vz}
+            resp = sim.submit(req)
+            self._json(resp, 200 if resp.get("ok") else 500)
 
         def do_GET(self):
             url = urlparse(self.path)
@@ -215,8 +384,33 @@ def start_web(sim, port: int) -> ThreadingHTTPServer:
                         return
                     with open(resp["frame"], "rb") as f:
                         self._send(200, f.read(), "image/png")
+                elif url.path == "/pet/frame":
+                    self._pet_frame(q)
+                elif url.path == "/pet/state":
+                    self._json(sim.submit({"cmd": "pet_state", "client": "web"}))
                 else:
                     self._json({"ok": False, "error": "not found"}, 404)
+            except Exception as e:
+                try:
+                    self._json({"ok": False, "error": repr(e)}, 500)
+                except Exception:
+                    pass
+
+        def do_POST(self):
+            url = urlparse(self.path)
+            try:
+                if url.path not in ("/pet/config", "/pet/world", "/pet/push"):
+                    self._json({"ok": False, "error": "not found"}, 404)
+                    return
+                body = self._body()
+                if body is None:
+                    return  # _body already answered
+                if url.path == "/pet/push":
+                    self._pet_push(body)
+                    return
+                cmd = "pet_config" if url.path == "/pet/config" else "pet_world"
+                resp = sim.submit({**body, "cmd": cmd, "client": "web"})
+                self._json(resp, 200 if resp.get("ok") else 400)
             except Exception as e:
                 try:
                     self._json({"ok": False, "error": repr(e)}, 500)

@@ -1,0 +1,518 @@
+# pet.toml — the duck that lives on the Dock.
+#
+# resident.toml's sibling, and the same contract: autonomous-first,
+# mind-optional. Where the resident mostly sits still and waits for something
+# worth a wake, this one has a job — be visibly alive on a strip of screen for
+# eight hours without ever being interesting enough to interrupt anyone.
+#
+#     duck machine load machines/pet.toml
+#     duck machine arm
+#     duck machine wait --block-s 300     # Claude, if present, listens
+#
+# Nothing here is animation. Every node is a velocity intent through the real
+# walk policy; the pacing, the turn at the wall, the nap and the fall are all
+# physics. If the pet looks stiff, the fix is in the numbers below, not in a
+# keyframe.
+#
+# ---------------------------------------------------------------------------
+# THE SCREEN, IN METRES  (the only numbers here that know about a display)
+# ---------------------------------------------------------------------------
+# The overlay maps sim x -> screen x at a fixed px_per_meter, so the duck's
+# world is one-dimensional and about as wide as the display:
+#
+#     duck standing height   0.2744 m   (measured, mesh verts, STAND keyframe)
+#     180 px tall duck   ->  656 px/m
+#     1728 pt of screen  ->  2.634 m of floor, i.e. x in [-1.317, +1.317]
+#     a 300 px window    ->  0.229 m of half-window either side of the duck
+#
+# So the furthest the duck can stand and still have its whole window on
+# screen is 1.317 - 0.229 = 1.088 m. TURN_X below is 1.00 rather than 1.088,
+# and the 0.088 is not slack — it is OVERSHOOT, measured: the guard fires,
+# the duck keeps walking through its 4 s point turn, and a live run peaked at
+# 1.107 with TURN_X at 1.05. Set TURN_X where you want the duck to STOP and
+# you will find its window hanging off the screen edge. The app's invisible
+# walls belong at ±1.30 m, well outside all of it, so the duck turns itself
+# around and never actually leans on one.
+#
+#     TURN_X   = 1.00   turn around here (the duck coasts to about 1.06)
+#     ROOM_X   = 0.90   "no room that way" — a shade inside TURN_X, so a spin
+#                       that ended at the wall cannot pick the wall
+#     AWAY_X   = 0.85   "I set off from that wall and I am still standing at it"
+#
+# On a different display, those two numbers and the wall placement are the
+# whole port. Guards cannot do arithmetic, so they are spelled out inline.
+# AWAY_X has to clear the worst honest case — a full 180 deg point turn (4 s)
+# plus the ground a slow amble covers in the remaining 6 s of its window —
+# and 0.85 does, with about 0.5 m to spare.
+#
+# A wall placed INSIDE TURN_X is not caught, and deliberately is not: the
+# duck leans on it for the rest of that leg, then a `peek` spins it round and
+# it walks off again. Wasted legs, not a jam, and no wake — waking a mind for
+# a badly placed wall is not the machine's job. What the away guard IS for is
+# a duck that genuinely cannot move: told to cross the screen, still standing
+# where it started six seconds later.
+#
+# ---------------------------------------------------------------------------
+# WHAT THE GAIT ACTUALLY DOES  (measured, shipped walk policy, plain scene)
+# ---------------------------------------------------------------------------
+# Every timing below is derived from these, and none of them is the number a
+# reader would guess from the velocity commands:
+#
+#     vx 0.30 -> 0.131 m/s     vx 0.26 -> 0.114     vx 0.22 -> 0.096
+#     vx <= 0.21 -> THE DUCK DOES NOT MOVE. There is no slow walk, and there
+#                   is no reverse either: -0.22 and -0.30 both measure 0.000.
+#     wz 1.5 in place -> 0.76-0.92 rad/s, so a 180 deg turn costs ~4 s
+#     wz >= 1.0 while walking -> the walk collapses; it is a turn now
+#
+# So "brisk" is 0.30 and "slow" is 0.22, which is the entire available range,
+# and crossing the 2.1 m the duck is allowed takes 16 s at the brisk pace
+# plus up to 4 s of turning to face the right way. Legs are sized for that.
+#
+# ---------------------------------------------------------------------------
+# THE RHYTHM
+# ---------------------------------------------------------------------------
+#   stroll (brisk, 14 s) -> pause -> amble (slow) -> wall -> peek -> stroll ...
+#
+# Two paces and two rests, alternating, because one pace at one interval is a
+# screensaver. The leg lengths are chosen so that BOTH halves happen: a
+# 14 s stroll off a wall covers 1.3-1.8 m and runs out of clock mid-screen
+# (so there is a pause), and the amble that follows it has 0.3-0.8 m left to
+# the far wall and gets there (so there is a wall). Lengthen the stroll past
+# ~20 s and it reaches the wall on its own, the rests stop happening, and the
+# pet becomes a metronome — that is the failure this rhythm is tuned against.
+#
+# Every turn-around therefore runs wall -> peek: six seconds at wz 1.5 is
+# 260-320 degrees, so the duck comes out of it pointing somewhere it was not
+# pointing before, and the wall it just met does not have to be un-met by a
+# separate turn node.
+#
+# `peek` and `pause` both check for room before choosing a direction. Without
+# that a spin at the left wall can pick "left", walk half a step, re-enter the
+# wall node, and ring-a-ring-o'-roses forever.
+#
+# The `roll` guard is the rationing mechanism throughout: an honest coin
+# drawn once per arrival at a node. This file tried to mine its randomness
+# out of the gait first (which way a six-second spin happened to leave the
+# duck pointing) and that is worth knowing about — it does not work. Every
+# quantity a machine can sense here is downstream of the same walk, so a
+# threshold on one is a feedback loop with itself: measured, the boredom wake
+# went from nine an hour to never as the threshold moved, with nothing usable
+# in between.
+#
+# Wakes are rationed hard — this runs for hours next to somebody working:
+#   fallen  a real fall. It watches for its own recovery, and a shallow tip
+#           usually rights itself on the standing policy alone inside two
+#           seconds — but the wake latches on entry, so a mind that is
+#           listening hears about every one. That is deliberate for something
+#           living on the Dock in plain sight: falling over IS the event.
+#           (resident.toml spends two `trick stand` attempts first because
+#           nobody is watching its scene; here somebody already saw it.)
+#   stuck   jammed at the edge of the screen and going nowhere. ONCE per jam:
+#           the unjam and the escape leg that follow either get the duck
+#           moving — in which case the day resumes and a later jam is a new
+#           event worth a new wake — or it parks in `wedged` and says nothing
+#           more. A duck that cannot move is not 59 pieces of news an hour.
+#   bored   the playful one, and gated behind two coin flips and a long nap
+# Words (`say`) only ever come out on those three. Everything else is body
+# language — but MIND THE SOUND BUDGET: a shipped emote can carry a voice-bank
+# tag (droop coos, head_tilt inquires, perk_up greets; `nod` is the silent
+# one), and this machine reaches a wall about seventy times an hour. An emote
+# with a sound on a wall node is a noise every forty-nine seconds, all day.
+# So the walls nod, and the only routine sounds in this file are the two ends
+# of a nap: eight coos and eight greets an hour, one about every four minutes,
+# each attached to something a person can actually see happen.
+
+[machine]
+name = "pet"
+initial = "settle"
+
+# The fall reflex, resident.toml's, with the postures carved out. Measured, a
+# settled sit keeps the trunk upright (59 mm off the floor and `upright` still
+# true), so `not sitting` is belt and braces rather than the load-bearing
+# part; settle_down and get_up are excluded for the second either side of the
+# sitstand transient, which is where the trunk actually swings. The cost of
+# the carve-out is honest and small: a sitting duck knocked over is not
+# noticed until the nap's own deadline gets it back on its feet, and the
+# reflex fires then.
+[[machine.transition]]
+when = "not upright and not sitting and elapsed_s > 0.5 and node != 'fallen' and node != 'down' and node != 'settle_down' and node != 'get_up'"
+to = "fallen"
+
+
+# --------------------------------------------------------------------------
+# setting off
+# --------------------------------------------------------------------------
+
+[[node]]
+name = "settle"
+behavior = "idle"
+# A beat on two feet before going anywhere: this is where arm, `duck reset`
+# and every recovery land, and the walk policy wants a moment of standing
+# before it is asked for velocity. Direction is chosen away from whichever
+# half of the screen the duck woke up in — and if there is no odometry at all
+# the first guard is False and it sets off right, which is a fine default.
+[[node.transition]]
+when = "elapsed_s > 1.5 and base.x > 0.0"
+to = "stroll_left"
+[[node.transition]]
+when = "elapsed_s > 1.5"
+to = "stroll_right"
+
+
+# --------------------------------------------------------------------------
+# the legs — `stroll` holds a world heading, so "walk the other way" IS the
+# turn: entering stroll_left at the right wall point-turns first, closed loop,
+# and no separate turn node has to guess how long 180 degrees takes.
+# --------------------------------------------------------------------------
+
+[[node]]
+name = "stroll_right"
+behavior = "stroll"
+[node.params]
+heading_deg = 0.0
+vx = 0.30                           # the brisk pace, and the only brisk pace
+[[node.transition]]
+when = "base.x > 1.00"
+to = "wall_right"
+# Jammed. Note what this does NOT say: "near the left edge for a while".
+# A position band cannot tell passing through from pinned — a healthy leg is
+# inside every band eventually, and sooner or later the timer lands there
+# too. Getting AWAY from a wall is a claim about time and distance together,
+# and that one is safe: ten seconds of walking right is a full point turn
+# (4 s) plus 0.8 m of ground, so a duck that set off from the left wall ten
+# seconds ago and is still out past AWAY_X did not set off.
+[[node.transition]]
+when = "elapsed_s > 10.0 and base.x < -0.85"
+to = "stuck"
+[[node.transition]]                 # short of a full crossing on purpose: the
+when = "elapsed_s > 14.0"           # leg runs out mid-screen and the amble
+to = "pause"                        # after the breather finishes the trip
+
+[[node]]
+name = "stroll_left"
+behavior = "stroll"
+[node.params]
+heading_deg = 180.0
+vx = 0.30
+[[node.transition]]
+when = "base.x < -1.00"
+to = "wall_left"
+[[node.transition]]
+when = "elapsed_s > 10.0 and base.x > 0.85"
+to = "stuck"
+[[node.transition]]
+when = "elapsed_s > 14.0"
+to = "pause"
+
+[[node]]
+name = "amble_right"
+behavior = "stroll"
+[node.params]
+heading_deg = 0.0
+vx = 0.22                           # the slow pace — and the slowest the gait
+                                    # has: below 0.21 the duck simply stops
+[[node.transition]]
+when = "base.x > 1.00"
+to = "wall_right"
+[[node.transition]]
+when = "elapsed_s > 10.0 and base.x < -0.85"
+to = "stuck"
+[[node.transition]]                 # the amble usually meets the wall before
+when = "elapsed_s > 13.0"           # this fires — it is the second half of a
+to = "peek"                         # crossing. The timer is for the leg that
+                                    # started facing the wrong way.
+
+[[node]]
+name = "amble_left"
+behavior = "stroll"
+[node.params]
+heading_deg = 180.0
+vx = 0.22
+[[node.transition]]
+when = "base.x < -1.00"
+to = "wall_left"
+[[node.transition]]
+when = "elapsed_s > 10.0 and base.x > 0.85"
+to = "stuck"
+[[node.transition]]
+when = "elapsed_s > 13.0"
+to = "peek"
+
+
+# --------------------------------------------------------------------------
+# the ends of the world
+# --------------------------------------------------------------------------
+
+[[node]]
+name = "wall_right"
+behavior = "idle"
+emote = "nod"                       # a nod at the drop before turning back —
+                                    # and `nod` because it is the one shipped
+                                    # gesture with no voice-bank tag on it,
+                                    # which at seventy wall arrivals an hour
+                                    # is the whole reason it is this gesture
+[[node.transition]]                 # ...and the turn itself is the peek, which
+when = "elapsed_s > 1.2"            # is what keeps the dice roll on the main
+to = "peek"                         # path instead of down a side branch
+
+[[node]]
+name = "wall_left"
+behavior = "idle"
+emote = "nod"                       # same reason, same gesture: the sound
+                                    # budget outranks the variety here
+[[node.transition]]
+when = "elapsed_s > 1.2"
+to = "peek"
+
+
+# --------------------------------------------------------------------------
+# the rests
+# --------------------------------------------------------------------------
+
+[[node]]
+name = "pause"
+behavior = "idle"
+# A breather mid-screen, then on at the slow pace the same way it was
+# pointing — unless the coin says have a proper look round instead. That is
+# the one place the rhythm itself varies, and it is why the lap is not the
+# same lap every time. After it, room first: a pause that happened near a
+# wall must not send the amble straight back into it.
+[[node.transition]]
+when = "elapsed_s > 2.2 and roll < 0.30"
+to = "peek"
+[[node.transition]]
+when = "elapsed_s > 2.2 and base.x > 0.90"
+to = "amble_left"
+[[node.transition]]
+when = "elapsed_s > 2.2 and base.x < -0.90"
+to = "amble_right"
+[[node.transition]]
+when = "elapsed_s > 2.2 and base.heading_x < 0.0"
+to = "amble_left"
+[[node.transition]]
+when = "elapsed_s > 2.2"
+to = "amble_right"
+
+[[node]]
+name = "peek"
+behavior = "search_ball"            # on a ball-less desktop scene this is just
+[node.params]                       # "turn in place, head level" — the glance
+wz = 1.5                            # resident.toml uses it for. Nothing is
+                                    # ever found, and nothing is meant to be:
+                                    # this is the duck having a look about.
+# Six seconds, because three would land on the same heading every time and
+# the spin would stop being worth watching. The NAP, though, is drawn on
+# `roll` — an honest coin, one draw per arrival — and not on where the spin
+# happened to stop. That was the first design and it was wrong: everything
+# this machine can sense is downstream of the same walk, so a threshold on
+# the terminal heading is an attractor, not a coin. Measured over 40
+# simulated hours it went from firing on every other look-around to firing on
+# none, with nothing usable in between. `roll < 0.08` is 8%, exactly, and
+# stays 8% when the rest of the file changes around it — the look-around runs
+# about a hundred times an hour, so that is eight naps an hour. Widen it to
+# nap more; the duck already spends about a third of the day sitting down.
+[[node.transition]]
+when = "elapsed_s > 6.0 and roll < 0.08"
+to = "settle_down"
+[[node.transition]]                 # no room that way: the wall decides
+when = "elapsed_s > 6.0 and base.x > 0.90"
+to = "stroll_left"
+[[node.transition]]
+when = "elapsed_s > 6.0 and base.x < -0.90"
+to = "stroll_right"
+[[node.transition]]                 # room either way: the spin decides
+when = "elapsed_s > 6.0 and base.heading_x < 0.0"
+to = "stroll_left"
+[[node.transition]]
+when = "elapsed_s > 6.0"
+to = "stroll_right"
+
+
+# --------------------------------------------------------------------------
+# the nap — a real posture, not a pause with a longer timer
+# --------------------------------------------------------------------------
+
+[[node]]
+name = "settle_down"
+behavior = "trick"
+[node.params]
+trick = "sit"
+[[node.transition]]                 # wait for the posture to actually arrive
+when = "sitting and elapsed_s > 0.8"
+to = "doze"
+[[node.transition]]                 # ...or don't: a refused sit dozes standing
+when = "elapsed_s > 3.0"
+to = "doze"
+
+[[node]]
+name = "doze"
+behavior = "idle"
+emote = "droop"                     # head down: asleep reads at 180 px
+# A second roll, independent of the first because it is drawn on arrival
+# HERE. Most naps are just naps; about one in eight turns into the long sleep
+# that eventually asks for company. Eight naps an hour at 12% measures out at
+# 0.97 boredom wakes an hour over 32 simulated hours — which is the whole
+# point of spending a real coin on it instead of hoping the gait would
+# provide one.
+[[node.transition]]
+when = "elapsed_s > 90.0 and roll < 0.12"
+to = "deep_doze"
+[[node.transition]]
+when = "elapsed_s > 90.0"
+to = "get_up"
+
+[[node]]
+name = "deep_doze"
+behavior = "idle"
+# Four more minutes of nothing happening before the duck asks for company.
+# The `roll` above is the rate dial; this timer is just the patience.
+[[node.transition]]
+when = "elapsed_s > 240.0"
+to = "bored"
+
+[[node]]
+name = "bored"
+behavior = "idle"                   # the holding pattern IS the nap it is
+                                    # already in — nothing to interrupt
+emote = "head_tilt"                 # ...and it inquires, which is the point
+say = "I have walked this Dock end to end all morning and nothing has happened. Come and drive me somewhere."
+say_mood = "smug"
+wake = "nothing has happened in a long time — the duck is bored and would like to be driven somewhere"
+[[node.transition]]                 # the deadline default: get up and putter
+when = "elapsed_s > 180.0"
+to = "get_up"
+
+[[node]]
+name = "get_up"
+behavior = "trick"
+emote = "perk_up"                   # a greet on waking, once a nap
+[node.params]
+trick = "stand"
+[[node.transition]]
+when = "not sitting and elapsed_s > 1.0"
+to = "settle"
+[[node.transition]]
+when = "elapsed_s > 3.5"
+to = "settle"
+
+
+# --------------------------------------------------------------------------
+# the two ways a pet goes wrong
+# --------------------------------------------------------------------------
+
+[[node]]
+name = "stuck"
+behavior = "idle"
+emote = "head_tilt"                 # head tilt, and the inquire that rides
+                                    # on it — this one has earned a noise
+say = "I have got myself wedged against the edge of the screen."
+say_mood = "sad"
+wake = "wedged at a screen edge and going nowhere — a shove (duck_push) or a heading would help; I will try turning off it myself in 45 s, and then go quiet about it"
+[[node.transition]]                 # the deadline default: turn off it alone
+when = "elapsed_s > 45.0"
+to = "unjam"
+
+[[node]]
+name = "unjam"
+behavior = "drive"
+# Turn, do not reverse. Backing away is the obvious move and it does not
+# exist: -0.22 and -0.30 both measure 0.000 m/s on the shipped policy, so a
+# reverse node would have been five seconds of the duck standing still while
+# claiming to escape. Five seconds at wz 1.5 is about 220 degrees — enough to
+# stop facing whatever it was leaning on — and `settle` then picks the
+# direction that points back into the screen. If the duck cannot even turn,
+# nothing here will save it and the stuck wake will fire again; that is the
+# honest failure, and it is the one that deserves a mind.
+[node.params]
+vx = 0.0
+vy = 0.0
+wz = 1.5
+# ...and then a leg AWAY from whatever it was leaning on, not back into the
+# ordinary rotation. This is the escalation path, and the reason it exists is
+# a measured one: with `unjam` returning straight to `settle`, a genuinely
+# wedged duck rode a 61 s cycle — stuck (wake + a spoken complaint + an
+# inquiring chirp) -> unjam -> settle -> stroll -> the 10 s away-guard ->
+# stuck — 59 times an hour, forever, next to somebody working. The header
+# above says wakes are rationed hard; this is where that promise is kept.
+[[node.transition]]
+when = "elapsed_s > 5.0 and base.x < 0.0"
+to = "escape_right"
+[[node.transition]]
+when = "elapsed_s > 5.0"
+to = "escape_left"
+
+# The proof leg. Same pace as a stroll, but it is asking one question — did
+# anything at all move? — and it does not report back to the rotation until
+# the answer is yes. Getting inside AWAY_X is the whole test, and it is the
+# same test the stroll nodes use to declare a jam in the first place.
+[[node]]
+name = "escape_right"
+behavior = "stroll"
+[node.params]
+heading_deg = 0.0
+vx = 0.30
+[[node.transition]]                 # it moved: the day resumes as normal
+when = "base.x > -0.85"
+to = "settle"
+[[node.transition]]                 # it did not: go quiet
+when = "elapsed_s > 12.0"
+to = "wedged"
+
+[[node]]
+name = "escape_left"
+behavior = "stroll"
+[node.params]
+heading_deg = 180.0
+vx = 0.30
+[[node.transition]]
+when = "base.x < 0.85"
+to = "settle"
+[[node.transition]]
+when = "elapsed_s > 12.0"
+to = "wedged"
+
+[[node]]
+name = "wedged"
+behavior = "idle"
+# The park, and resident.toml's `parked` is its model: deliberately NOT a
+# wake node, and deliberately silent — no emote, so no voice-bank tag, so no
+# noise. `stuck` already called for help and the unjam already failed; saying
+# it again once a minute for eight hours is not new information, it is a
+# pager loop. What is left is patience: keep trying, quietly, every ten
+# minutes, and rejoin the day the moment the duck is somewhere else — which
+# is what a shove (duck_push), a heading from a mind, or a screen that
+# changed shape under it all look like from in here.
+[[node.transition]]
+when = "base.x > -0.85 and base.x < 0.85"
+to = "settle"
+[[node.transition]]
+when = "elapsed_s > 600.0"
+to = "unjam"
+
+[[node]]
+name = "fallen"
+behavior = "idle"
+emote = "droop"
+say = "I have gone over."
+say_mood = "sad"
+wake = "I've fallen on the Dock — try duck_trick stand (the sitstand policy is loaded, and duck_policy can swap a better one in); duck_reset is the escape hatch"
+# Unlike resident.toml this one watches for its own recovery: `duck reset`
+# stands the duck up and re-enters this node (reset is deliberately not a
+# wake), so noticing `upright` again is how the pet gets itself back to work
+# without anybody having to force a node.
+[[node.transition]]
+when = "upright and elapsed_s > 1.5"
+to = "settle"
+[[node.transition]]                 # deadline default: park quietly
+when = "elapsed_s > 300.0"
+to = "down"
+
+[[node]]
+name = "down"
+behavior = "idle"
+# The park, and deliberately NOT a wake node: `fallen` already called, and the
+# fall reflex excludes this node so it cannot restorm. It is not terminal
+# though — a duck that is upright again has somewhere to be.
+[[node.transition]]
+when = "upright and elapsed_s > 2.0"
+to = "settle"

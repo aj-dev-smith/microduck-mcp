@@ -25,6 +25,8 @@ dependencies = [
     "mcp>=2,<3",
     "pillow>=10",
     "google-genai>=1.0",
+    "pyobjc-framework-cocoa>=10 ; sys_platform == 'darwin'",
+    "pyobjc-framework-quartz>=10 ; sys_platform == 'darwin'",
 ]
 
 [project.urls]
@@ -36,6 +38,7 @@ Issues = "https://github.com/aj-dev-smith/microduck-mcp/issues"
 duck-sim = "microduck_mcp.sim_server:main"
 duck = "microduck_mcp.client:main"
 duck-mcp = "microduck_mcp.mcp_server:main"
+duck-pet = "microduck_mcp.pet_app:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -43,3 +46,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/microduck_mcp"]
+
+# `--scene desktop` reads scenes/scene_desktop.xml, so the wheel has to carry
+# it. It rides *inside* the package rather than at the wheel root — a
+# top-level `scenes/` would land loose in site-packages — and
+# sim_server.local_scenes_dir() looks there first.
+[tool.hatch.build.targets.wheel.force-include]
+"scenes" = "microduck_mcp/scenes"

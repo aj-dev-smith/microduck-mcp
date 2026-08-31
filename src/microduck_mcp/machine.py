@@ -51,10 +51,29 @@ a string. It does not know what emotes exist, what they do, or whether the
 server it lands on has any — a machine naming a gesture nobody has is a lint
 warning at load and a note at fire time, never a rejection, for the same
 reason a machine with a voice loads onto a mute server.
+
+ODOMETRY PATHS: guards may read `base.x`, `base.y`, `base.yaw_deg` and
+`base.heading_x`/`base.heading_y` — the duck's own pose, filled in by the
+executor rather than by the server's sensed digest. See _pose_digest.
+
+THE ROLL: `roll` is a fresh number in [0, 1) drawn on every node entry and
+held constant for the whole stay, so `roll < 0.15` is exactly "one time in
+seven, decided on arrival" — and it does not flicker mid-node the way a
+per-tick draw would, which would make a guard fire the instant it felt like
+it rather than at its deadline. It exists because a machine that runs in
+front of a person for hours has to be able to be UNpredictable, and nothing
+else in this vocabulary can do it: everything sensed here is downstream of
+the same walk, so a "coin" mined out of, say, which way the gait happened to
+leave the duck pointing turns out to be an attractor, not a coin (measured:
+it moved a wake rate from every-time to never with nothing in between). A
+robot may flip a coin; that is not a fairness leak, and unlike the sensed
+paths this one is the machine's own, like elapsed_s and node. Seed it for a
+test by passing `rng=` to Machine.
 """
 
 import ast
 import math
+import random
 import tomllib
 
 import numpy as np
@@ -78,7 +97,21 @@ GUARD_PATHS = {
     # fairness leak: a real pitch has a goal-line sensor, and "someone scored"
     # is not "where the ball is".
     "goal.scored", "goal.count",
-    "elapsed_s", "sim_time_s", "node",
+    # Own odometry: where the duck is standing and which way it points. Filled
+    # by the executor (_pose_digest), not by the server's sensed digest, and
+    # deliberately so — it is derived from the robot's own state and needs no
+    # sensor model, which means a machine that steers by its own position runs
+    # on any server old enough to load it, with no protocol to negotiate. Not
+    # a fairness leak either: dead reckoning is what _own_pose has fed the ball
+    # approach since the striker. The ground truth this vocabulary still
+    # withholds is where anything ELSE is.
+    #
+    # heading_x/heading_y are cos/sin of the yaw, and they are here because
+    # yaw_deg wraps at ±180 — exactly where a duck walking the -x direction
+    # lives — while the grammar has no abs() to paper over it. The components
+    # are wrap-free and read plainly: `base.heading_x > 0.0` is "pointing +x".
+    "base.x", "base.y", "base.yaw_deg", "base.heading_x", "base.heading_y",
+    "elapsed_s", "sim_time_s", "node", "roll",
 }
 
 # A node's `say` line. Same ceiling as voice.MAX_SAY_CHARS, spelled out rather
@@ -270,6 +303,104 @@ def _own_pose(sim):
     w, qx, qy, qz = (float(v) for v in q)
     yaw = math.atan2(2 * (w * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
     return x, y, yaw
+
+
+# What "I don't know where I am" looks like in the digest. Every comparison
+# over a null field is False (see compile_guard), so a machine that steers by
+# position simply stops steering rather than steering on a guess.
+_NO_POSE = {"base.x": None, "base.y": None, "base.yaw_deg": None,
+            "base.heading_x": None, "base.heading_y": None}
+
+# The sim shapes that legitimately have no pose to give: a bare stub in a test,
+# a hardware feed whose telemetry has not started, a server whose model has no
+# freejoint. All of them fail inside _own_pose on attribute or index access.
+_POSE_MISSING = (AttributeError, TypeError, IndexError, ValueError)
+
+
+def _pose_digest(sim) -> dict:
+    """The odometry half of the digest — see GUARD_PATHS' `base.*` note.
+
+    The executor adds this each tick instead of the server building it into
+    the sensed digest, because it is the one part of the vocabulary that needs
+    nothing from the server but the state the robot already carries. That is
+    what lets a position-steering machine hot-load onto a running daemon.
+    """
+    try:
+        x, y, yaw = _own_pose(sim)
+    except _POSE_MISSING:
+        return dict(_NO_POSE)
+    return {"base.x": round(x, 4), "base.y": round(y, 4),
+            "base.yaw_deg": round(math.degrees(yaw), 2),
+            "base.heading_x": round(math.cos(yaw), 4),
+            "base.heading_y": round(math.sin(yaw), 4)}
+
+
+def bhv_stroll(sim, params, mem, digest):
+    """Walk a compass heading and hold it — the pet's gait.
+
+    `drive` sets one velocity intent and lets it ride, which is right for a
+    two-second backoff after a failed kick and wrong for a two-metre walk: a
+    hundred steps of gait noise bends an open-loop vx into a slow arc, and a
+    duck that is supposed to be pacing the Dock ends up facing the wallpaper.
+    So this is drive with a compass — proportional steering onto
+    `heading_deg` in the WORLD frame (own odometry, the same knowledge the
+    ball approach has always steered on), at `vx`.
+
+    Two bands, and the split is the gait's, not a preference. Measured on the
+    shipped walk policy (plain scene, commanded vs achieved):
+
+        vx  0.22 -> 0.096 m/s   0.26 -> 0.114   0.30 -> 0.131
+        vx <= 0.21 -> the duck does not move at all, and neither does any
+                      negative vx: there is no reverse
+        wz  1.5 -> 0.76-0.92 rad/s in place (180 deg in ~3.5-4 s)
+        wz  1.2 while walking -> the walk collapses to 0.008 m/s
+
+    So a big wz is a point turn whether you meant one or not, and a small one
+    is free steering: at vx 0.30, wz 0.2/0.3/0.4 buys 5/11/15 deg per second
+    while still covering 0.124/0.118/0.105 m/s of ground. Hence `wz_max`
+    defaulting to 0.4 — winding it up does not steer harder, it stops the
+    duck. Badly off heading, the point turn is the honest move: vx to zero,
+    wz to full, and no pretence of walking. Which also makes turning round at
+    a wall free — "stroll the other way" IS the turn, closed loop, and the
+    machine only has to name the new heading.
+    """
+    if not mem.get("head"):
+        _set_head(sim, float(params.get("head", 0.0)))
+        mem["head"] = True
+    vx = float(params.get("vx", 0.30))
+    try:
+        _, _, yaw = _own_pose(sim)
+    except _POSE_MISSING:
+        # No odometry: walk the intent open-loop rather than steer on a guess.
+        sim.policy.set_vel_cmd(vx, 0.0, 0.0)
+        return
+    err = _wrap(math.radians(float(params.get("heading_deg", 0.0))) - yaw)
+    if abs(err) > math.radians(float(params.get("turn_in_deg", 25.0))):
+        sim.policy.set_vel_cmd(0.0, 0.0, math.copysign(1.5, err))
+        return
+    wz_max = float(params.get("wz_max", 0.4))
+    sim.policy.set_vel_cmd(
+        vx, 0.0, _clip(float(params.get("gain", 1.0)) * err, -wz_max, wz_max))
+
+
+def bhv_trick(sim, params, mem, digest):
+    """Fire one episodic trick on entry, then hold — `celebrate` generalised.
+
+    celebrate is this with the roulade already chosen; a pet needs the same
+    one-shot for postures rather than stunts: `trick = "sit"` to settle down
+    for a nap, `trick = "stand"` to get back up. The posture lands in the
+    digest (`sitting`), so the machine can wait for it to actually arrive
+    instead of trusting a timer — and a refused trick never satisfies that
+    guard, which is exactly what the node's deadline transition is for.
+
+    stage_ball defaults False here where celebrate leaves it True: staging
+    teleports the ball to the foot, and a posture change has no business
+    moving the world.
+    """
+    if not mem.get("done"):
+        mem["done"] = True
+        sim._handle_trick(str(params.get("trick", "stand")),
+                          stage_ball=bool(params.get("stage_ball", False)))
 
 
 def _drive_to(sim, dist, bearing):
@@ -522,9 +653,11 @@ def bhv_celebrate(sim, params, mem, digest):
 BEHAVIORS = {
     "idle": bhv_idle,
     "drive": bhv_drive,
+    "stroll": bhv_stroll,
     "search_ball": bhv_search_ball,
     "approach_ball": bhv_approach_ball,
     "kick": bhv_kick,
+    "trick": bhv_trick,
     "celebrate": bhv_celebrate,
 }
 
@@ -538,8 +671,11 @@ class MachineError(ValueError):
 class Machine:
     """A validated machine: nodes, compiled guards, and the 50 Hz executor."""
 
-    def __init__(self, spec: dict, source_path: str = "<inline>"):
+    def __init__(self, spec: dict, source_path: str = "<inline>", rng=None):
         self.source_path = source_path
+        # The roll's source. Injectable so a test can pin a rate instead of
+        # sampling one; a live machine gets the module's own generator.
+        self.rng = rng if rng is not None else random.Random()
         m = spec.get("machine")
         if not isinstance(m, dict):
             raise MachineError("missing [machine] table")
@@ -631,20 +767,22 @@ class Machine:
         self.current = self.initial
         self.entered_at = 0.0
         self.mem = {}
+        self.roll = self.rng.random()
 
     @classmethod
-    def load(cls, path: str) -> "Machine":
+    def load(cls, path: str, rng=None) -> "Machine":
         with open(path, "rb") as f:
             try:
                 spec = tomllib.load(f)
             except tomllib.TOMLDecodeError as e:
                 raise MachineError(f"{path}: TOML does not parse: {e}") from e
-        return cls(spec, source_path=path)
+        return cls(spec, source_path=path, rng=rng)
 
     def enter(self, node: str, sim_time: float):
         self.current = node
         self.entered_at = sim_time
         self.mem = {}
+        self.roll = self.rng.random()   # one draw per stay, not per tick
 
     def status(self) -> dict:
         return {"name": self.name, "source": self.source_path,
@@ -663,6 +801,11 @@ class Machine:
         """One 50 Hz step: transitions first (global, then node, in order),
         then the current behavior. Returns the fired transition or None."""
         digest["elapsed_s"] = round(digest["sim_time_s"] - self.entered_at, 3)
+        digest["roll"] = self.roll
+        # Odometry, added here rather than by the server (GUARD_PATHS' base.*
+        # note). In place, before the guards, so a wake pack's digest snapshot
+        # carries the pose and the roll the transition actually fired on.
+        digest.update(_pose_digest(sim))
         node = self.nodes[self.current]
         for t in self.global_transitions + node["transitions"]:
             if t["to"] != self.current and t["guard"](digest):

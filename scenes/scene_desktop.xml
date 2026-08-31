@@ -1,0 +1,230 @@
+<mujoco model="scene_desktop">
+    <!-- The desktop pet's world: a strip of invisible floor pinned to the top
+         of the Dock, walls at the mapped screen edges, and nothing else the
+         camera is allowed to see but the duck.
+
+         NOT DIRECTLY LOADABLE — this is a template. `@ROBOT_XML@` and
+         `@MESHDIR@` are substituted with absolute paths under --rl-repo at
+         load time (sim_server.local_scene_xml). MuJoCo resolves `<include>`
+         relative to the INCLUDING file but `meshdir` relative to the MAIN
+         file, so a scene living outside microduck_rl has to say both, and
+         only the daemon knows where the clone is.
+
+         WHAT THE PET RENDERER SEES (sim_server._handle_pet_frame):
+           group 0/1/2  drawn  -> the duck (visual geoms are group 2) and the
+                                  chroma backdrop
+           group 4      hidden -> floor, walls, depth rails, platform boxes.
+                                  Hidden, not deleted: they are fully
+                                  collidable, they just never occlude the duck
+                                  in either the RGB or the segmentation pass.
+                                  (Group >= 3 is off in MuJoCo's default
+                                  MjvOption too, so the AX debug page on a pet
+                                  daemon shows a floating duck. That is the
+                                  scene being honest, not a bug.)
+
+         GEOMETRY IS SET AT RUNTIME, NOT HERE. Everything positional below is
+         a placeholder: `pet_config` moves the walls to the screen edges and
+         `pet_world` moves and resizes the platform boxes. No recompile, no
+         restart, so one daemon survives a Dock resize and the window-ledge
+         lane repositioning ledges every frame.
+
+         WHY THEY ARE MOCAP BODIES AND NOT PLAIN WORLD GEOMS. Writing
+         model.geom_pos on a geom that hangs directly off the worldbody moves
+         it in the renderer and in mjData.geom_xpos, and then it QUIETLY STOPS
+         COLLIDING: the world body's bounding-volume hierarchy is built at
+         compile time and a geom parked out at y=+10 keeps a leaf out at y=+10
+         no matter where its pos says it is. Measured on this scene — a duck
+         dropped from 0.6 m onto a 0.35 x 0.30 x 0.15 m "ledge" moved directly
+         beneath it fell straight through, with not one contact in 14 seconds.
+         A mocap body is the classic fix and the only one that is honest here:
+         it is its own body, posed from mjData.mocap_pos, and its bounds are
+         recomputed every step. Same experiment, mocap body, contact on the
+         first bounce.
+
+         So: POSITION is mjData.mocap_pos[body_mocapid]; SIZE is
+         model.geom_size, plus geom_rbound and geom_aabb, which MuJoCo derives
+         from the size at compile time and would otherwise go stale (a box you
+         grew stops generating contacts outside its old bounding sphere).
+         Neither is touched by `reset`, which only rewinds qpos/qvel — the
+         screen the duck lives on survives a new episode, as it should.
+
+         WHY ORTHOGRAPHIC, AND WHY IT IS NOT SET HERE. An orthographic free
+         camera makes the pet frame a pixel-exact map of the world:
+         metres-per-pixel is fovy/height everywhere in frame, at every depth
+         (measured: exact to the pixel, independent of the camera distance).
+         That is what lets the sim floor BE the Dock's top edge and a platform
+         box BE a window's title bar, rather than approximately be them near
+         the middle of the screen. But `orthographic` and `fovy` live on
+         mjModel.vis.global_, which every renderer on this model shares — and
+         under orthographic, fovy stops meaning degrees and starts meaning
+         metres, which would leave the AX debug page's `distance` knob doing
+         nothing. So the pet renderer sets both from px_per_meter around its
+         own two render calls and puts them back (all renders run on the sim
+         thread, so nothing can observe the model mid-swap), and this scene
+         stays a perspective scene for `duck cam` and the debug page.
+
+         `<statistic>` is pinned so parked platform boxes (out at y = +10)
+         cannot inflate the model extent — near/far clipping is derived from
+         it, and an inflated extent silently clips the duck out of frame. -->
+
+    <include file="@ROBOT_XML@"/>
+    <compiler angle="radian" meshdir="@MESHDIR@"/>
+
+    <statistic center="0 0 0.15" extent="0.6"/>
+
+    <visual>
+        <!-- Shadows cost ~6 ms of the 20 ms control period and land on a floor
+             nobody can see. MSAA is off for a subtler reason: the pet frame is
+             supersampled 2x and box-filtered, which is already antialiasing,
+             and multisampled RGB edges are blended with the backdrop while the
+             segmentation mask that keys the alpha is perfectly binary — so
+             every silhouette subpixel comes back part magenta with alpha 255,
+             and premultiplication cannot undo what the GPU already mixed.
+             Hard edges at 2x, averaged down, are both cheaper and cleaner. -->
+        <headlight diffuse="0.62 0.62 0.63" ambient="0.42 0.43 0.45" specular="0.10 0.10 0.10"/>
+        <quality shadowsize="0" offsamples="0"/>
+        <!-- Fog is pushed past the far clip. MuJoCo's default fogstart/fogend
+             are 3 and 10 model extents (1.8 m and 6 m here), which is close
+             enough to haze the backdrop into a grey gradient — and a hazed
+             backdrop is no longer a chroma key. haze is magenta too, so even
+             a residual blend lands on the key colour rather than off it.
+             `fovy` is left at MuJoCo's 45 degrees: the pet renderer overwrites
+             it per frame with a view height in metres, and a placeholder left
+             here would be read as 0.46 DEGREES by every perspective render on
+             this model (measured: the AX debug page becomes a telephoto
+             sliver of backdrop). -->
+        <map znear="0.005" fogstart="30" fogend="60"/>
+        <rgba haze="1 0 1 1"/>
+        <global azimuth="90" elevation="0" offwidth="1024" offheight="1024"/>
+    </visual>
+
+    <asset>
+        <!-- Flat, unlit, and a colour no part of the duck contains: the
+             chroma-key fallback for when segmentation rendering is
+             unavailable. In the normal path the segmentation mask keys the
+             alpha and this is just the background the RGB pass happens to
+             have. emission="1" keeps it exactly (255, 0, 255) under any
+             lighting, so a fallback key can be a hard equality test. -->
+        <material name="pet_chroma" rgba="1 0 1 1" emission="1"
+            specular="0" shininess="0" reflectance="0"/>
+    </asset>
+
+    <default>
+        <!-- The invisible world: collides with everything, drawn by nothing.
+             Same friction as the stock ground plane. -->
+        <default class="pet_solid">
+            <geom type="box" group="4" rgba="0.4 0.4 0.45 1" condim="3"/>
+        </default>
+    </default>
+
+    <worldbody>
+        <!-- One soft key light from the viewer's side so the duck reads as a
+             sticker on the Dock rather than a flat cutout. No shadow caster. -->
+        <light name="pet_key" directional="true" castshadow="false"
+            pos="-0.6 -1.4 1.8" dir="0.25 0.62 -1"
+            diffuse="0.52 0.52 0.50" specular="0.10 0.10 0.10"/>
+        <light name="pet_fill" directional="true" castshadow="false"
+            pos="0.8 0.9 1.2" dir="-0.3 -0.5 -1"
+            diffuse="0.16 0.17 0.20" specular="0 0 0"/>
+
+        <!-- The Dock's top edge. An ordinary infinite ground plane; the app
+             pins world z=0 to it. Invisible (group 4), fully collidable. -->
+        <geom name="floor" size="0 0 0.05" pos="0 0 0" type="plane" group="4"
+            rgba="0.3 0.3 0.35 1" condim="3"/>
+
+        <!-- The chroma backdrop, behind everything the camera can reach. -->
+        <geom name="pet_backdrop" type="box" pos="0 1.60 0.60" size="8 0.01 3"
+            material="pet_chroma" contype="0" conaffinity="0" group="1"/>
+
+        <!-- SCREEN EDGES. x is moved to +/- (screen_width_m/2 - margin) by
+             pet_config; these placeholders are one default 1728 pt screen at
+             656 px/m with a 300 pt window. 0.6 m tall so a stagger cannot top
+             them, 1.2 m deep in y so a diagonal cannot round them, and sunk
+             0.02 m below the floor so no toe can catch the seam. (A mocap
+             body overlapping the ground plane costs nothing: MuJoCo never
+             generates contacts between two bodies that both have no dofs.)
+             Body and geom share a name — different namespaces, one lookup. -->
+        <body name="pet_wall_left" mocap="true" pos="-1.089 0 0.28">
+            <geom name="pet_wall_left" class="pet_solid" size="0.02 0.60 0.30"/>
+        </body>
+        <body name="pet_wall_right" mocap="true" pos="1.089 0 0.28">
+            <geom name="pet_wall_right" class="pet_solid" size="0.02 0.60 0.30"/>
+        </body>
+
+        <!-- DEPTH RAILS. The pet frame is a side view: y is the camera axis,
+             so drift in y is invisible on screen right up until the duck
+             walks behind the backdrop and vanishes. These keep it in a
+             corridor. Moved by pet_config's `corridor_m`. -->
+        <body name="pet_rail_near" mocap="true" pos="0 -0.35 0.28">
+            <geom name="pet_rail_near" class="pet_solid" size="4 0.02 0.30"/>
+        </body>
+        <body name="pet_rail_far" mocap="true" pos="0 0.35 0.28">
+            <geom name="pet_rail_far" class="pet_solid" size="4 0.02 0.30"/>
+        </body>
+
+        <!-- THE PLATFORMING LANE (blueprint v2: real app windows as ledges).
+             Twelve boxes pre-allocated because a rectangle that has to exist
+             before it can be positioned is cheaper than a model recompile
+             mid-session — and a recompile would drop the duck's state on the
+             floor. Parked at y=+10: past the rails, out of every contact pair,
+             and (thanks to the pinned <statistic>) unable to move the
+             clipping planes. pet_world moves and resizes them; anything it is
+             not given goes back to the parking lot. -->
+        <body name="pet_platform_00" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_00" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+        <body name="pet_platform_01" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_01" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+        <body name="pet_platform_02" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_02" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+        <body name="pet_platform_03" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_03" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+        <body name="pet_platform_04" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_04" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+        <body name="pet_platform_05" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_05" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+        <body name="pet_platform_06" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_06" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+        <body name="pet_platform_07" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_07" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+        <body name="pet_platform_08" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_08" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+        <body name="pet_platform_09" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_09" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+        <body name="pet_platform_10" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_10" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+        <body name="pet_platform_11" mocap="true" pos="0 10 0.5">
+            <geom name="pet_platform_11" class="pet_solid" size="0.05 0.15 0.02"/>
+        </body>
+    </worldbody>
+
+    <!-- The stock STAND pose, copied from microduck_rl's scene.xml. The
+         daemon never reads it (DuckSim sets qpos and ctrl programmatically at
+         init, the same way infer_policy does), but a scene you can drop into
+         mj_resetDataKeyframe and get a standing duck out of is worth the
+         twenty lines — it is how tests/test_pet_stream.py checks that the sim
+         floor lands on the Dock's edge without booting a policy. -->
+    <keyframe>
+        <key name="STAND" qpos="
+        0 0 0.12 1 0 0 0
+
+        0 -0.08726646259971647 -0.457924 -0.004940 0.452984
+        0.3490658503988659 0.3490658503988659 0 0
+        0 0.08726646259971647 0.457924 0.004940 -0.452984"
+         ctrl="
+        0 -0.08726646259971647 -0.457924 -0.004940 0.452984
+        0.3490658503988659 0.3490658503988659 0 0
+        0 0.08726646259971647 0.457924 0.004940 -0.452984"
+        />
+    </keyframe>
+</mujoco>

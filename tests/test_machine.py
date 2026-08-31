@@ -161,7 +161,10 @@ class WakeNodes(unittest.TestCase):
     def test_shipped_resident_machine_loads(self):
         m = Machine.load(os.path.join(REPO, "machines", "resident.toml"))
         self.assertEqual(m.initial, "rest")
-        self.assertEqual(m.status()["wake_nodes"], ["ball_spotted", "fallen"])
+        # `fallen` stopped being a wake node when the sitstand policy landed:
+        # the body now spends two stand attempts of its own and only `down`
+        # calls a mind (machines/resident.toml).
+        self.assertEqual(m.status()["wake_nodes"], ["ball_spotted", "down"])
 
     def test_shipped_striker_wake_nodes(self):
         m = Machine.load(os.path.join(REPO, "machines", "striker.toml"))
@@ -369,7 +372,9 @@ class EmotingNodes(unittest.TestCase):
 
     def test_the_resident_startles_at_the_ball(self):
         m = Machine.load(os.path.join(REPO, "machines", "resident.toml"))
-        self.assertEqual(m.status()["emote_nodes"], ["ball_spotted"])
+        # ...and perks up again on `recovered`, which is the same gesture
+        # meaning the same thing: something happened worth showing.
+        self.assertEqual(m.status()["emote_nodes"], ["ball_spotted", "recovered"])
         self.assertEqual(m.nodes["ball_spotted"]["emote"], "perk_up")
 
     def test_the_match_machines_are_left_alone(self):

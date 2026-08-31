@@ -17,6 +17,9 @@ build/
 # Runtime artifacts (frames land in a temp dir by default, but just in case)
 frames/
 *.sock
+# ...and what `duck film` renders out of them. This is a public repo and a
+# stray mp4 in the tree is one `git add -A` away from being published.
+*.mp4
 
 # Local trained-policy artifacts: ONNX exports pulled from the training box
 # and shadow policy dirs for hot-swap demos. Policies belong on HF Hub (see

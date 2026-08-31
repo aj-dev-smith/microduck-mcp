@@ -17,6 +17,7 @@ Run headless (plain python) or with the interactive viewer (macOS: mjpython):
 
 import argparse
 import importlib.util
+import io
 import json
 import math
 import os
@@ -54,6 +55,15 @@ SCENES = {
     "pitch": "src/mjlab_microduck/robot/microduck/scene_pitch.xml",
     "plain": "src/mjlab_microduck/robot/microduck/scene.xml",
 }
+
+# Scenes that ship with THIS repo rather than microduck_rl. They are templates,
+# not loadable MJCF: MuJoCo resolves <include> relative to the including file
+# but `meshdir` relative to the MAIN file, so a scene living outside
+# microduck_rl can reach the robot MJCF by no fixed relative path at all. The
+# daemon is the only thing that knows where the clone is (--rl-repo), so it
+# substitutes both absolute paths at load time — see local_scene_xml().
+LOCAL_SCENES = {"desktop": "scene_desktop.xml"}
+ROBOT_XML_REL = "src/mjlab_microduck/robot/microduck/robot_allcollisions.xml"
 
 # The goal in scene_pitch.xml: line at world x=+0.60 with the mouth opening
 # back towards the origin (-x), posts at y=±0.20, crossbar underside at
@@ -166,6 +176,84 @@ HEAD_BOUND_BEHAVIORS = ("approach_ball", "kick")
 # than paused, and an emote may have the beak back.
 MOUTH_HELD_S = 0.5
 
+# ---------- the desktop pet ----------
+# The duck on the Dock (notes/desktop-pet.md). The overlay app is a *viewer*:
+# it owns no animation data, only a window that travels. Everything below is
+# the sim half — the cutout frames, the pose the window is placed from, and
+# the world the app configures from the screen it is drawn on.
+#
+# The mapping, in one line: sim world x -> screen x at `px_per_meter`, sim
+# world z=0 -> the Dock's top edge. It holds exactly because the pet camera is
+# ORTHOGRAPHIC (metres-per-pixel is fovy/height, at every depth, everywhere in
+# frame), which is also why a platform box can stand in for a real window's
+# ledge without drifting off it towards the edges of the screen.
+
+# The geoms scene_desktop.xml pre-allocates for the pet to move around. Named,
+# never indexed: the mouth mocap plate shifts geom ids at load (G20).
+PET_WALL_GEOMS = ("pet_wall_left", "pet_wall_right")      # screen edges, ±x
+PET_RAIL_GEOMS = ("pet_rail_near", "pet_rail_far")        # depth corridor, ±y
+PET_PLATFORM_GEOMS = tuple(f"pet_platform_{i:02d}" for i in range(12))
+# Where an unused platform box waits: past the rails, out of every contact
+# pair, and (because scene_desktop.xml pins <statistic>) unable to inflate the
+# model extent that the near/far clipping planes are derived from.
+PET_PARK_POS = (0.0, 10.0, 0.5)
+PET_PARK_SIZE = (0.05, 0.15, 0.02)
+# Walls and rails: 0.60 m of box, two centimetres of it underground so the
+# ground line has no seam. Must match scene_desktop.xml's wall/rail sizes.
+PET_SOLID_HALF_H = 0.30
+PET_SOLID_SINK = 0.02
+PET_PLATFORM_DEPTH_M = 0.30   # default y extent of a ledge: wide enough to
+                              # walk along, narrow enough to fall off
+
+# Duck geometry, measured off the model (mesh vertices, STAND keyframe,
+# excluding the floor and the unposed mouth plate): 0.2744 m floor to crown.
+# A ~180 pt pet on a 1728 pt screen therefore wants 656 px/m, and that is the
+# whole reason for every default below.
+DUCK_HEIGHT_M = 0.2744
+PET_PX_PER_METER = 656.0
+PET_FRAME_PX = 300            # the overlay window's edge, in points
+PET_SUPERSAMPLE = 2           # render 2x, box-downsample: real antialiasing on
+                              # the alpha (the segmentation mask is hard-edged)
+                              # and a Retina-native frame at backingScale 2.0
+PET_SCREEN_WIDTH_M = 1728.0 / PET_PX_PER_METER  # one built-in display, points
+PET_CORRIDOR_M = 0.35         # half-width of the depth corridor the rails make
+PET_FLOOR_PAD_PX = 26         # output px between the sim floor line and the
+                              # bottom of the frame — the duck's feet want a
+                              # little room before the window ends
+PET_CAM_DISTANCE_M = 1.0      # orthographic: sets depth only, never scale
+PET_CAM_AZIMUTH_DEG = 90.0    # camera at -y looking +y, so +world x is screen
+                              # right and the duck walks the way it drives
+PET_CAM_ELEVATION_DEG = 0.0
+PET_FRAME_MIN_PX, PET_FRAME_MAX_PX = 32, 512
+PET_OFFSCREEN_MAX_PX = 1024   # scene_desktop.xml's <global offwidth/offheight>
+# How many live `mujoco.Renderer`s to keep. A Renderer owns a GL context and an
+# MjrContext: cheap to hold, ~50 ms to build. Keyed on render size, so two
+# consumers asking for different sizes (the overlay at 512, a `duck pet frame
+# --size-px 300` diagnostic beside it) each keep their own instead of tearing
+# the other's down and rebuilding it on the 50 Hz sim thread every frame —
+# measured, that alternation cost 93-117 ms a frame against 42-45 ms steady.
+PET_RENDERER_CACHE = 3
+# The pet world is one screen's worth of floor. `<statistic extent="0.6">` is
+# pinned in scene_desktop.xml and every clipping plane is derived from it, so a
+# ledge is metres, never kilometres and never inf — a non-finite half-extent
+# lands in geom_rbound and swallows the duck whole (measured).
+PET_WORLD_MAX_M = 20.0
+# The chroma fallback key, when segmentation rendering is unavailable: the
+# backdrop's exact magenta, which nothing on the duck comes near.
+PET_CHROMA_RGB = (255, 0, 255)
+PET_CHROMA_TOL = 60
+PET_PUSH_MAX = 2.0            # same clamp the `push` intent already applies
+                              # horizontally, now also on the vertical axis
+                              # a drag gesture can reach (webui._pet_push)
+# How long an MCP intent keeps the duck "inhabited" on the pet's status line.
+# Long enough to survive Claude thinking between two tool calls, short enough
+# that a finished residency stops claiming the wheel.
+PET_INHABITED_S = 8.0
+# Polls, not intents: these never count as somebody taking the wheel, and they
+# never reach the AX event feed (a 20 fps frame stream would flush it in
+# fifteen seconds — G18).
+PET_AMBIENT_CMDS = ("pet_frame", "pet_state")
+
 
 def load_infer_policy_module(rl_repo: str):
     """Import microduck_rl's scripts/infer_policy.py as a module."""
@@ -181,15 +269,69 @@ def load_infer_policy_module(rl_repo: str):
     return mod
 
 
-def load_model_with_mouth(xml_path: str):
+def local_scenes_dir() -> str:
+    """Where this repo's `scenes/` lives.
+
+    The same ladder `--emotes` walks, two rungs longer: an explicit env
+    override, then the copy inside the installed package (pyproject
+    force-includes `scenes/` as `microduck_mcp/scenes`, so a wheel is not a
+    daemon that cannot open `--scene desktop`), then the checkout the package
+    is running out of (so a dev daemon started from anywhere still finds the
+    editable one), then the working directory.
+    """
+    env = os.environ.get("DUCK_SCENES")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    here = os.path.dirname(os.path.abspath(__file__))  # src/microduck_mcp
+    packaged = os.path.join(here, "scenes")
+    if os.path.isdir(packaged):
+        return packaged
+    repo = os.path.abspath(os.path.join(here, os.pardir, os.pardir, "scenes"))
+    if os.path.isdir(repo):
+        return repo
+    return os.path.abspath("scenes")
+
+
+def local_scene_xml(name: str, rl_repo: str) -> tuple[str, str]:
+    """Read one of LOCAL_SCENES and bind it to this microduck_rl clone.
+
+    Returns (xml_text, template_path). The template names the robot MJCF and
+    its mesh directory as @ROBOT_XML@ / @MESHDIR@ because neither can be
+    reached relatively from outside microduck_rl: MuJoCo resolves an <include>
+    against the including file but `meshdir` against the MAIN file, so a scene
+    over here would need two different relative roots and gets neither.
+    """
+    path = os.path.join(local_scenes_dir(), LOCAL_SCENES[name])
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"scene template {LOCAL_SCENES[name]!r} not found at {path} — set "
+            "DUCK_SCENES to microduck-mcp's scenes/ directory")
+    robot = os.path.join(os.path.abspath(os.path.expanduser(rl_repo)),
+                         ROBOT_XML_REL)
+    if not os.path.isfile(robot):
+        raise FileNotFoundError(
+            f"robot MJCF not found at {robot} — pass --rl-repo pointing at a "
+            "clone of https://github.com/pollen-robotics/microduck_rl")
+    with open(path) as f:
+        text = f.read()
+    text = text.replace("@ROBOT_XML@", robot)
+    text = text.replace("@MESHDIR@", os.path.join(os.path.dirname(robot), "assets"))
+    return text, path
+
+
+def load_model_with_mouth(xml_path: str, xml_text: str | None = None):
     """Compile the scene with the mouth plate moved onto a mocap body.
 
     Returns (model, mouth_ok). Any failure — an MJCF without the head body or
     plate mesh, an older mujoco without MjSpec — falls back to the stock model
     with the mouth disabled, never a broken sim.
+
+    `xml_text` compiles an in-memory scene (a bound LOCAL_SCENES template)
+    instead of a file; `xml_path` is then only what gets printed and blamed.
     """
     try:
-        spec = mujoco.MjSpec.from_file(xml_path)
+        spec = (mujoco.MjSpec.from_string(xml_text) if xml_text is not None
+                else mujoco.MjSpec.from_file(xml_path))
         plate = None
         for body in spec.bodies:
             if body.name == MOUTH_BODY:
@@ -209,6 +351,8 @@ def load_model_with_mouth(xml_path: str):
         return spec.compile(), True
     except Exception as e:
         print(f"note: mouth disabled ({e}) — loading stock model")
+        if xml_text is not None:
+            return mujoco.MjModel.from_xml_string(xml_text), False
         return mujoco.MjModel.from_xml_path(xml_path), False
 
 
@@ -431,9 +575,28 @@ class DuckSim:
 
         ip = load_infer_policy_module(self.rl_repo)
 
-        xml_path = os.path.join(self.rl_repo, SCENES[scene])
+        # Three kinds of scene, one normalized key. `scene_key` is what the
+        # rest of __init__ branches on, so a scene that arrives as a path or
+        # as one of this repo's own templates still lands in the right
+        # "has a ball / has a goal / has neither" branch.
+        self.scene = scene
+        xml_text = None
+        if scene in LOCAL_SCENES:
+            self.scene_key = scene
+            xml_text, xml_path = local_scene_xml(scene, self.rl_repo)
+        elif scene.endswith(".xml"):
+            xml_path = os.path.abspath(os.path.expanduser(scene))
+            self.scene_key = os.path.splitext(os.path.basename(xml_path))[0]
+        elif scene in SCENES:
+            self.scene_key = scene
+            xml_path = os.path.join(self.rl_repo, SCENES[scene])
+        else:
+            raise ValueError(
+                f"unknown scene {scene!r} — choose from "
+                f"{', '.join(sorted(SCENES) + sorted(LOCAL_SCENES))}, or pass "
+                "a path to an .xml")
         print(f"Loading MuJoCo model: {xml_path}")
-        self.model, mouth_ok = load_model_with_mouth(xml_path)
+        self.model, mouth_ok = load_model_with_mouth(xml_path, xml_text)
         self.model.opt.timestep = TIMESTEP
         self.data = mujoco.MjData(self.model)
         self._apply_current_limit(DEFAULT_CURRENT_LIMIT)
@@ -447,7 +610,8 @@ class DuckSim:
                 paths[role] = p
             else:
                 print(f"note: no {role} policy at {p} — skipping")
-        if scene == "plain":
+        if self.scene_key == "plain" or self.scene_key in LOCAL_SCENES:
+            # No ball to kick: don't spend the load time or the memory.
             paths.pop("kick_left", None)
             paths.pop("kick_right", None)
         # Which file each role is running RIGHT NOW — kept true across live
@@ -481,7 +645,7 @@ class DuckSim:
         self.data.qpos[self.qpos_adr + 3:self.qpos_adr + 7] = [1, 0, 0, 0]
         for i, qi in enumerate(self.policy.joint_qpos_indices):
             self.data.qpos[qi] = self.policy.default_pose[i]
-        if scene == "pitch" and self.policy.ball_qpos_adr is not None:
+        if self.scene_key == "pitch" and self.policy.ball_qpos_adr is not None:
             # Kickoff from a metre out, not the scene's point-blank penalty
             # spot — snapshot before _qpos0 so reset restarts the match here.
             ba = self.policy.ball_qpos_adr
@@ -544,6 +708,58 @@ class DuckSim:
                 self.model, mujoco.mjtObj.mjOBJ_BODY, MOUTH_BODY)
             self.mouth_tick()  # park the plate on the head before first render
             mujoco.mj_forward(self.model, self.data)
+        # The desktop pet's own renderer, world and screen mapping. All of it
+        # is inert on a scene without the pet geoms — `pet_*` commands then
+        # refuse with the scene's name rather than half-working.
+        self.pet = self._pet_default_config()
+        # Every movable pet part is a mocap body wearing a same-named geom:
+        # the geom id carries the size, the mocap id carries the pose.
+        self._pet_geoms, self._pet_mocap = {}, {}
+        for name in PET_WALL_GEOMS + PET_RAIL_GEOMS + PET_PLATFORM_GEOMS:
+            self._pet_geoms[name] = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+            self._pet_mocap[name] = (int(self.model.body_mocapid[bid])
+                                     if bid >= 0 else -1)
+        self.pet_scene = all(self._pet_geoms[n] >= 0 and self._pet_mocap[n] >= 0
+                             for n in PET_WALL_GEOMS)
+        # Which geoms ARE the duck, resolved once, by name, at load (G20: the
+        # mouth plate shifts ids). Everything on the worldbody is scenery and
+        # everything on a pet mocap body is invisible furniture; what is left
+        # is robot. The frame's alpha is this array and nothing else, so a
+        # future visible prop cannot accidentally become part of the duck.
+        pet_bodies = {int(self.model.geom_bodyid[self._pet_geoms[n]])
+                      for n in self._pet_geoms if self._pet_geoms[n] >= 0}
+        self._pet_duck_geom = np.array(
+            [int(self.model.geom_bodyid[g]) != 0
+             and int(self.model.geom_bodyid[g]) not in pet_bodies
+             for g in range(self.model.ngeom)], dtype=bool)
+        # render_px -> Renderer, most-recently-used last (see
+        # PET_RENDERER_CACHE). `_pet_renderer` is whichever one the frame in
+        # hand is being drawn with — `_pet_alpha` renders through it.
+        self._pet_renderers = {}
+        self._pet_renderer = None
+        self._pet_renderer_px = 0
+        self._pet_option = None
+        # Did a caller pin `wall_margin_m`? Until one does, the margin tracks
+        # the window size; once one has, a later config that does not mention
+        # it must LEAVE IT ALONE. `duck pet config` with no flags is documented
+        # as a read (client.py), and silently walking the walls back to half a
+        # window would put them inside the arc pet.toml turns around in.
+        self._pet_wall_pinned = False
+        # Segmentation gives an exact duck mask; if this host cannot do a
+        # second pass we fall back to keying the backdrop's magenta, and say
+        # so in pet_state rather than silently shipping a worse cutout.
+        self._pet_seg_ok = True
+        self._pet_cache = None  # (key, png bytes, w, h) for one sim tick
+        if self.pet_scene:
+            self._pet_apply_world_geometry()
+        # Who has the wheel. Set by drain_requests when an MCP client sends an
+        # intent (not a poll) — the pet's "Claude is driving" light, and the
+        # only place the sim cares which client is talking.
+        self._mcp_intent_t = 0.0
+        self._mcp_intent_cmd = None
+
         # Command-feed ring buffer for the AX debug page (webui.py).
         self.events = deque(maxlen=500)
         self._event_id = 0
@@ -1221,7 +1437,17 @@ class DuckSim:
             angle = math.radians(req["angle_deg"]) if "angle_deg" in req else random.uniform(0, 2 * math.pi)
             self.data.qvel[self.qvel_adr + 0] = mag * math.cos(angle)
             self.data.qvel[self.qvel_adr + 1] = mag * math.sin(angle)
-            return {"ok": True, "pushed": {"magnitude": mag, "angle_deg": round(math.degrees(angle), 1)}}
+            pushed = {"magnitude": mag, "angle_deg": round(math.degrees(angle), 1)}
+            # Optional vertical component. The desktop pet's drag gesture
+            # happens in a side view, where "up the screen" is world +z and a
+            # shove that cannot lift the duck is only half a shove. Absent, the
+            # vertical velocity is left exactly as the physics had it — the
+            # horizontal push has behaved this way since it was written.
+            if req.get("vz") is not None:
+                vz = float(np.clip(req["vz"], -PET_PUSH_MAX, PET_PUSH_MAX))
+                self.data.qvel[self.qvel_adr + 2] = vz
+                pushed["vz"] = round(vz, 3)
+            return {"ok": True, "pushed": pushed}
         if cmd == "mouth":
             # robot.mouth semantics: a continuous opening intent, clamped.
             # Ambient (streamed at ~40 Hz by `duck say`), so _log_event skips
@@ -1251,6 +1477,14 @@ class DuckSim:
             return self._handle_machine(req)
         if cmd == "policy":
             return self._handle_policy(req)
+        if cmd == "pet_frame":
+            return self._handle_pet_frame(req)
+        if cmd == "pet_state":
+            return self._handle_pet_state(req)
+        if cmd == "pet_config":
+            return self._handle_pet_config(req)
+        if cmd == "pet_world":
+            return self._handle_pet_world(req)
         return {"ok": False, "error": f"unknown cmd {cmd!r}"}
 
     def _handle_chirp(self, tag: str) -> dict:
@@ -1421,6 +1655,11 @@ class DuckSim:
         self.mouth_tick()
         mujoco.mj_forward(self.model, self.data)
         self.sim_time = 0.0
+        # The pet's one-tick frame cache is keyed on sim_time, and the clock
+        # just rewound onto a tick it may already have a picture of. (The
+        # pet's WORLD — walls, ledges — is deliberately not reset: it belongs
+        # to the screen, not the episode.)
+        self._pet_cache = None
         self._det_step = 0
         self._ball_seen = dict(NOT_SEEN)
         self._ball_seen_t = 0.0
@@ -1491,6 +1730,514 @@ class DuckSim:
             return {"ok": False, "error": f"render failed: {e} "
                     "(offscreen rendering may be unavailable under mjpython; use headless mode)"}
 
+    # ---------- the desktop pet (sim thread only) ----------
+    # Four verbs, and between them the whole sim half of the overlay:
+    #   pet_config  what screen the duck is living on -> where the walls go
+    #   pet_world   what is on that screen -> where the platform ledges go
+    #   pet_frame   a cutout of the duck, alpha and all, plus the pose
+    #   pet_state   the pose alone, for when a frame would be wasteful
+    # `pet_frame` deliberately carries the full pet state: the window has to
+    # be moved to match the frame it is showing, and one submit costs a 20 ms
+    # tick, so asking for the pose separately would halve the frame rate to
+    # learn something the render already knew.
+
+    def _pet_default_config(self) -> dict:
+        return {
+            "px_per_meter": PET_PX_PER_METER,
+            "frame_px": PET_FRAME_PX,
+            "supersample": PET_SUPERSAMPLE,
+            "screen_width_m": PET_SCREEN_WIDTH_M,
+            # Half a window: the duck stops with its whole window on screen
+            # rather than with its nose against the bezel.
+            "wall_margin_m": PET_FRAME_PX / (2 * PET_PX_PER_METER),
+            "corridor_m": PET_CORRIDOR_M,
+            "floor_pad_px": PET_FLOOR_PAD_PX,
+            "camera_distance_m": PET_CAM_DISTANCE_M,
+            "azimuth_deg": PET_CAM_AZIMUTH_DEG,
+            "elevation_deg": PET_CAM_ELEVATION_DEG,
+        }
+
+    def _pet_wall_x(self) -> float:
+        """Where the invisible screen edges stand, in metres from the origin."""
+        return max(0.05, self.pet["screen_width_m"] / 2
+                   - self.pet["wall_margin_m"])
+
+    def _pet_set_geom(self, name: str, pos, size=None):
+        """Move (and optionally resize) one piece of the pet's world, live.
+
+        The pose goes through mjData.mocap_pos, NOT mjModel.geom_pos: a geom
+        hanging off the worldbody keeps the compile-time bounding volume that
+        the broadphase culls against, so moving one moves its picture and
+        silently retires its physics (measured — see scene_desktop.xml).
+        Every movable pet part is therefore its own mocap body.
+
+        The size does go through the model, and takes geom_rbound and
+        geom_aabb with it: MuJoCo derives both from the size at compile time
+        and never revisits them, so a box you grew would stop generating
+        contacts past its old bounding sphere.
+        """
+        gid = self._pet_geoms.get(name, -1)
+        mid = self._pet_mocap.get(name, -1)
+        if gid < 0 or mid < 0:
+            return False
+        self.data.mocap_pos[mid] = pos
+        if size is not None:
+            self.model.geom_size[gid] = size
+            self.model.geom_rbound[gid] = float(np.linalg.norm(size))
+            self.model.geom_aabb[gid] = [0.0, 0.0, 0.0, *size]
+        return True
+
+    def _pet_apply_world_geometry(self):
+        """Put the walls at the screen edges and the rails around the walkway.
+
+        Sunk PET_SOLID_SINK below the floor so there is no seam at the
+        ground line for a toe to catch (the walls are 0.60 m of box; two
+        centimetres of it can live underground).
+        """
+        half = self._pet_wall_x()
+        z = PET_SOLID_HALF_H - PET_SOLID_SINK
+        for name, sign in zip(PET_WALL_GEOMS, (-1.0, 1.0)):
+            self._pet_set_geom(name, [sign * half, 0.0, z])
+        for name, sign in zip(PET_RAIL_GEOMS, (-1.0, 1.0)):
+            self._pet_set_geom(name, [0.0, sign * self.pet["corridor_m"], z])
+
+    def _pet_not_a_pet_scene(self) -> dict:
+        return {"ok": False, "error":
+                f"scene {self.scene!r} has no pet geoms — start duck-sim with "
+                "--scene desktop (scenes/scene_desktop.xml)"}
+
+    def _pet_config_state(self) -> dict:
+        p = self.pet
+        half = self._pet_wall_x()
+        frame_px = p["frame_px"]
+        return {
+            **p,
+            "render_px": frame_px * p["supersample"],
+            "view_height_m": frame_px / p["px_per_meter"],
+            "walls_m": [-half, half],
+            "duck_height_m": DUCK_HEIGHT_M,
+            "duck_height_px": DUCK_HEIGHT_M * p["px_per_meter"],
+            "platform_capacity": len(PET_PLATFORM_GEOMS),
+            "segmentation": self._pet_seg_ok,
+        }
+
+    def _handle_pet_config(self, req: dict) -> dict:
+        """Tell the sim what screen it is being drawn on.
+
+        The app measures the screen (NSScreen.visibleFrame) and picks how big
+        the duck should look; everything else — where the walls stand, how
+        many metres of floor the screen is worth, what the camera's view
+        height has to be — falls out of that. Sending it again is how a Dock
+        resize or a display change is handled: no restart, no reset, the duck
+        keeps walking while the world it is walking in changes shape.
+
+        A call that names no key at all is a READ: it answers with the config
+        and touches nothing. `duck pet config` with no flags is exactly that
+        call (client.py sends only the keys it was given), and a "read" that
+        moved the walls and ran an mj_forward would be a trap.
+        """
+        if not self.pet_scene:
+            return self._pet_not_a_pet_scene()
+        wanted = dict(self.pet)
+        bounds = {
+            "px_per_meter": (50.0, 8000.0),
+            "frame_px": (PET_FRAME_MIN_PX, PET_FRAME_MAX_PX),
+            "supersample": (1, 3),
+            "screen_width_m": (0.2, 40.0),
+            "wall_margin_m": (0.0, 5.0),
+            "corridor_m": (0.05, 5.0),
+            "floor_pad_px": (0, PET_FRAME_MAX_PX // 2),
+            "camera_distance_m": (0.2, 20.0),
+            "azimuth_deg": (-360.0, 360.0),
+            "elevation_deg": (-89.0, 89.0),
+        }
+        if not (set(bounds) | {"screen_width_px"}) & set(req):
+            return {"ok": True, "config": self._pet_config_state(),
+                    "note": f"walls at ±{self._pet_wall_x():.3f} m (read only)"}
+        for key, (lo, hi) in bounds.items():
+            if key not in req:
+                continue
+            try:
+                val = float(req[key])
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"{key} must be a number, "
+                        f"got {req[key]!r}"}
+            if not lo <= val <= hi:
+                return {"ok": False, "error":
+                        f"{key}={val} out of range [{lo}, {hi}]"}
+            wanted[key] = (int(val) if key in ("frame_px", "supersample",
+                                               "floor_pad_px") else val)
+        # A screen width in points is what the app actually has; converting it
+        # here keeps the one division in one place.
+        if "screen_width_px" in req:
+            try:
+                px = float(req["screen_width_px"])
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "screen_width_px must be a number"}
+            if not 100.0 <= px <= 40000.0:
+                return {"ok": False, "error": f"screen_width_px={px} out of range"}
+            wanted["screen_width_m"] = px / wanted["px_per_meter"]
+        if "wall_margin_m" in req:
+            # Pinned. It stays pinned: the overlay sends one duck-depth on the
+            # first config and then only ever re-sends the screen, and a later
+            # partial config must not walk the walls back inside the arc the
+            # machine turns around in (notes/desktop-pet.md's last bullet).
+            self._pet_wall_pinned = True
+        elif not self._pet_wall_pinned:
+            # Nobody has an opinion yet, so track the window size.
+            wanted["wall_margin_m"] = wanted["frame_px"] / (2 * wanted["px_per_meter"])
+        if wanted["frame_px"] * wanted["supersample"] > PET_OFFSCREEN_MAX_PX:
+            return {"ok": False, "error":
+                    f"frame_px*supersample = "
+                    f"{wanted['frame_px'] * wanted['supersample']} exceeds the "
+                    f"{PET_OFFSCREEN_MAX_PX} px offscreen framebuffer"}
+        # No renderer invalidation here: they are cached by render size
+        # (PET_RENDERER_CACHE), so a resize picks up the right one — or builds
+        # it — and the old one stays warm for whoever is still asking for it.
+        self.pet = wanted
+        self._pet_apply_world_geometry()
+        self._pet_cache = None
+        mujoco.mj_forward(self.model, self.data)  # walls move now, not next tick
+        return {"ok": True, "config": self._pet_config_state(),
+                "note": f"walls at ±{self._pet_wall_x():.3f} m"}
+
+    def _handle_pet_world(self, req: dict) -> dict:
+        """Reposition the pre-allocated platform boxes from screen rectangles.
+
+        This is the window-ledge lane (notes/desktop-pet.md, "parked for v2"):
+        the app mirrors real window frames in, and the duck stands on, walks
+        along and falls off them with real contacts. Rectangles are in the
+        SAME screen-space metres as everything else — x rightwards from the
+        origin, y upwards from the Dock's top edge — with (x, y) the bottom
+        left corner, because that is the shape a window rect arrives in.
+
+        The list is the whole world, not a patch: every box the call does not
+        name goes back to the parking lot. That way a window closing on the
+        real desktop cannot leave a ledge hanging in the sim.
+        """
+        if not self.pet_scene:
+            return self._pet_not_a_pet_scene()
+        rects = req.get("rects", [])
+        if not isinstance(rects, list):
+            return {"ok": False, "error": "rects must be a list of "
+                    "{x, y, w, h} rectangles in metres"}
+        if len(rects) > len(PET_PLATFORM_GEOMS):
+            return {"ok": False, "error":
+                    f"{len(rects)} rectangles but only "
+                    f"{len(PET_PLATFORM_GEOMS)} platform boxes are "
+                    "pre-allocated (scene_desktop.xml) — send the nearest ones"}
+        placed = []
+        for i, r in enumerate(rects):
+            if not isinstance(r, dict):
+                return {"ok": False, "error": f"rect {i} is not an object"}
+            try:
+                x, y = float(r["x"]), float(r["y"])
+                w, h = float(r["w"]), float(r["h"])
+                depth = float(r.get("depth_m", PET_PLATFORM_DEPTH_M))
+            except (KeyError, TypeError, ValueError):
+                return {"ok": False, "error":
+                        f"rect {i} needs numeric x, y, w, h (metres)"}
+            # Range check every number, the way _handle_pet_config does, and
+            # for a harder reason: this path writes model.geom_size and with
+            # it geom_rbound and geom_aabb. `json.loads` accepts `Infinity`
+            # and `1e400`, and inf > 0 is True — an infinite half-extent is a
+            # box that contains the whole world, and the duck sinks into it
+            # (measured: base z 0.116 -> 0.051 over 500 steps) with no way
+            # back short of another POST, because `reset` deliberately leaves
+            # the pet world alone.
+            if not all(math.isfinite(v) for v in (x, y, w, h, depth)):
+                return {"ok": False, "error":
+                        f"rect {i} has a non-finite value: x={x} y={y} w={w} "
+                        f"h={h} depth={depth}"}
+            if not (w > 0 and h > 0 and depth > 0):
+                return {"ok": False, "error":
+                        f"rect {i} has a non-positive size: w={w} h={h} "
+                        f"depth={depth}"}
+            if max(abs(x), abs(y), w, h, depth) > PET_WORLD_MAX_M:
+                return {"ok": False, "error":
+                        f"rect {i} is outside the pet world: every value must "
+                        f"be within ±{PET_WORLD_MAX_M} m (these are metres of "
+                        "screen floor, not pixels)"}
+            size = [w / 2, depth / 2, h / 2]
+            pos = [x + w / 2, 0.0, y + h / 2]
+            self._pet_set_geom(PET_PLATFORM_GEOMS[i], pos, size)
+            placed.append({"geom": PET_PLATFORM_GEOMS[i], "center_m": pos,
+                           "half_size_m": size})
+        for name in PET_PLATFORM_GEOMS[len(rects):]:
+            self._pet_set_geom(name, list(PET_PARK_POS), list(PET_PARK_SIZE))
+        self._pet_cache = None
+        mujoco.mj_forward(self.model, self.data)
+        return {"ok": True, "placed": placed,
+                "parked": len(PET_PLATFORM_GEOMS) - len(placed),
+                "capacity": len(PET_PLATFORM_GEOMS)}
+
+    def _pet_inhabited(self):
+        """Is an MCP client driving right now, and how long since it spoke?"""
+        if not self._mcp_intent_t:
+            return False, None, None
+        age = time.time() - self._mcp_intent_t
+        return age < PET_INHABITED_S, round(age, 2), self._mcp_intent_cmd
+
+    def _handle_pet_state(self, req: dict = None) -> dict:
+        """Everything the overlay window needs to place and label itself.
+
+        Unrounded, unlike get_state(): position_m is rounded to a millimetre
+        for humans, and a millimetre is two thirds of a pixel of window jitter
+        at 656 px/m. Nothing else reads these fields, so they can be honest.
+        """
+        adr, vadr = self.qpos_adr, self.qvel_adr
+        pos = self.data.qpos[adr:adr + 3]
+        _, _, yaw = quat_to_rpy(self.data.qpos[adr + 3:adr + 7])
+        proj_g = self.policy.get_projected_gravity()
+        upright = bool(proj_g[2] < -0.7)
+        inhabited, age_s, cmd = self._pet_inhabited()
+        p = self.pet
+        return {
+            "ok": True,
+            "sim_time_s": self.sim_time,
+            # The pose is real on any scene; the walls and ledges are not.
+            # pet_frame/config/world refuse elsewhere, but a pose is a pose,
+            # so this one answers and says which world it is answering about.
+            "pet_scene": self.pet_scene,
+            "base_x_m": float(pos[0]),
+            "base_y_m": float(pos[1]),
+            "base_z_m": float(pos[2]),
+            "heading_deg": math.degrees(yaw),
+            "vel_world_mps": [float(v) for v in self.data.qvel[vadr:vadr + 3]],
+            "upright": upright,
+            "fallen": not upright,
+            "sitting": bool(self.policy.sit_mode),
+            "active_policy": self.policy.current_policy,
+            "behavior": self.policy.behavior_mode,
+            "vel_cmd": [float(v) for v in self.policy.vel_cmd],
+            "machine": ({"name": self.machine.name, "armed": self.machine.armed,
+                         "node": self.machine.current}
+                        if self.machine is not None else None),
+            # "Claude has the wheel" — an MCP intent inside PET_INHABITED_S.
+            "inhabited": inhabited,
+            "inhabited_age_s": age_s,
+            "inhabited_cmd": cmd,
+            # Precomputed screen mapping, so the app does no arithmetic it
+            # could get subtly out of step with the renderer's.
+            "screen": {
+                "center_offset_px": float(pos[0]) * p["px_per_meter"],
+                "floor_px_from_bottom": p["floor_pad_px"],
+                "px_per_meter": p["px_per_meter"],
+                "frame_px": p["frame_px"],
+            },
+            "config": self._pet_config_state(),
+        }
+
+    def _pet_camera(self, size_px: int = None) -> "mujoco.MjvCamera":
+        """The tracking camera: centred on the duck, level with the world.
+
+        lookat.x follows the duck so it is always in the middle of its window
+        (the WINDOW is what travels); lookat.z does NOT follow, or the Dock's
+        edge would slide up and down the frame and a stumble would look like
+        a camera move instead of a fall. lookat.y follows only to keep the
+        duck inside the depth clip — under orthographic it changes nothing on
+        screen, which is exactly why the side view can be trusted.
+
+        `size_px` is the frame actually being rendered, which is not always
+        the configured one: `/pet/frame?size_px=` can ask for another. Framing
+        off the config instead would leave the floor line somewhere other than
+        `floor_pad_px` up from the bottom, and `pet_state.screen` — which is
+        what the app hangs the window off — would be quietly describing a
+        different picture.
+        """
+        p = self.pet
+        cam = mujoco.MjvCamera()
+        pos = self.data.qpos[self.qpos_adr:self.qpos_adr + 3]
+        # World z of the frame's centre: put the floor `floor_pad_px` above
+        # the bottom edge and everything else follows.
+        floor_from_center_px = (size_px or p["frame_px"]) / 2 - p["floor_pad_px"]
+        cam.lookat[:] = [float(pos[0]), float(pos[1]),
+                         floor_from_center_px / p["px_per_meter"]]
+        cam.distance = p["camera_distance_m"]
+        cam.azimuth = p["azimuth_deg"]
+        cam.elevation = p["elevation_deg"]
+        return cam
+
+    def _pet_alpha(self, rgb) -> "np.ndarray":
+        """The duck's silhouette, as an alpha channel.
+
+        Segmentation pass: render() returns (H, W, 2) int32 of (object id,
+        object type), so looking each id up in the duck-geom table built at
+        load is the exact cutout — every duck part, nothing of the scene, no
+        colour heuristic to fool. The mouth plate is a body of its own and
+        comes along for free; walls and ledges are excluded by name even
+        though the group cull already keeps them out of the render.
+
+        Chroma fallback for a host that cannot do the second pass: key the
+        backdrop's magenta. Worse (it eats any magenta highlight on the duck)
+        but it is one render instead of two and it never returns a blank duck.
+        """
+        if self._pet_seg_ok:
+            try:
+                self._pet_renderer.enable_segmentation_rendering()
+                try:
+                    seg = self._pet_renderer.render()
+                finally:
+                    self._pet_renderer.disable_segmentation_rendering()
+                ids = np.clip(seg[:, :, 0], 0, self.model.ngeom - 1)
+                is_geom = seg[:, :, 1] == int(mujoco.mjtObj.mjOBJ_GEOM)
+                return ((is_geom & self._pet_duck_geom[ids])
+                        .astype(np.uint8)) * 255
+            except Exception as e:
+                self._pet_seg_ok = False
+                print(f"note: pet segmentation pass disabled ({e}) — falling "
+                      "back to the chroma key")
+        d = np.abs(rgb.astype(np.int16) - np.asarray(PET_CHROMA_RGB, dtype=np.int16))
+        return (~(d.max(axis=2) <= PET_CHROMA_TOL)).astype(np.uint8) * 255
+
+    @staticmethod
+    def _pet_compose(rgb, alpha, ss: int):
+        """Supersampled RGBA -> the frame the window shows.
+
+        Premultiply BEFORE the box filter, or the background bleeds into every
+        edge pixel: the segmentation mask is perfectly binary (measured:
+        np.unique == [0, 255]) while the RGB pass is antialiased against the
+        backdrop, so a naive downsample would fringe the duck magenta. With
+        premultiplied averaging the colour of an edge pixel is the average of
+        the duck pixels that landed in it and nothing else — which is what
+        antialiasing means.
+        """
+        if ss <= 1:
+            return np.dstack([rgb, alpha])
+        h, w = alpha.shape
+        h2, w2 = h // ss, w // ss
+        a = alpha[:h2 * ss, :w2 * ss].astype(np.float32) / 255.0
+        pm = rgb[:h2 * ss, :w2 * ss].astype(np.float32) * a[:, :, None]
+        a = a.reshape(h2, ss, w2, ss).mean(axis=(1, 3))
+        pm = pm.reshape(h2, ss, w2, ss, 3).mean(axis=(1, 3))
+        out = np.clip(pm / np.maximum(a, 1e-6)[:, :, None], 0, 255).astype(np.uint8)
+        return np.dstack([out, np.round(a * 255).astype(np.uint8)])
+
+    def _pet_renderer_for(self, render_px: int) -> "mujoco.Renderer":
+        """The renderer for this size, kept warm — see PET_RENDERER_CACHE.
+
+        A `mujoco.Renderer` is a GL context and an MjrContext; building one
+        costs tens of milliseconds *on the sim thread*, and the previous
+        one-renderer version rebuilt it on every frame as soon as two
+        consumers wanted two sizes. Holding a handful is far cheaper than
+        holding the physics up. The scene option is built once and shared —
+        it does not depend on the size.
+        """
+        r = self._pet_renderers.pop(render_px, None)
+        if r is None:
+            self.model.vis.global_.offwidth = max(
+                int(self.model.vis.global_.offwidth), render_px)
+            self.model.vis.global_.offheight = max(
+                int(self.model.vis.global_.offheight), render_px)
+            r = mujoco.Renderer(self.model, height=render_px, width=render_px)
+        self._pet_renderers[render_px] = r      # move to the MRU end
+        while len(self._pet_renderers) > PET_RENDERER_CACHE:
+            dead = self._pet_renderers.pop(next(iter(self._pet_renderers)))
+            try:
+                dead.close()
+            except Exception:
+                pass
+        if self._pet_option is None:
+            # Group 4 is the invisible world: floor, walls, rails, ledges.
+            # Culling them here rather than making them transparent is the
+            # difference between "not drawn" and "drawn as a hole" — a
+            # transparent wall still occludes the duck in the SEGMENTATION
+            # pass, and the duck would come back with bites taken out of it.
+            self._pet_option = mujoco.MjvOption()
+            self._pet_option.geomgroup[:] = 0
+            for g in (0, 1, 2):
+                self._pet_option.geomgroup[g] = 1
+        return r
+
+    def _handle_pet_frame(self, req: dict) -> dict:
+        """One RGBA cutout of the duck, plus the pose it was taken at.
+
+        Its own renderer, never `self._renderer`: that one is clamped to
+        640x480 and shared with the AX debug page, and toggling segmentation
+        on it would corrupt the page's frames mid-stream.
+
+        Budget: rendering runs on the 50 Hz sim thread, and ~40 fps of it
+        stops physics dead (measured: sim/wall 0.012). The app should stay at
+        or under 25 fps. The one-tick cache below is the cheap insurance — two
+        pollers on one daemon get one render between them instead of two.
+        """
+        if not self.pet_scene:
+            return self._pet_not_a_pet_scene()
+        p = self.pet
+        size = int(req.get("size_px") or p["frame_px"])
+        ss = int(req.get("supersample") or p["supersample"])
+        size = max(PET_FRAME_MIN_PX, min(PET_FRAME_MAX_PX, size))
+        ss = max(1, min(3, ss))
+        render_px = size * ss
+        if render_px > PET_OFFSCREEN_MAX_PX:
+            ss = max(1, PET_OFFSCREEN_MAX_PX // size)
+            render_px = size * ss
+        state = self._handle_pet_state()
+        key = (render_px, ss, self.sim_time, p["px_per_meter"],
+               p["floor_pad_px"], p["camera_distance_m"], p["azimuth_deg"],
+               p["elevation_deg"])
+        if self._pet_cache is not None and self._pet_cache[0] == key:
+            png, w, h, bbox = self._pet_cache[1:]
+            return {**state, "png": png, "width": w, "height": h,
+                    "bbox": bbox, "cached": True, "alpha": "cache"}
+        model = self.model
+        was_ortho = int(model.vis.global_.orthographic)
+        was_fovy = float(model.vis.global_.fovy)
+        try:
+            self._pet_renderer = self._pet_renderer_for(render_px)
+            self._pet_renderer_px = render_px
+            # fovy is degrees under perspective and METRES under orthographic;
+            # both live on the shared model, so borrow and give back. Every
+            # render is on the sim thread, so nothing can look in between.
+            model.vis.global_.orthographic = 1
+            model.vis.global_.fovy = size / p["px_per_meter"]
+            self._pet_renderer.update_scene(self.data,
+                                            camera=self._pet_camera(size),
+                                            scene_option=self._pet_option)
+            rgb = self._pet_renderer.render().copy()
+            alpha = self._pet_alpha(rgb)
+        except Exception as e:
+            return {"ok": False, "error": f"pet render failed: {e} (offscreen "
+                    "rendering is unavailable under mjpython — run the pet "
+                    "daemon headless)"}
+        finally:
+            model.vis.global_.orthographic = was_ortho
+            model.vis.global_.fovy = was_fovy
+        rgba = self._pet_compose(rgb, alpha, ss)
+        buf = io.BytesIO()
+        from PIL import Image
+        # compress_level 1: this is a loopback stream at 20+ fps, so the CPU
+        # spent squeezing the last 20% out of a 30 KB frame is CPU the physics
+        # does not get.
+        Image.fromarray(rgba, "RGBA").save(buf, format="PNG", compress_level=1)
+        png = buf.getvalue()
+        h, w = rgba.shape[:2]
+        bbox = self._pet_bbox(rgba[:, :, 3])
+        self._pet_cache = (key, png, w, h, bbox)
+        return {**state, "png": png, "width": w, "height": h, "bbox": bbox,
+                "cached": False,
+                "alpha": "segmentation" if self._pet_seg_ok else "chroma"}
+
+    @staticmethod
+    def _pet_bbox(alpha):
+        """Where the duck's pixels actually are, in frame pixels, top-left
+        origin, as [x0, y0, x1, y1] half-open.
+
+        The overlay window is a transparent square sitting over the Dock, so
+        it has to decide per cursor position whether to swallow a click or let
+        it fall through to a Dock icon. It can only do that honestly if it
+        knows the silhouette, and the silhouette is already in our hands: the
+        segmentation mask cost nothing extra and two `nonzero` reductions on a
+        binary channel are cheaper than the app scanning the PNG it just
+        decoded. None when the duck is off frame — the app then falls back to
+        its nominal standing box.
+        """
+        cols = np.flatnonzero(alpha.any(axis=0))
+        rows = np.flatnonzero(alpha.any(axis=1))
+        if not cols.size or not rows.size:
+            return None
+        return [int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1]
+
     # ---------- socket plumbing ----------
 
     def submit(self, req: dict, timeout: float = 10.0) -> dict:
@@ -1505,6 +2252,12 @@ class DuckSim:
             except queue.Empty:
                 return
             client = req.pop("client", "cli")
+            if client == "mcp" and req.get("cmd") not in ("state", "ping"):
+                # A mind took the wheel. Polls do not count: watching the duck
+                # is not driving it, and the pet's "inhabited" light saying so
+                # would make it useless. (mcp_server.py tags every request.)
+                self._mcp_intent_t = time.time()
+                self._mcp_intent_cmd = req.get("cmd")
             try:
                 resp = self.handle(req)
             except Exception as e:
@@ -1514,7 +2267,9 @@ class DuckSim:
 
     def _log_event(self, client: str, req: dict, resp: dict):
         cmd = req.get("cmd", "?")
-        if cmd in ("camera_web", "ping", "mouth"):  # ambient traffic, not agent intent
+        # Ambient traffic, not agent intent. The pet polls belong here or a
+        # 20 fps overlay flushes the whole 300-entry feed in fifteen seconds.
+        if cmd in ("camera_web", "ping", "mouth") or cmd in PET_AMBIENT_CMDS:
             return
         if not resp.get("ok"):
             note = resp.get("error", "error")
@@ -1532,6 +2287,13 @@ class DuckSim:
             "args": {k: v for k, v in req.items() if k != "cmd"},
             "ok": bool(resp.get("ok")), "note": note.strip(),
         })
+
+
+def _wire_safe(obj):
+    """Last resort for the JSON-lines control plane: describe, never crash."""
+    if isinstance(obj, (bytes, bytearray)):
+        return f"<{len(obj)} bytes — in-process only, use the /pet HTTP routes>"
+    return repr(obj)
 
 
 def serve_socket(sim: DuckSim, sock_path: str, stop: threading.Event):
@@ -1572,7 +2334,10 @@ def serve_socket(sim: DuckSim, sock_path: str, stop: threading.Event):
                     resp = dispatch(req)
                 except Exception as e:
                     resp = {"ok": False, "error": repr(e)}
-                f.write((json.dumps(resp) + "\n").encode())
+                # `default=` so one handler returning something unencodable
+                # (pet_frame hands the webui raw PNG bytes, which are for
+                # in-process consumers) cannot kill a client's connection.
+                f.write((json.dumps(resp, default=_wire_safe) + "\n").encode())
                 f.flush()
 
     def accept_loop():
@@ -1637,7 +2402,14 @@ def main():
                         help="Directory of ONNX policies (microduck repo's policies/)")
     parser.add_argument("--socket", default=os.environ.get("DUCK_SIM_SOCKET",
                         os.path.join(tempfile.gettempdir(), "microduck-sim.sock")))
-    parser.add_argument("--scene", choices=sorted(SCENES), default="ball")
+    # Not a closed enum any more: `desktop` is this repo's own scene (see
+    # scenes/scene_desktop.xml and LOCAL_SCENES), and a path lets a scene be
+    # tried without editing the server. Unknown names are rejected by
+    # DuckSim.__init__ with the same list argparse would have printed.
+    parser.add_argument("--scene", default="ball", metavar="NAME",
+                        help="scene to load: "
+                             + ", ".join(sorted(SCENES) + sorted(LOCAL_SCENES))
+                             + ", or a path to an .xml (default: ball)")
     parser.add_argument("--frames-dir", default=os.path.join(tempfile.gettempdir(), "microduck-frames"))
     parser.add_argument("--viewer", action="store_true",
                         help="Open the MuJoCo viewer (on macOS run under mjpython)")

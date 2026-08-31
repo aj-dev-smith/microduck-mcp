@@ -148,7 +148,7 @@ class Render(unittest.TestCase):
 
 
 class ShippedEmotes(unittest.TestCase):
-    """The four authored gestures. Their timings are taste; their SIGNS are
+    """The five authored gestures. Their timings are taste; their SIGNS are
     physics, and positive pitch looks down."""
 
     def emote(self, name):
@@ -156,7 +156,8 @@ class ShippedEmotes(unittest.TestCase):
 
     def test_all_of_them_load_and_are_named_for_their_files(self):
         names = EmoteLibrary(EMOTES).names()
-        self.assertEqual(names, ["droop", "head_tilt", "nod", "perk_up"])
+        self.assertEqual(names,
+                         ["droop", "head_tilt", "new_brain", "nod", "perk_up"])
         for name in names:
             with self.subTest(emote=name):
                 self.assertEqual(self.emote(name).name, name)
@@ -184,7 +185,7 @@ class ShippedEmotes(unittest.TestCase):
         self.assertLessEqual(float(y.max()), 0.31)
 
     def test_droop_is_the_only_one_that_opens_the_beak(self):
-        for name in ("nod", "head_tilt", "perk_up"):
+        for name in ("nod", "head_tilt", "perk_up", "new_brain"):
             with self.subTest(emote=name):
                 self.assertEqual(
                     float(np.abs(self.emote(name).render()["mouth"]).max()), 0.0)
@@ -195,7 +196,8 @@ class ShippedEmotes(unittest.TestCase):
     def test_the_sounded_ones_name_bank_tags(self):
         sounds = {n: self.emote(n).sound for n in EmoteLibrary(EMOTES).names()}
         self.assertEqual(sounds, {"droop": "coo", "head_tilt": "inquire",
-                                  "nod": None, "perk_up": "greet"})
+                                  "nod": None, "perk_up": "greet",
+                                  "new_brain": "chirp"})
 
 
 class Library(unittest.TestCase):
