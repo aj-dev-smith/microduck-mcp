@@ -1,0 +1,48 @@
+# new_brain — a policy swap just landed and the duck feels different. Played
+# after `duck_policy swap` succeeds (by whoever did the swapping — the sim
+# doesn't auto-play it; a transplant the resident doesn't acknowledge is just
+# maintenance). Two beats: a quick roll-shake left-right, an animal settling
+# into a body that fits differently than it did a second ago — then the
+# perk_up rise, taller and slower than the startle version, because this
+# isn't surprise, it's trying out the new posture and finding it good.
+#
+# Chirp, not wheee: wheee belongs to a scored goal and the server would veto
+# it anyway. A new brain is a greeting to yourself.
+
+[emote]
+name = "new_brain"
+sound = "chirp"
+
+[[key]]
+t = 0.0
+
+[[key]]
+t = 0.2
+head_roll = 0.18
+ease = "smooth"
+
+[[key]]
+t = 0.5
+head_roll = -0.18
+ease = "smooth"
+
+[[key]]                  # the shake settles — old habits leaving the body
+t = 0.75
+head_roll = 0.0
+ease = "smooth"
+
+[[key]]
+t = 1.2
+neck_pitch = -0.12
+head_pitch = -0.28
+ease = "smooth"
+
+[[key]]                  # standing tall in the new brain, letting it be seen
+t = 2.0
+ease = "hold"
+
+[[key]]
+t = 2.6
+neck_pitch = 0.0
+head_pitch = 0.0
+ease = "smooth"
