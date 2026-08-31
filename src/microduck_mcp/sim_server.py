@@ -450,6 +450,9 @@ class DuckSim:
         if scene == "plain":
             paths.pop("kick_left", None)
             paths.pop("kick_right", None)
+        # Which file each role is running RIGHT NOW — kept true across live
+        # swaps, so `policy list` never has to guess from symlinks on disk.
+        self.policy_paths = {r: os.path.realpath(p) for r, p in paths.items()}
 
         self.policy = ip.PolicyInference(
             self.model, self.data,
@@ -1246,6 +1249,8 @@ class DuckSim:
             return self._handle_reset()
         if cmd == "machine":
             return self._handle_machine(req)
+        if cmd == "policy":
+            return self._handle_policy(req)
         return {"ok": False, "error": f"unknown cmd {cmd!r}"}
 
     def _handle_chirp(self, tag: str) -> dict:
@@ -1311,6 +1316,90 @@ class DuckSim:
             out["ok"] = False
             out["error"] = f"{name} refused (busy: policy={p.current_policy}, sitting={p.sit_mode})"
         return out
+
+    # Where PolicyInference keeps each role's ONNX session. The sitstand role
+    # lands in sit_session (with is_sitstand=True) — infer_policy's legacy
+    # naming, papered over here so the wire protocol speaks roles only.
+    POLICY_SESSION_ATTRS = {
+        "walking": "walking_session",
+        "standing": "standing_session",
+        "sitstand": "sit_session",
+        "ground_pick": "ground_pick_session",
+    }
+    BEHAVIOR_ROLES = ("kick_left", "kick_right", "roulade")
+
+    def _policy_session(self, role):
+        p = self.policy
+        if role in self.POLICY_SESSION_ATTRS:
+            return getattr(p, self.POLICY_SESSION_ATTRS[role])
+        if role in self.BEHAVIOR_ROLES:
+            return p.behavior_sessions.get(role)
+        return None
+
+    def _handle_policy(self, req: dict) -> dict:
+        """Inspect or hot-swap the ONNX brains, on a live sim.
+
+        The train→export→swap loop ends here: a freshly exported checkpoint
+        goes into a running body without a restart, and a bad one is undone
+        with one more swap (the reply carries the path it displaced). The
+        contract that makes that safe: the new session is BUILT AND VALIDATED
+        off to the side first — if the file is missing, malformed, or speaks a
+        different obs width than the incumbent, the refusal arrives before
+        anything is touched and the old brain never stops flying. Runs on the
+        sim thread like every handler, so the rebind lands between physics
+        steps, never mid-inference.
+        """
+        p = self.policy
+        action = req.get("action", "list")
+        roles = list(self.POLICY_SESSION_ATTRS) + list(self.BEHAVIOR_ROLES)
+        if action == "list":
+            slots = []
+            for role in roles:
+                sess = self._policy_session(role)
+                slots.append({
+                    "role": role,
+                    "loaded": sess is not None,
+                    "file": self.policy_paths.get(role),
+                    "obs_dim": int(sess.get_inputs()[0].shape[-1]) if sess else None,
+                })
+            return {"ok": True, "active_policy": p.current_policy, "slots": slots}
+        if action != "swap":
+            return {"ok": False, "error": f"unknown policy action {action!r} (list, swap)"}
+
+        role = req.get("role", "")
+        if role not in roles:
+            return {"ok": False, "error": f"unknown role {role!r} ({', '.join(roles)})"}
+        path = os.path.realpath(os.path.expanduser(str(req.get("path", ""))))
+        if not os.path.isfile(path):
+            return {"ok": False, "error": f"no ONNX file at {path}"}
+        import onnxruntime as ort
+        try:
+            sess = ort.InferenceSession(path)
+        except Exception as e:
+            return {"ok": False, "error": f"ONNX load failed, incumbent untouched: {e}"}
+        obs_dim = int(sess.get_inputs()[0].shape[-1])
+        incumbent = self._policy_session(role)
+        if incumbent is not None:
+            want = int(incumbent.get_inputs()[0].shape[-1])
+            if obs_dim != want:
+                return {"ok": False, "error":
+                        f"obs contract mismatch: {role} runs {want}D, "
+                        f"{os.path.basename(path)} wants {obs_dim}D — refused, "
+                        "incumbent untouched"}
+        if role in self.POLICY_SESSION_ATTRS:
+            setattr(p, self.POLICY_SESSION_ATTRS[role], sess)
+            if role == "sitstand":
+                p.is_sitstand = True
+        else:
+            p.behavior_sessions[role] = sess
+        previous = self.policy_paths.get(role)
+        self.policy_paths[role] = path
+        print(f"policy swap: {role} ← {path}" +
+              (f" (was {previous})" if previous else ""))
+        return {"ok": True, "role": role, "file": path, "obs_dim": obs_dim,
+                "previous": previous,
+                "active_policy": p.current_policy,
+                "note": "live next control tick; swap back by passing `previous`"}
 
     def _handle_reset(self) -> dict:
         p = self.policy

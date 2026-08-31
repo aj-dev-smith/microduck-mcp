@@ -241,6 +241,58 @@ def duck_trick(name: str, stage_ball: bool = True) -> DuckState:
     return DuckState(**_state_after())
 
 
+class PolicySlot(BaseModel):
+    role: str
+    loaded: bool
+    file: str | None = Field(description="Resolved path of the ONNX running "
+                             "this role right now (symlinks followed)")
+    obs_dim: int | None = Field(description="Observation width the session "
+                                "expects — the family contract is 61")
+
+
+class PolicyResult(BaseModel):
+    active_policy: str = Field(description="Which role is driving the body "
+                               "at this instant")
+    slots: list[PolicySlot] | None = Field(default=None,
+                                           description="action='list': every role")
+    role: str | None = None
+    file: str | None = None
+    obs_dim: int | None = None
+    previous: str | None = Field(default=None, description="The path this swap "
+                                 "displaced — pass it back to `path` to undo")
+    note: str | None = None
+
+
+@mcp.tool(title="Duck brains", annotations=_INTENT)
+def duck_policy(action: Literal["list", "swap"] = "list",
+                role: str | None = None, path: str | None = None) -> PolicyResult:
+    """The duck's brains, inspectable and mutable while the body runs. This is
+    the last leg of the closed learning loop: train on the GPU box, export an
+    ONNX, and swap it into the LIVE sim — no restart, no dropped pose, active
+    on the next control tick.
+
+    action='list' shows every role (walking, standing, sitstand, ground_pick,
+    kick_left, kick_right, roulade), which ONNX file each is running, and
+    which one is driving right now. action='swap' rebinds one role to a new
+    file. The swap is validated before it lands: the new session is built off
+    to the side, its obs width checked against the incumbent's, and any
+    problem is refused with the old brain still flying — a bad export can
+    never brick the body. The reply's `previous` field is the rollback: one
+    more swap with that path undoes the experiment.
+
+    Etiquette, not enforcement: you MAY swap the role that is actively
+    driving (that is the point of a mid-sit brain transplant), but the new
+    policy inherits the body wherever it stands — swap experimental walking
+    policies while the duck is standing still unless the handoff itself is
+    what you're testing."""
+    if action == "list":
+        return PolicyResult(**_call({"cmd": "policy", "action": "list"}))
+    if not role or not path:
+        raise ToolError("swap needs both `role` and `path` (an ONNX file)")
+    return PolicyResult(**_call({"cmd": "policy", "action": "swap",
+                                 "role": role, "path": path}))
+
+
 @mcp.tool(title="Point the head", annotations=_INTENT)
 def duck_look(neck_pitch: float = 0.0, head_pitch: float = 0.0,
               head_yaw: float = 0.0, head_roll: float = 0.0) -> DuckState:

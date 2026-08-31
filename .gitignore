@@ -17,3 +17,9 @@ build/
 # Runtime artifacts (frames land in a temp dir by default, but just in case)
 frames/
 *.sock
+
+# Local trained-policy artifacts: ONNX exports pulled from the training box
+# and shadow policy dirs for hot-swap demos. Policies belong on HF Hub (see
+# microduck/policies/README.md), not in this repo's history.
+*.onnx
+policies_v2/

@@ -60,6 +60,27 @@ attachment; it will never be the primary path.
   2026-07-28 revision. Server logs go to stderr.
 - **SSE transport** — deprecated.
 
+## Live policy swaps (`duck_policy`)
+
+The closed learning loop (train on the box → export ONNX → new brain in a
+running body) ends at `duck_policy swap`, and its contract is
+refuse-before-touch: the candidate session is built and its obs width checked
+against the incumbent *before* anything is rebound, so a bad export can never
+brick the body; every swap reply carries the displaced path as a one-call
+rollback. Two lessons from the first live use, both about state rather than
+files:
+
+- **A swapped-in brain inherits stale mode state.** The sim's `sit` trick is
+  a transition that gets consumed: swap a sitter in after the transition
+  logically happened (under a brain that ignored it) and nothing descends —
+  a re-trigger no-ops because `sit_mode` is already set. Etiquette is
+  swap-then-engage, not engage-then-swap, unless the handoff itself is the
+  experiment.
+- **The swap is an instrument, not just a deploy step.** Dropping a policy
+  into a body state it never met in training (a stand-only policy into a
+  seated body) revealed learned command-tracking no eval had shown. Cheap
+  behavioral probes beat speculation about what a checkpoint "knows".
+
 ## Dependency policy
 
 `mcp>=2,<3`. SDK v2 targets spec 2026-07-28 while transparently serving
