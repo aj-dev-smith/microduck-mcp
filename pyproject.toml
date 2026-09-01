@@ -29,6 +29,14 @@ dependencies = [
     "pyobjc-framework-quartz>=10 ; sys_platform == 'darwin'",
 ]
 
+# `uv run --group dev pytest` — the suite's own deps, so a fresh clone can
+# run the documented test command without an ephemeral `--with` overlay.
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-subtests>=0.13",
+]
+
 [project.urls]
 Homepage = "https://github.com/aj-dev-smith/microduck-mcp"
 Repository = "https://github.com/aj-dev-smith/microduck-mcp"
