@@ -148,7 +148,7 @@ class Render(unittest.TestCase):
 
 
 class ShippedEmotes(unittest.TestCase):
-    """The five authored gestures. Their timings are taste; their SIGNS are
+    """The six authored gestures. Their timings are taste; their SIGNS are
     physics, and positive pitch looks down."""
 
     def emote(self, name):
@@ -156,8 +156,9 @@ class ShippedEmotes(unittest.TestCase):
 
     def test_all_of_them_load_and_are_named_for_their_files(self):
         names = EmoteLibrary(EMOTES).names()
-        self.assertEqual(names,
-                         ["droop", "head_tilt", "new_brain", "nod", "perk_up"])
+        self.assertEqual(names, ["double_take", "droop", "head_tilt",
+                                 "new_brain", "nod", "nuzzle", "perk_up",
+                                 "shiver", "yawn"])
         for name in names:
             with self.subTest(emote=name):
                 self.assertEqual(self.emote(name).name, name)
@@ -184,8 +185,13 @@ class ShippedEmotes(unittest.TestCase):
         self.assertGreater(float(y.max()), 0.25)
         self.assertLessEqual(float(y.max()), 0.31)
 
-    def test_droop_is_the_only_one_that_opens_the_beak(self):
-        for name in ("nod", "head_tilt", "perk_up", "new_brain"):
+    def test_the_beak_stays_shut_unless_the_gesture_is_about_a_sound(self):
+        # Only gestures with a voice-bank tag to shape may crack the beak:
+        # droop's coo, nuzzle's contented one, the yawn (all the way — that
+        # is what a yawn is), the double take's open-mouthed second look. A
+        # beak that opens on a silent gesture is a duck mouthing at nothing —
+        # which is why the shiver, silent by design, is held to it too.
+        for name in ("nod", "head_tilt", "perk_up", "new_brain", "shiver"):
             with self.subTest(emote=name):
                 self.assertEqual(
                     float(np.abs(self.emote(name).render()["mouth"]).max()), 0.0)
@@ -194,10 +200,16 @@ class ShippedEmotes(unittest.TestCase):
         self.assertGreater(float(traj["head_pitch"].max()), 0.4)  # and looks down
 
     def test_the_sounded_ones_name_bank_tags(self):
+        # The cozy shelf's split is deliberate: the yawn coos (a sleepy
+        # sound, not a call), the double take inquires on its second look,
+        # and the shiver is silent — a shiver with a sound effect is a
+        # cartoon, a silent one is a bird.
         sounds = {n: self.emote(n).sound for n in EmoteLibrary(EMOTES).names()}
         self.assertEqual(sounds, {"droop": "coo", "head_tilt": "inquire",
                                   "nod": None, "perk_up": "greet",
-                                  "new_brain": "chirp"})
+                                  "new_brain": "chirp", "nuzzle": "coo",
+                                  "yawn": "coo", "shiver": None,
+                                  "double_take": "inquire"})
 
 
 class Library(unittest.TestCase):

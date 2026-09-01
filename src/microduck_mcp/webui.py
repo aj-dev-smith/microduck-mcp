@@ -22,7 +22,13 @@ protocol, nothing written to disk:
          GET  /pet/state               pose, policy, and who has the wheel
          POST /pet/config              the screen the duck is living on
          POST /pet/world               screen rectangles -> platform ledges
-         POST /pet/push                a drag gesture -> a real shove
+         POST /pet/push                a drag gesture -> a real shove, of the
+                                       duck or (target: "ball") of its toy
+         POST /pet/sense               where the mouse pointer is, in metres
+         POST /pet/touch               a hand on the duck — the gesture that
+                                       is NOT a shove and never reaches qvel
+         POST /pet/carry               start/move/end a pick-up: a weld to an
+                                       invisible hand, not a force
 """
 
 import json
@@ -34,6 +40,14 @@ from urllib.parse import parse_qs, urlparse
 # rather than in the app so the gesture means the same thing to every client.
 PET_DRAG_GAIN = 6.0
 PET_PUSH_MAX = 2.0
+# What a shove may be aimed at. One gain and one clamp for both, on purpose:
+# a poke rolls the 15 g ball about 0.4 m and a flick sends it into a wall, and
+# a separate "ball gain" would be the app deciding how heavy the toy is
+# instead of the physics deciding. Mirrors sim_server.PET_PUSH_TARGETS.
+PET_PUSH_TARGETS = ("duck", "ball")
+# The pick-up's three verbs, mirrored from sim_server.PET_CARRY_ACTIONS so a
+# typo is refused on this thread rather than after a 50 Hz tick.
+PET_CARRY_ACTIONS = ("start", "move", "end")
 # Cap on a POST body: these are all small JSON objects, and an HTTP server on
 # the sim's front door should not read an arbitrary number of bytes.
 MAX_BODY_BYTES = 64 * 1024
@@ -323,6 +337,16 @@ def start_web(sim, port: int) -> ThreadingHTTPServer:
             lifts the duck off the Dock. Nothing here is a special effect —
             it lands in qvel and the real controller has to deal with it.
 
+            `target` says WHOSE qvel: `"duck"` (the default, so every caller
+            written before the toy existed is untouched) or `"ball"`. One
+            gesture vocabulary and one gain for both, deliberately — a poke
+            (0.075 m of gesture, 0.45 m/s) rolls the 15 g ball about 0.4 m at
+            the shipped rolling friction and a full flick crosses the screen
+            and meets a wall, which are both the right answers. The app
+            decides which target on the way DOWN (`pet_app.beginDrag_`) and
+            never revisits it, the way a scrollbar keeps a drag that leaves
+            the scrollbar.
+
             Two things this deliberately does NOT do. It does not shove a
             duck that is not the pet's: `pet_state` answers on any scene by
             design (a pose is a pose), and the pet's port is duck-sim's own
@@ -355,13 +379,85 @@ def start_web(sim, port: int) -> ThreadingHTTPServer:
                 self._json({"ok": False, "error": "dx_px/dy_px (or dx_m/dy_m) "
                             "and gain must be numbers"}, 400)
                 return
+            target = str(body.get("target", "duck"))
+            if target not in PET_PUSH_TARGETS:
+                # Refused on this thread rather than in the sim: an HTTP
+                # handler thread is free and a `sim.submit` is a whole 50 Hz
+                # tick of the duck's life. (The sim checks again anyway — it
+                # is reachable from the socket too.)
+                self._json({"ok": False, "error":
+                            f"unknown push target {target!r} — choose from "
+                            f"{', '.join(PET_PUSH_TARGETS)}"}, 400)
+                return
             vx = max(-PET_PUSH_MAX, min(PET_PUSH_MAX, dx_m * gain))
             vz = max(-PET_PUSH_MAX, min(PET_PUSH_MAX, -dy_m * gain))
-            req = {"cmd": "push", "client": "web",
+            req = {"cmd": "push", "client": "web", "target": target,
                    "magnitude": abs(vx), "angle_deg": 0.0 if vx >= 0 else 180.0,
                    "vz": vz}
             resp = sim.submit(req)
-            self._json(resp, 200 if resp.get("ok") else 500)
+            # A ball asked for on a scene that has none is the caller's
+            # mistake, not the daemon's failure: 400, like every other
+            # refusal on this surface, rather than a 500 that reads as a bug.
+            code = 200 if resp.get("ok") else (400 if target == "ball" else 500)
+            self._json(resp, code)
+
+        def _pet_human(self, body, cmd):
+            """`/pet/sense`, `/pet/touch` and `/pet/carry`: what the person is
+            doing.
+
+            Both are gated on `_pet_scene()` for exactly the reason
+            `_pet_push` spells out above, and the reason is if anything
+            sharper here. The pet's port is `duck-sim`'s own default, so a
+            `duck-pet` started against a live MCP session would otherwise be a
+            remote *petting* button on somebody else's duck — a stranger's
+            overlay making that session's robot stop what it was doing and
+            coo, five times a second, from a route nobody had to authenticate
+            to. The carry route is the sharpest case of all: it is a remote
+            PICK-UP button, and a duck lifted off the floor by somebody else's
+            window is a session whose robot simply stops working. One cached
+            boolean, no sim tick, and the refusal names the flag that would
+            have made this daemon the right one.
+
+            Validation is here rather than in the handler for the same reason
+            `_body` is: an HTTP handler thread is free, and a `sim.submit()`
+            spent to be told a string is not a float is a whole 50 Hz tick of
+            the duck's life.
+            """
+            if not _pet_scene():
+                self._json(PET_NOT_A_PET_SCENE, 400)
+                return
+            if cmd == "pet_sense" and body.get("present", True):
+                for key in ("x_m", "z_m"):
+                    try:
+                        float(body[key])
+                    except (KeyError, TypeError, ValueError):
+                        self._json({"ok": False,
+                                    "error": "x_m and z_m must be numbers"}, 400)
+                        return
+            if cmd == "pet_carry":
+                action = str(body.get("action", ""))
+                if action not in PET_CARRY_ACTIONS:
+                    self._json({"ok": False, "error":
+                                f"unknown carry action {action!r} — choose "
+                                f"from {', '.join(PET_CARRY_ACTIONS)}"}, 400)
+                    return
+                if body.get("x_m") is not None or body.get("z_m") is not None:
+                    try:
+                        float(body["x_m"]), float(body["z_m"])
+                    except (KeyError, TypeError, ValueError):
+                        self._json({"ok": False,
+                                    "error": "x_m and z_m must be numbers"}, 400)
+                        return
+            resp = sim.submit({**body, "cmd": cmd, "client": "web"})
+            # 409 for the one refusal that is neither the caller's fault nor
+            # the daemon's: a `move` or an `end` whose token is no longer the
+            # current grab. Nothing changed, the hand it was talking about is
+            # gone, and the app's right answer is to forget the gesture rather
+            # than retry it — which is a different answer from "your body was
+            # malformed", so it gets a different status.
+            code = 200 if resp.get("ok") else (409 if resp.get("conflict")
+                                               else 400)
+            self._json(resp, code)
 
         def do_GET(self):
             url = urlparse(self.path)
@@ -399,7 +495,8 @@ def start_web(sim, port: int) -> ThreadingHTTPServer:
         def do_POST(self):
             url = urlparse(self.path)
             try:
-                if url.path not in ("/pet/config", "/pet/world", "/pet/push"):
+                if url.path not in ("/pet/config", "/pet/world", "/pet/push",
+                                    "/pet/sense", "/pet/touch", "/pet/carry"):
                     self._json({"ok": False, "error": "not found"}, 404)
                     return
                 body = self._body()
@@ -407,6 +504,9 @@ def start_web(sim, port: int) -> ThreadingHTTPServer:
                     return  # _body already answered
                 if url.path == "/pet/push":
                     self._pet_push(body)
+                    return
+                if url.path in ("/pet/sense", "/pet/touch", "/pet/carry"):
+                    self._pet_human(body, "pet_" + url.path.rsplit("/", 1)[1])
                     return
                 cmd = "pet_config" if url.path == "/pet/config" else "pet_world"
                 resp = sim.submit({**body, "cmd": cmd, "client": "web"})

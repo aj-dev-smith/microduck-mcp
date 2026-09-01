@@ -206,21 +206,113 @@
         <body name="pet_platform_11" mocap="true" pos="0 10 0.5">
             <geom name="pet_platform_11" class="pet_solid" size="0.05 0.15 0.02"/>
         </body>
+
+        <!-- THE TOY. A real free body, not a prop: the same 70 mm, 15 g
+             floorball that microduck_rl's ball.xml ships, down to the inertia,
+             because sim_server.BALL_RADIUS_M (0.035) is baked into the head
+             camera's range solve — the detector reads distance out of the
+             SOLID ANGLE the blob covers, so a ball of any other size would
+             report the wrong `ball_seen.distance_m` and the approach would
+             stop short of a pocket it thought it was in.
+
+             Group 0, unlike every other thing this file adds: the pet
+             renderer draws groups 0/1/2, so the toy is on screen, and the
+             head camera can find it. It is the first object in the pet's
+             world that is neither duck nor invisible furniture, which is why
+             sim_server splits its segmentation masks (`_pet_duck_geom` vs
+             `_pet_ball_geom`) instead of asking "is it on the worldbody" —
+             the frame's `bbox` is what the overlay hit-tests against, and a
+             ball folded into it would be a duck you could grab from a metre
+             away.
+
+             `ball_geom` / `ball_free` are the names the rest of the daemon
+             already looks up: `_fix_ball_contact` re-applies condim 6 and the
+             rolling friction at load (they are written here so the file reads
+             true), and infer_policy.PolicyInference finds `ball_free` to fill
+             ball_qpos_adr / ball_qvel_adr — which is also what turns the head
+             camera's detector on and what `push {target: "ball"}` writes to.
+
+             It spawns at x=0.75, off to the right of a duck that starts at
+             the origin and OUTSIDE the duck's own 0.39 m window: the toy is
+             found by walking to it, not by being handed one. -->
+        <body name="pet_ball" pos="0.75 0 0.035">
+            <freejoint name="ball_free"/>
+            <inertial pos="0 0 0" mass="0.015"
+                diaginertia="1.225e-5 1.225e-5 1.225e-5"/>
+            <geom type="sphere" name="ball_geom" size="0.035" group="0"
+                rgba="1 0.55 0 1" condim="6" friction="0.5 0.005 0.002"/>
+        </body>
+
+        <!-- THE HAND. Invisible (group 4, culled by the pet renderer's option
+             the same way the floor and the walls are) and non-colliding
+             (contype/conaffinity 0): it is not a thing in the world, it is
+             where the human's fingers are. Nothing may bump into it, nothing
+             may stand on it, and the duck must never be able to see it.
+
+             A mocap body for both of this file's reasons at once. The first
+             is the one the walls are written against — mjData.mocap_pos is
+             the only pose channel whose bounds stay honest, and the hand is
+             moved every single tick while somebody is holding the duck. The
+             second is new: a weld needs a body to weld TO, and a bare geom on
+             the worldbody is not one.
+
+             Parked at z=3, well above anything the pet camera can frame, so
+             an idle hand is nowhere near the duck. That parking spot is also
+             what makes the weld below wrong at compile time — see there. -->
+        <body name="pet_hand" mocap="true" pos="0 0 3.0">
+            <geom name="pet_hand" type="sphere" size="0.01" group="4"
+                contype="0" conaffinity="0" rgba="0 0 0 0"/>
+        </body>
     </worldbody>
+
+    <!-- PICK-UP. Inactive at load and toggled from mjData.eq_active at
+         runtime, so the duck is welded to the hand only for as long as
+         somebody is actually holding the mouse button down on it.
+
+         `relpose` is left at the default DELIBERATELY, and it is a trap worth
+         spelling out. MuJoCo bakes a weld's relative pose from qpos0 at
+         compile time, and qpos0 here is the hand parked at z=3 against a duck
+         standing at z=0.12 — measured on this compiled scene, eq_data comes
+         back [0,0,0, 0,0,-2.88, 1,0,0,0, 1]. Activating that unedited would
+         snap the duck 2.88 m straight down, through the Dock, on the first
+         step of every pick-up. So sim_server._pet_carry_grab rewrites
+         eq_data[3:10] from the LIVE relative pose every time a hand closes,
+         and what is written here is a placeholder exactly the way every
+         position in this file is a placeholder.
+
+         solref="0.02 1" is a measured choice, not a default: at that
+         stiffness the trunk tracks the hand about 4 cm behind, which reads as
+         a duck with weight in it rather than a duck on the end of a stick.
+         Stiffen towards "0.005 1" if it ever looks glued. -->
+    <equality>
+        <weld name="pet_carry" body1="pet_hand" body2="trunk_base"
+            active="false" solref="0.02 1" solimp="0.9 0.95 0.001"/>
+    </equality>
 
     <!-- The stock STAND pose, copied from microduck_rl's scene.xml. The
          daemon never reads it (DuckSim sets qpos and ctrl programmatically at
          init, the same way infer_policy does), but a scene you can drop into
          mj_resetDataKeyframe and get a standing duck out of is worth the
          twenty lines — it is how tests/test_pet_stream.py checks that the sim
-         floor lands on the Dock's edge without booting a policy. -->
+         floor lands on the Dock's edge without booting a policy.
+
+         THE LAST SEVEN NUMBERS ARE THE BALL, and they are not optional.
+         `ball_free` is a freejoint, so it owns qpos[21:28] — and a keyframe
+         shorter than nq is ZERO-PADDED by the compiler, which would hand the
+         ball the quaternion (0,0,0,0). A zero quat is not "no rotation", it
+         is not a rotation at all: mj_forward normalises it to garbage and
+         anything that copies this keyframe wholesale (tests/test_pet_stream's
+         `_reset_pose` does exactly that) gets a ball that is nowhere, in an
+         orientation that is nothing. Grow this string with the scene. -->
     <keyframe>
         <key name="STAND" qpos="
         0 0 0.12 1 0 0 0
 
         0 -0.08726646259971647 -0.457924 -0.004940 0.452984
         0.3490658503988659 0.3490658503988659 0 0
-        0 0.08726646259971647 0.457924 0.004940 -0.452984"
+        0 0.08726646259971647 0.457924 0.004940 -0.452984
+
+        0.75 0 0.035 1 0 0 0"
          ctrl="
         0 -0.08726646259971647 -0.457924 -0.004940 0.452984
         0.3490658503988659 0.3490658503988659 0 0

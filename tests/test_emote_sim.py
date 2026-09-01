@@ -323,7 +323,8 @@ class Listing(unittest.TestCase):
         self.assertTrue(resp["ok"])
         self.assertEqual(resp["playing"], "nod")
         self.assertEqual(sorted(e["name"] for e in resp["emotes"]),
-                         ["droop", "head_tilt", "new_brain", "nod", "perk_up"])
+                         ["double_take", "droop", "head_tilt", "new_brain",
+                          "nod", "nuzzle", "perk_up", "shiver", "yawn"])
         self.assertTrue(all(e["valid"] for e in resp["emotes"]))
 
     def test_a_server_without_an_emote_directory_says_so(self):

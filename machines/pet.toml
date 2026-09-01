@@ -53,6 +53,193 @@
 # where it started six seconds later.
 #
 # ---------------------------------------------------------------------------
+# THE HUMAN, IN METRES  (guards cannot do arithmetic, so these are spelled out)
+# ---------------------------------------------------------------------------
+# The overlay is the only thing on either side of the socket that can see a
+# mouse pointer, so it posts one (POST /pet/sense, five times a second while
+# it moves and once a second while it sits still) and the daemon turns it into
+# `cursor.*`. The duck therefore knows something no sim ever has: where the
+# person's hand is. What follows is the whole of what it does about it.
+#
+#     NOTICE_M   = 0.45   a cursor this close, down at the walk line, is worth
+#                         crossing the screen for (295 pt — about a duck and a
+#                         half of screen either side)
+#     CLOSE_M    = 0.10   already on top of the duck: that is a click coming,
+#                         not an invitation to walk
+#     PERSONAL_M = 0.22   where the duck stops. A duck is 0.123 m deep, so this
+#                         is a duck and a half of air between them — near
+#                         enough to be attentive, far enough to have dignity
+#     LEAVE_M    = 0.55   the hand wandered off; go after it again
+#     GONE_S     = 2.5    cursor.age_s past this and the hand has left the room
+#                         (the app heartbeats at 1 Hz, so a pointer that is
+#                         merely PARKED never ages out — only a quit overlay,
+#                         a locked screen or another display does)
+#     TURN_M     = 0.15   hysteresis on "it went past behind me". A sign test
+#                         alone flaps at arm's length, and a duck that
+#                         alternates left-right-left is not following anything.
+#                         Note what it costs: a hand less than 0.15 m behind
+#                         is also inside PERSONAL_M, so `regard` (written
+#                         first) claims it and the turn never happens. Turning
+#                         round is for a hand that genuinely went elsewhere
+#     MOVING_MPS = 0.05   and it has to be a hand ARRIVING, not a pointer left
+#                         lying about — see below, this one is load-bearing
+#     ROLL_GATE  = 0.55   the duck notices on the HIGH half of the coin. The
+#                         high half specifically: `peek` already spends the low
+#                         end on the nap (roll < 0.08) and `pause` on the extra
+#                         look-around (roll < 0.30), and a cursor gate down
+#                         there would quietly eat both.
+#
+# The coin is there because a pointer crosses the Dock dozens of times an hour
+# and a duck that sets off after every one of them is a duck that never does
+# anything else. Roughly half of the noticings, out of a node that is already
+# only checked once per leg, is a duck that looks up sometimes.
+#
+# MOVING_MPS IS NOT DECORATION, and it is the one number here that was found
+# rather than chosen. Without it the gate reads "a pointer is near me", which
+# is true for as long as somebody leaves the mouse over the Dock and goes back
+# to reading — and the loop that follows (notice -> approach -> regard ->
+# lost_interest -> settle -> a leg -> notice again) closes in about sixteen
+# seconds. Measured on this repo's own putter, cursor pinned at three
+# different x, one simulated hour each: **54-60 `regard` entries an hour**,
+# i.e. an inquiring chirp a minute, all day, from a mouse nobody is touching.
+# That is the exact failure the sound budget below is written against. With
+# the movement term the same runs measure **0**: a hand that is not moving is
+# furniture, and the duck has seen it already. `cursor.speed_mps` is EMA'd on
+# the daemon (sim_server.PET_CURSOR_SPEED_EMA) and decays to nothing about
+# four seconds after a pointer stops, which is well inside one lap.
+#
+# THE ONE NEW NOISE. `regard` carries head_tilt (which inquires), and it is
+# the only routine sound this whole lane adds — because reaching personal
+# space costs the human a hand that came over and then held still, which
+# rations it better than a timer could. `notice` is deliberately silent: it
+# fires on a pointer merely passing by, and a chirp there would be a chirp
+# every few minutes all day. The pet ITSELF answers a stroke (the daemon plays
+# `nuzzle` + a coo on POST /pet/touch, rate-limited to one every 2.5 s), which
+# is why the `petted` node below has no emote of its own — a gesture there
+# would be the duck thanking you twice for one hand.
+#
+# NOTE FOR ANYONE HOT-LOADING THIS: the guards below read `cursor.*`,
+# `touch.*` and `carried`, and a daemon started before those landed rejects
+# the whole file with `GuardError: unknown path 'cursor.dist_m'`. Same trap
+# `roll` and `base.x` set before it; the fix is the same, restart the daemon.
+#
+# ---------------------------------------------------------------------------
+# THE TOY
+# ---------------------------------------------------------------------------
+# scene_desktop.xml carries one 70 mm floorball — the same body the pitch
+# scenes use, so the head camera's detector sizes it correctly and every
+# `ball_seen.*` path below means what it means everywhere else in this repo.
+# The play loop reuses the striker's controllers wholesale (`approach_ball`
+# with the goal-bearing term off, then `kick`): there is no goal on a Dock,
+# so this is the plain pocket approach and one honest boot.
+#
+#     PLAY_M   = 0.45   how near a moving ball has to be to be an invitation.
+#                       Same number as NOTICE_M above, and by no accident —
+#                       it is also `approach_ball`'s own "close" threshold
+#     PLAY_MPS = 0.10   the ball has to be MOVING to be worth crossing the
+#                       screen for. This is the toy's MOVING_MPS and it is
+#                       load-bearing for exactly the same reason — see below
+#     STILL_MPS = 0.10  ...and at rest before the duck will kick it. Same
+#                       number from the other side, and the same number
+#                       striker.toml's pocket guard uses for "settled"
+#     RALLY      = 0.5  the coin that ends a rally (on `watch_ball`)
+#
+# A BALL LYING ON THE DOCK IS FURNITURE. This is the ball's half of the
+# lesson the cursor lane learned the expensive way: a guard that reads "there
+# is a ball in view" is true for as long as the ball exists, and the loop it
+# opens (see_ball -> chase -> settle -> a leg -> see_ball) closes in about
+# twenty-five seconds. Measured on this repo's own putter, a ball parked in
+# view for one simulated hour, two seeds: with the speed term stripped out,
+# **139 `see_ball` entries an hour, both seeds** — a greeting chirp every
+# twenty-six seconds, all day, from a toy nobody touched. With it: **0** on
+# the putter — and 15 in ten minutes on a REAL daemon, which is the story
+# told under PLAY_M below and the reason this lane ended up silent.
+#
+# `ball_seen.speed_mps > 0.10` is what makes the ball an INVITATION instead
+# of a fact: it only moves because a human rolled it (POST /pet/push with
+# target "ball"), or because the duck kicked it, or because the duck walked
+# into it on a lap. THE WHOLE LANE IS SILENT because of that last one — see
+# `see_ball` below for the measurement that settled it. The toy is expressive
+# the way `notice` is: by the duck visibly walking over and booting something.
+#
+# `speed_mps` is null until the detector's track spans 0.25 s
+# (sim_server.DET_SPEED_MIN_DT_S), and a null compares False — so a ball that
+# has only just come into view waits two detector ticks before it counts.
+# That is a feature: it is the same half-second of confirmation `notice`
+# spends on a pointer.
+#
+# PLAY_M IS NOT A TASTE JUDGEMENT EITHER, and it was the expensive half. The
+# detector gets its range by inverting the SOLID ANGLE the blob covers, so
+# precision falls apart with distance: a 70 mm ball at two metres is three or
+# four pixels across, DET_MIN_PX is six, and a ten-percent range error there
+# is 0.2 m of world position, which the speed track differences into half a
+# metre a second of ball that never moved. Measured live on a real daemon,
+# three minutes, ball untouched: nineteen readings over 0.10 m/s, all of them
+# at 0.6-2.0 m, the worst **6.4 m/s at 1.95 m**. Under 0.45 m the same run
+# had none. The offline putter measured this lane at zero spurious bouts
+# because its coarse gait never reaches the kick pocket; a real daemon
+# measured **15 in ten minutes**, and that gap is the whole argument for
+# probing a live one.
+#
+# And the second half is the nicer one: the human can ONLY start a bout at
+# close range, because the ball is only clickable while it is inside the
+# duck's own 0.39 m window (see the window note at the end of this block). So
+# a gate at 0.45 m throws away exactly the sightings nobody could have caused
+# and keeps exactly the ones somebody did.
+#
+# WHAT YOU CANNOT DO IS THROW IT FURTHER THAN THE WINDOW. The overlay draws
+# a 256 pt window centred on the duck — about 0.39 m of world — so a ball
+# outside that is neither drawn nor grabbable. It is not a bug and it is not
+# worth a bigger frame (notes/desktop-pet.md measured that road: 640 px ×2 is
+# 18 fps). It is the point. Past the edge of its own window the duck has to
+# go and FETCH the toy, and `chase_ball`/`find_ball` are what bring it back
+# into reach.
+#
+# ---------------------------------------------------------------------------
+# BEING PICKED UP
+# ---------------------------------------------------------------------------
+# Hold the mouse still on the duck for a third of a second and the overlay
+# promotes the press into a carry: the daemon closes a weld between an
+# invisible mocap hand and the trunk, and the duck hangs off the pointer until
+# the button comes up (POST /pet/carry, sim_server's PET_CARRY_*). It is the
+# only gesture in this file that is a CONSTRAINT rather than a force, and the
+# machine's whole contribution to it is two lines and one node.
+#
+# THE ONE LINE THAT MATTERS IS `not carried` ON THE FALL REFLEX. A duck
+# dangling from a hand is not upright — projected gravity says so within about
+# a second of the lift — so without the carve-out the reflex fires on every
+# single pick-up: `fallen` latches a wake, plays `droop`, and says "I have
+# gone over" at somebody who is holding the duck in their hand and can see
+# perfectly well that it has not. That is the exact discipline resident.toml
+# established for the postures, applied to a new kind of not-upright.
+#
+# THE FLAILING IS NOT A BUG. `carried` commands zero velocity, which selects
+# the standing policy, and a standing policy with no ground under it has
+# nothing to balance against and paddles. Every instinct says to hide that
+# behind a canned "held" pose. Don't: it is exactly what a real Microduck does
+# when you lift it off the table, it is the same physics as everything else in
+# this file, and a keyframe here would be the first faked frame in the whole
+# pet.
+#
+#     LAND_S = 0.4   how long `carried` waits after the hand opens before
+#                    handing back to `settle`. Long enough that a duck set
+#                    down gently is on its feet by the time anything else
+#                    looks at it, and short enough that a duck DROPPED is in
+#                    `fallen` inside a second — through `settle` and the fall
+#                    ladder that already exists, with no landing node of its
+#                    own. `node != 'carried'` is on the fall reflex for
+#                    exactly that beat: without it, letting go of a duck you
+#                    had been holding for five seconds fires the reflex on the
+#                    release tick (elapsed_s is already past 0.5) and every
+#                    put-down, however gentle, is a wake.
+#
+# `carried` is the one node in the cursor/toy/carry surface that keeps a
+# sound. `perk_up` greets, and a pick-up earns it the way `regard` earns its
+# tilt: it cannot happen by accident — it costs a human a deliberate press
+# held still on a 180 px duck — and it cannot re-arm itself the way the toy
+# could, because the duck has no way to pick itself up.
+#
+# ---------------------------------------------------------------------------
 # WHAT THE GAIT ACTUALLY DOES  (measured, shipped walk policy, plain scene)
 # ---------------------------------------------------------------------------
 # Every timing below is derived from these, and none of them is the number a
@@ -118,13 +305,85 @@
 # tag (droop coos, head_tilt inquires, perk_up greets; `nod` is the silent
 # one), and this machine reaches a wall about seventy times an hour. An emote
 # with a sound on a wall node is a noise every forty-nine seconds, all day.
-# So the walls nod, and the only routine sounds in this file are the two ends
-# of a nap: eight coos and eight greets an hour, one about every four minutes,
+# So the walls nod, and the routine sounds in this file are the two ends of a
+# nap — eight coos and eight greets an hour — plus `greet_hand`'s inquire on a
+# 12% coin, measured at 9.8-11.0 an hour against a hand that keeps moving all
+# day. Twenty-seven an hour at the very worst, one about every two minutes,
 # each attached to something a person can actually see happen.
+#
+# THE RATE IS THE THING, NOT THE NODE. A gate that re-arms on every pacing
+# node's arrival fires as often as the pace does, and every sound this file
+# has ever had to take back was taken back for that one reason: `see_ball`
+# lost perk_up to it (six bouts in ten minutes off a toy nobody touched) and
+# `regard` lost head_tilt to it (48-73 an hour off a hand that keeps moving).
+# The prose reason a node "earns" a sound is worth nothing; measure the loop
+# it sits in, on the putter or on a real daemon, and count.
 
 [machine]
 name = "pet"
 initial = "settle"
+
+# --------------------------------------------------------------------------
+# THE GLOBAL TRANSITIONS, IN FILE ORDER — and the order is the priority.
+# Machine.tick evaluates these before any node transition, first match wins,
+# so what is written above outranks what is written below. The rule that keeps
+# this readable as the surface grows: the more a thing is being DONE TO the
+# duck, the higher it goes. Being held outranks being petted; being petted
+# outranks noticing a toy; and the fall reflex is last, because everything
+# above it is a better explanation for a duck that is not upright.
+# --------------------------------------------------------------------------
+
+# Someone picked the duck up. FIRST, before everything, because a duck in the
+# air is not upright and every other reflex in this file would misread it —
+# and because being held is the most a thing can be DONE TO a duck, which is
+# the ordering rule this block is written on. No exclusions at all beyond its
+# own node: a pick-up outranks a fall, a nap, a jam and a game of football,
+# and none of those is a better description of a duck dangling from a hand.
+[[machine.transition]]
+when = "carried and node != 'carried'"
+to = "carried"
+
+# Someone is petting it. The exclusions are the same discipline resident.toml
+# established: not mid-fall (`fallen`/`down` are already an answer to a bigger
+# question), and not mid-posture — the sitstand transient is the one second
+# where the trunk actually swings, and a detour through `petted` would strand
+# a duck halfway into a sit with nothing left to finish it. `not carried`
+# keeps a hand on a dangling duck from sending the machine walking, and
+# `node != 'carried'` leaves the landing beat alone.
+[[machine.transition]]
+when = "touch.petted and not carried and upright and node != 'petted' and node != 'carried' and node != 'fallen' and node != 'down' and node != 'settle_down' and node != 'get_up'"
+to = "petted"
+
+# The toy is in play. Below `petted` because a hand on the duck outranks a
+# ball rolling past it, and above the fall reflex because a duck that is
+# upright and chasing something is not falling over.
+#
+# The terms, in the order they matter:
+#   distance_m < 0.45 close enough that the sighting can be BELIEVED, and
+#                     close enough that a human could have caused it. Both
+#                     halves are load-bearing — see PLAY_M below.
+#   speed_mps > 0.10  the ball is MOVING, i.e. somebody just played with it.
+#                     See the header — without this the loop below re-arms
+#                     itself off its own kick and greets you twice a minute
+#                     for the rest of the day.
+#   speed_mps < 2.5   ...and moving at a speed a ball on this Dock can
+#                     actually have. PET_PUSH_MAX is 2.0 m/s and nothing here
+#                     hits harder than a shove, so anything past 2.5 is not a
+#                     ball, it is a sighting that fell apart.
+#   age_s < 0.4       a live sighting, not a memory. One blind detector tick
+#                     mid-stride is a blink; four is a ball that has gone.
+#   not sitting       what keeps a nap a nap. `upright` covers fallen/down
+#                     for free, and `not carried` is the pick-up lane's.
+# The named exclusions are the play loop itself (it must not restorm its own
+# nodes), the jam ladder (a duck that has already asked for help should not
+# be talked out of escaping by a toy), the posture transient, and `petted`.
+# PARKED (2026-08-31): the toy's one door in, closed at AJ's request — chasing
+# hogged the duck's whole attention span during the first hands-on test and
+# the cursor lanes never got a turn. The play loop below is intact and
+# unreachable; uncomment to reopen when the chase is worth watching again.
+#[[machine.transition]]
+#when = "ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.distance_m < 0.45 and ball_seen.speed_mps > 0.10 and ball_seen.speed_mps < 2.5 and upright and not sitting and not carried and node != 'see_ball' and node != 'chase_ball' and node != 'find_ball' and node != 'boot' and node != 'watch_ball' and node != 'ball_rest' and node != 'petted' and node != 'carried' and node != 'stuck' and node != 'unjam' and node != 'escape_right' and node != 'escape_left' and node != 'wedged' and node != 'settle_down' and node != 'get_up'"
+#to = "see_ball"
 
 # The fall reflex, resident.toml's, with the postures carved out. Measured, a
 # settled sit keeps the trunk upright (59 mm off the floor and `upright` still
@@ -134,8 +393,20 @@ initial = "settle"
 # the carve-out is honest and small: a sitting duck knocked over is not
 # noticed until the nap's own deadline gets it back on its feet, and the
 # reflex fires then.
+#
+# `not carried` and `node != 'carried'` are the pick-up lane's, and between
+# them they are the difference between a feature and a bug. The first stops
+# the reflex firing while the duck DANGLES (it reads not-upright within a
+# second of every lift, so without it every pick-up is a wake and a "I have
+# gone over" said to somebody holding the duck). The second buys the landing
+# its beat: `elapsed_s` in `carried` is however long the human held on, so on
+# the release tick it is already past 0.5, and without the exclusion even the
+# gentlest put-down would fire the reflex before the feet touched anything.
+# A duck genuinely DROPPED still falls — `carried` hands back to `settle`
+# after 0.4 s, and the reflex catches it there half a second later, through
+# the ladder that already exists.
 [[machine.transition]]
-when = "not upright and not sitting and elapsed_s > 0.5 and node != 'fallen' and node != 'down' and node != 'settle_down' and node != 'get_up'"
+when = "not upright and not carried and not sitting and elapsed_s > 0.5 and node != 'fallen' and node != 'down' and node != 'carried' and node != 'settle_down' and node != 'get_up'"
 to = "fallen"
 
 
@@ -184,9 +455,30 @@ to = "wall_right"
 [[node.transition]]
 when = "elapsed_s > 10.0 and base.x < -0.85"
 to = "stuck"
+[[node.transition]]                 # a hand, down at the walk line, near
+when = "cursor.near_floor and cursor.dist_m < 0.45 and cursor.dist_m > 0.10 and cursor.speed_mps > 0.05 and roll > 0.55"
+to = "notice"                       # ...and the HIGH half of the coin: `peek`
+                                    # spends roll < 0.08 on the nap and
+                                    # `pause` roll < 0.30 on the look-around,
+                                    # so a low-band gate placed above them in
+                                    # file order would silently eat both.
+                                    # MOVING_MPS is the term that makes this a
+                                    # hand ARRIVING rather than a pointer left
+                                    # lying about — see the header; without it
+                                    # a parked mouse measures 54-60 chirps an
+                                    # hour, forever
 [[node.transition]]                 # short of a full crossing on purpose: the
 when = "elapsed_s > 14.0"           # leg runs out mid-screen and the amble
 to = "pause"                        # after the breather finishes the trip
+[[node.transition]]                 # the mouse RUSHING past at duck height:
+when = "cursor.near_floor and cursor.age_s < 0.5 and cursor.dist_m < 0.60 and cursor.speed_mps > 1.2 and roll < 0.15"
+to = "boggle"                       # cartoon disbelief, coin-gated to 15%
+                                    # and speed-gated to a real swipe (1.2 m/s
+                                    # is four times the duck's own brisk pace)
+                                    # because the inquire call under the
+                                    # double take spends sound budget.
+                                    # roll < 0.15 is disjoint from notice's
+                                    # > 0.55 — one draw serves both gates.
 
 [[node]]
 name = "stroll_left"
@@ -200,9 +492,24 @@ to = "wall_left"
 [[node.transition]]
 when = "elapsed_s > 10.0 and base.x > 0.85"
 to = "stuck"
+[[node.transition]]                 # a hand, down at the walk line, near
+when = "cursor.near_floor and cursor.dist_m < 0.45 and cursor.dist_m > 0.10 and cursor.speed_mps > 0.05 and roll > 0.55"
+to = "notice"                       # ...and the HIGH half of the coin: `peek`
+                                    # spends roll < 0.08 on the nap and
+                                    # `pause` roll < 0.30 on the look-around,
+                                    # so a low-band gate placed above them in
+                                    # file order would silently eat both.
+                                    # MOVING_MPS is the term that makes this a
+                                    # hand ARRIVING rather than a pointer left
+                                    # lying about — see the header; without it
+                                    # a parked mouse measures 54-60 chirps an
+                                    # hour, forever
 [[node.transition]]
 when = "elapsed_s > 14.0"
 to = "pause"
+[[node.transition]]                 # the rushing mouse — see stroll_right
+when = "cursor.near_floor and cursor.age_s < 0.5 and cursor.dist_m < 0.60 and cursor.speed_mps > 1.2 and roll < 0.15"
+to = "boggle"
 
 [[node]]
 name = "amble_right"
@@ -217,10 +524,25 @@ to = "wall_right"
 [[node.transition]]
 when = "elapsed_s > 10.0 and base.x < -0.85"
 to = "stuck"
+[[node.transition]]                 # a hand, down at the walk line, near
+when = "cursor.near_floor and cursor.dist_m < 0.45 and cursor.dist_m > 0.10 and cursor.speed_mps > 0.05 and roll > 0.55"
+to = "notice"                       # ...and the HIGH half of the coin: `peek`
+                                    # spends roll < 0.08 on the nap and
+                                    # `pause` roll < 0.30 on the look-around,
+                                    # so a low-band gate placed above them in
+                                    # file order would silently eat both.
+                                    # MOVING_MPS is the term that makes this a
+                                    # hand ARRIVING rather than a pointer left
+                                    # lying about — see the header; without it
+                                    # a parked mouse measures 54-60 chirps an
+                                    # hour, forever
 [[node.transition]]                 # the amble usually meets the wall before
 when = "elapsed_s > 13.0"           # this fires — it is the second half of a
 to = "peek"                         # crossing. The timer is for the leg that
                                     # started facing the wrong way.
+[[node.transition]]                 # the rushing mouse — see stroll_right
+when = "cursor.near_floor and cursor.age_s < 0.5 and cursor.dist_m < 0.60 and cursor.speed_mps > 1.2 and roll < 0.15"
+to = "boggle"
 
 [[node]]
 name = "amble_left"
@@ -234,9 +556,24 @@ to = "wall_left"
 [[node.transition]]
 when = "elapsed_s > 10.0 and base.x > 0.85"
 to = "stuck"
+[[node.transition]]                 # a hand, down at the walk line, near
+when = "cursor.near_floor and cursor.dist_m < 0.45 and cursor.dist_m > 0.10 and cursor.speed_mps > 0.05 and roll > 0.55"
+to = "notice"                       # ...and the HIGH half of the coin: `peek`
+                                    # spends roll < 0.08 on the nap and
+                                    # `pause` roll < 0.30 on the look-around,
+                                    # so a low-band gate placed above them in
+                                    # file order would silently eat both.
+                                    # MOVING_MPS is the term that makes this a
+                                    # hand ARRIVING rather than a pointer left
+                                    # lying about — see the header; without it
+                                    # a parked mouse measures 54-60 chirps an
+                                    # hour, forever
 [[node.transition]]
 when = "elapsed_s > 13.0"
 to = "peek"
+[[node.transition]]                 # the rushing mouse — see stroll_right
+when = "cursor.near_floor and cursor.age_s < 0.5 and cursor.dist_m < 0.60 and cursor.speed_mps > 1.2 and roll < 0.15"
+to = "boggle"
 
 
 # --------------------------------------------------------------------------
@@ -280,12 +617,28 @@ behavior = "idle"
 [[node.transition]]
 when = "elapsed_s > 2.2 and roll < 0.30"
 to = "peek"
+[[node.transition]]                 # ...and a sliver of the FREE band
+when = "elapsed_s > 2.2 and roll > 0.44 and roll < 0.50"
+to = "ruffle"                       # (0.30-0.55 was spoken for by nobody, so
+                                    # this 6% slice changes no measured rate)
 [[node.transition]]
 when = "elapsed_s > 2.2 and base.x > 0.90"
 to = "amble_left"
 [[node.transition]]
 when = "elapsed_s > 2.2 and base.x < -0.90"
 to = "amble_right"
+[[node.transition]]                 # a hand, down at the walk line, near
+when = "cursor.near_floor and cursor.dist_m < 0.45 and cursor.dist_m > 0.10 and cursor.speed_mps > 0.05 and roll > 0.55"
+to = "notice"                       # ...and the HIGH half of the coin: `peek`
+                                    # spends roll < 0.08 on the nap and
+                                    # `pause` roll < 0.30 on the look-around,
+                                    # so a low-band gate placed above them in
+                                    # file order would silently eat both.
+                                    # MOVING_MPS is the term that makes this a
+                                    # hand ARRIVING rather than a pointer left
+                                    # lying about — see the header; without it
+                                    # a parked mouse measures 54-60 chirps an
+                                    # hour, forever
 [[node.transition]]
 when = "elapsed_s > 2.2 and base.heading_x < 0.0"
 to = "amble_left"
@@ -320,12 +673,58 @@ to = "stroll_left"
 [[node.transition]]
 when = "elapsed_s > 6.0 and base.x < -0.90"
 to = "stroll_right"
+[[node.transition]]                 # a hand, down at the walk line, near
+when = "cursor.near_floor and cursor.dist_m < 0.45 and cursor.dist_m > 0.10 and cursor.speed_mps > 0.05 and roll > 0.55"
+to = "notice"                       # ...and the HIGH half of the coin: `peek`
+                                    # spends roll < 0.08 on the nap and
+                                    # `pause` roll < 0.30 on the look-around,
+                                    # so a low-band gate placed above them in
+                                    # file order would silently eat both.
+                                    # MOVING_MPS is the term that makes this a
+                                    # hand ARRIVING rather than a pointer left
+                                    # lying about — see the header; without it
+                                    # a parked mouse measures 54-60 chirps an
+                                    # hour, forever
 [[node.transition]]                 # room either way: the spin decides
 when = "elapsed_s > 6.0 and base.heading_x < 0.0"
 to = "stroll_left"
 [[node.transition]]
 when = "elapsed_s > 6.0"
 to = "stroll_right"
+
+# The rare fidget — the cozy pass's second verb. A shiver is 1.1 s of
+# feather-ruffle and deliberately SILENT (the emote's own file says why: a
+# shiver with a sound effect is a cartoon, a silent one is a bird), so it
+# spends nothing from the sound budget and can afford to just happen. It is
+# reached from `pause` on a 6% slice of the unspoken-for roll band, which
+# works out to a ruffle every ten-or-so minutes of pacing — often enough to
+# catch out of the corner of an eye, never often enough to be the show.
+[[node]]
+name = "ruffle"
+behavior = "idle"
+emote = "shiver"
+[[node.transition]]
+when = "elapsed_s > 1.6"
+to = "settle"
+
+# Cartoon disbelief — the cozy pass's third verb, for the one event on this
+# desktop that genuinely deserves it: the mouse tearing past at duck height.
+# Entered from the four walking legs only (a dozing duck sleeps through
+# traffic, a petted duck is busy being petted), on the guard narrated at
+# stroll_right's entry. The double take is 2.6 s and carries the inquire
+# call on its second look; the exits mirror `notice`'s manners — if the
+# hand SETTLED nearby after rushing past, look at it properly, otherwise
+# shrug and resume the lap.
+[[node]]
+name = "boggle"
+behavior = "idle"
+emote = "double_take"
+[[node.transition]]                 # it stopped here: that deserves a regard
+when = "elapsed_s > 2.8 and cursor.dist_m < 0.45 and cursor.age_s < 1.0"
+to = "regard"
+[[node.transition]]
+when = "elapsed_s > 2.8"
+to = "settle"
 
 
 # --------------------------------------------------------------------------
@@ -385,7 +784,12 @@ to = "get_up"
 [[node]]
 name = "get_up"
 behavior = "trick"
-emote = "perk_up"                   # a greet on waking, once a nap
+emote = "yawn"                      # EVERY doze exit yawns — the cozy pass's
+                                    # one absolute. It replaced perk_up here:
+                                    # a startle on waking read as an alarm
+                                    # clock, a yawn reads as a nap that ended.
+                                    # The sleepy coo under it is the only
+                                    # scheduled sound a nap costs, ~8/hour.
 [node.params]
 trick = "stand"
 [[node.transition]]
@@ -393,6 +797,407 @@ when = "not sitting and elapsed_s > 1.0"
 to = "settle"
 [[node.transition]]
 when = "elapsed_s > 3.5"
+to = "settle"
+
+
+# --------------------------------------------------------------------------
+# the human — the one thing on this desktop that is not physics
+#
+# The loop is four nodes and one shape: see the hand, walk to it, look at it,
+# give up. Nothing here is a new behavior — "walk toward the hand" IS a
+# compass heading, and `stroll` already owns the point turn onto one, so the
+# approach nodes are ordinary legs told where to point. That is the whole
+# reason this lane cost no controller work: the duck was already able to walk
+# somewhere on purpose, it just had nowhere it wanted to go.
+# --------------------------------------------------------------------------
+
+[[node]]
+name = "notice"
+behavior = "idle"
+# A beat, and a silent one. The pointer comes near the Dock dozens of times an
+# hour; an emote here would be a chirp every few minutes all day, which is the
+# exact failure the header's sound budget is written against. The duck notices
+# by WALKING OVER — at 180 px on a Dock that is expressive enough.
+#
+# The 0.8 s before it commits is not padding either: it is what stops the duck
+# lurching after a pointer on its way to the Trash. Most hands that come near
+# are gone again inside a second, and the first guard below is what lets those
+# go by without a wasted leg.
+[[node.transition]]
+when = "cursor.age_s > 1.5"          # gone before the duck got going
+to = "settle"
+[[node.transition]]
+when = "elapsed_s > 0.8 and cursor.dx_m > 0.0"
+to = "approach_cursor_right"
+[[node.transition]]
+when = "elapsed_s > 0.8"
+to = "approach_cursor_left"
+
+[[node]]
+name = "approach_cursor_right"
+behavior = "stroll"                  # the pet's own gait, told a heading
+[node.params]
+heading_deg = 0.0
+vx = 0.26                            # 0.26 measures 0.114 m/s: the middle
+                                     # pace, interested without being frantic.
+                                     # The brisk 0.30 reads as a charge and
+                                     # the slow 0.22 as indifference
+[[node.transition]]
+when = "base.x > 1.00"               # the wall still outranks the human. A
+to = "wall_right"                    # pointer parked off the right edge of the
+                                     # screen therefore bounces this node
+                                     # straight into the wall nod and back out
+                                     # through `peek` — which is fine, because
+                                     # `peek` redraws the coin and only about
+                                     # half of those come back here. The gate
+                                     # is what keeps that a shrug and not a
+                                     # ring-a-ring-o'-roses.
+[[node.transition]]                  # personal space: close enough to attend
+when = "cursor.dist_m < 0.22 and roll < 0.12"   # to, far enough to have
+to = "greet_hand"                    # dignity — and about one arrival in eight
+                                     # says hello out loud. See `greet_hand`
+                                     # for why the sound is on a coin and not
+                                     # on arriving. The roll was drawn when
+                                     # this leg started, so it is one honest
+                                     # coin per approach rather than a dice
+                                     # roll per tick
+[[node.transition]]
+when = "cursor.dist_m < 0.22"
+to = "regard"
+[[node.transition]]
+when = "cursor.age_s > 2.5"
+to = "lost_interest"
+[[node.transition]]
+when = "cursor.dx_m < -0.15"         # it went past behind; turn around. The
+to = "approach_cursor_left"          # 0.15 m band is hysteresis, not slop —
+                                     # a sign test alone flaps at arm's length
+[[node.transition]]
+when = "elapsed_s > 12.0"            # a full crossing is 16 s at the brisk
+to = "lost_interest"                 # pace; 12 s at 0.26 is most of one, and
+                                     # enough patience for a hand that keeps
+                                     # moving away from the duck
+
+[[node]]
+name = "approach_cursor_left"
+behavior = "stroll"
+[node.params]
+heading_deg = 180.0
+vx = 0.26
+[[node.transition]]
+when = "base.x < -1.00"
+to = "wall_left"
+[[node.transition]]                  # the same coin, on the same arrival
+when = "cursor.dist_m < 0.22 and roll < 0.12"
+to = "greet_hand"
+[[node.transition]]
+when = "cursor.dist_m < 0.22"
+to = "regard"
+[[node.transition]]
+when = "cursor.age_s > 2.5"
+to = "lost_interest"
+[[node.transition]]
+when = "cursor.dx_m > 0.15"
+to = "approach_cursor_right"
+[[node.transition]]
+when = "elapsed_s > 12.0"
+to = "lost_interest"
+
+[[node]]
+name = "greet_hand"
+behavior = "idle"
+emote = "head_tilt"                  # THE ONLY INQUIRE IN THE HUMAN LANE, and
+                                     # it is behind a coin because the reason
+                                     # it used to be free was measured and
+                                     # wrong. `regard` carried this gesture,
+                                     # justified as "reaching personal space
+                                     # costs the human several seconds of
+                                     # holding still, which rations the sound
+                                     # by itself". It does not. The loop
+                                     # notice(0.8) -> approach -> regard ->
+                                     # lost_interest(1.5) -> settle(1.5) ->
+                                     # stroll -> notice closes in about fifty
+                                     # seconds and the notice gate re-arms on
+                                     # every pacing node's arrival, so this
+                                     # repo's own putter measured 48-73
+                                     # regards an HOUR against a hand that
+                                     # keeps moving — a chirp every fifty
+                                     # seconds, all day, which is the exact
+                                     # rate the header's sound budget is
+                                     # written against and nine times its
+                                     # stated sixteen an hour. The ball lane
+                                     # hit this first and answered it by taking
+                                     # perk_up off `see_ball` altogether; a
+                                     # hand deserves better than silence, so it
+                                     # gets a real coin instead. 12% of
+                                     # approaches measures 9.8-11.0 an hour on
+                                     # the same putter, against 74.2 before —
+                                     # about the budget the two ends of a nap
+                                     # are on
+[[node.transition]]                  # a beat for the gesture, then attend to
+when = "elapsed_s > 0.8"             # the hand exactly as `regard` does. One
+to = "regard"                        # way only: `regard` has no path back
+                                     # here, so one approach cannot chirp twice
+
+[[node]]
+name = "regard"
+behavior = "idle"
+# SILENT, and `greet_hand` above carries the measurement that made it so. The
+# visible half of this node was always the body: the duck stands still and
+# looks at your hand, which at 180 px on a Dock reads perfectly well without a
+# sound. The sound is now a rarity that arrives through `greet_hand` on a coin.
+[[node.transition]]
+when = "cursor.age_s > 3.0"
+to = "lost_interest"
+[[node.transition]]                  # the hand wandered off again: LEAVE_M is
+when = "cursor.dist_m > 0.55 and cursor.dx_m > 0.0"   # 0.55 rather than the
+to = "approach_cursor_right"                          # 0.22 it stopped at, so
+[[node.transition]]                                   # the duck does not
+when = "cursor.dist_m > 0.55"                         # shuffle after every
+to = "approach_cursor_left"                           # twitch of the mouse
+[[node.transition]]
+when = "elapsed_s > 12.0"            # how long a duck will stand and regard a
+to = "lost_interest"                 # parked cursor before getting on with it
+
+[[node]]
+name = "lost_interest"
+behavior = "idle"
+emote = "nod"                        # the silent one — the same gesture the
+                                     # walls get, and for the same reason. A
+                                     # nod and then back to work: the duck was
+                                     # not waiting on you
+[[node.transition]]
+when = "elapsed_s > 1.5"
+to = "settle"
+
+[[node]]
+name = "petted"
+behavior = "idle"
+emote = "nuzzle"
+# The nuzzle rides HERE as well as on the daemon's touch path, and exactly one
+# of the two ever plays. The touch path's nuzzle (POST /pet/touch, machine=False)
+# is refused whenever the head belongs to a steering node — which is a duck
+# mid-stroll, i.e. nearly every duck anyone actually strokes; on the first
+# hands-on test every pet landed in the tally and looked like nothing at all.
+# This node-entry emote is machine-priority, so it plays in that case — and in
+# the idle case, where the daemon's own nuzzle is already running when the
+# machine arrives here a tick later, the engine's mid-emote refusal drops this
+# one. The refusal semantics make the pair idempotent; no double thank-you.
+# This node's other job is unchanged: STOP WALKING and let it happen.
+#
+# EVERY EXIT WAITS FOR THE REFLEX TO DISARM, and that is not belt and braces.
+# `touch.petted` is `age_s < PET_TOUCH_RECENT_S` (sim_server: 3.0 s) and the
+# global petting transition at the top of this file excludes only `petted`
+# itself — so an exit at 2.5 s handed the body back while the reflex was still
+# armed, the global immediately fired again, and one stroke measured as
+# petted -> regard -> petted -> regard, half a second apart, firing regard's
+# gesture twice. Exactly the double thank-you the paragraph above says this
+# node exists to avoid. Waiting for `touch.age_s > 3.0` closes it at the
+# source: the node cannot be left until the hand's own reflex has gone quiet,
+# and a hand that is still stroking simply keeps the duck standing still,
+# which is the whole point of the node.
+[[node.transition]]
+when = "elapsed_s > 2.5 and touch.age_s > 3.0 and sitting"   # petted mid-nap:
+to = "get_up"                            # get up PROPERLY. `settle` would
+                                         # stroll a seated duck and the gait
+                                         # does nothing at all — measured,
+                                         # that is a duck shuffling on its
+                                         # haunches until the next deadline
+                                         # notices
+[[node.transition]]
+when = "elapsed_s > 2.5 and touch.age_s > 3.0 and cursor.dist_m < 0.35"
+to = "regard"                            # the hand is still there: look at it
+[[node.transition]]
+when = "elapsed_s > 2.5 and touch.age_s > 3.0"
+to = "settle"
+
+
+# --------------------------------------------------------------------------
+# picked up — the one gesture that is a constraint and not a force
+# --------------------------------------------------------------------------
+
+[[node]]
+name = "carried"
+behavior = "idle"                    # zero velocity selects the standing
+                                     # policy, and a standing policy with no
+                                     # ground under it flails. THAT IS THE
+                                     # FEATURE. It is what a real Microduck
+                                     # does when you lift it off the table,
+                                     # it is the same physics as every other
+                                     # node here, and a canned "held" pose
+                                     # would be the first faked frame in the
+                                     # whole pet
+emote = "perk_up"                    # surprise, once per pick-up — and the
+                                     # only sound this file's newest three
+                                     # lanes keep. It is affordable for the
+                                     # reason `regard`'s tilt is: a human had
+                                     # to press and hold still on a 180 px
+                                     # duck to cause it, and unlike the toy
+                                     # the duck has no way of causing it
+                                     # itself
+[[node.transition]]                  # the hand opened. LAND_S of grace and
+when = "not carried and elapsed_s > 0.4"   # then back to the day — with no
+to = "settle"                        # landing node of its own, deliberately:
+                                     # `settle` is idle, the fall reflex does
+                                     # not exclude it, so a duck dropped on
+                                     # its side is `fallen` half a second
+                                     # later through the ladder that already
+                                     # exists, and a duck set down on its feet
+                                     # simply carries on
+
+
+# --------------------------------------------------------------------------
+# the toy — the other thing on this desktop that is not the duck
+#
+# Four nodes, and not one new behavior: `approach_ball` and `kick` are the
+# striker's own controllers, `search_ball` is the glance `peek` already uses,
+# and `idle` is a beat. That is the whole reason this lane cost no controller
+# work — the duck already knew how to walk up to a ball and hit it, it just
+# had nothing to hit on a Dock.
+#
+# The shape is: notice it moving, walk it down, boot it, watch where it went,
+# then stand quietly until the toy has stopped. Every node in it is silent,
+# the rally inside a bout is coin-limited, and the cooldown at the end is what
+# stops the duck's own kick starting the next one — so a toy left on the
+# screen is a toy and not a treadmill.
+# --------------------------------------------------------------------------
+
+[[node]]
+name = "see_ball"
+behavior = "idle"
+# A beat, and a SILENT one — this node wanted `perk_up` and cannot have it.
+# The greet was the design right up until a real daemon was asked: ten
+# minutes armed with a ball nobody touched, and even with the range and speed
+# gates in place, **six bouts** — because a duck pacing a 2 m strip walks into
+# its own toy on most laps, the ball rolls, and the ball rolling is a genuine
+# invitation by every honest reading. Six an hour would have been fine. Six
+# per ten minutes is a greeting chirp every hundred seconds, all day, and the
+# sound budget at the top of this file is written against exactly that.
+#
+# So the play lane says nothing at all, for the reason `notice` says nothing:
+# the duck expresses this by WALKING OVER AND KICKING SOMETHING, which at
+# 180 px on a Dock is a great deal more visible than a chirp. The sounds this
+# wave adds stay where a person put them — the coo the daemon plays when you
+# actually stroke the duck.
+[[node.transition]]
+when = "elapsed_s > 1.0"             # a beat to look at it before setting off
+to = "chase_ball"
+
+[[node]]
+name = "chase_ball"
+behavior = "approach_ball"           # the striker's controller with the
+[node.params]                        # goal-bearing term switched OFF: there
+aim = false                          # is no goal on a Dock, so this is the
+pocket_bearing_deg = 0.0             # plain pocket approach, walking straight
+head_down = 0.5                      # at the ball with the head tilted down
+                                     # (a floor ball leaves the camera frame
+                                     # at ~0.15 m with the head level, which
+                                     # is BEFORE the pocket — the tilt is
+                                     # what makes near-range tracking
+                                     # physically possible at all)
+# THE SERVO AND THE GUARD BELOW MUST NAME THE SAME WINDOW, and this file got
+# that wrong: it took striker.toml's narrow entry guard (-0.086..-0.052) and
+# left the fine-range servo on machine.py's defaults (-0.020 / -0.080). The
+# servo then stops turning the moment est_left reaches -0.020 and vx is
+# already in its own dead band, so the controller is satisfied at about
+# -0.02..-0.04 — inside the servo's window and OUTSIDE the guard's. Nothing
+# moves again, `boot` is unreachable, and the whole play lane ends silently at
+# chase_ball's 25 s deadline. soccer.toml pairs the default servo with a guard
+# of exactly (-0.082, -0.020); striker.toml narrows both together and says so.
+# These are striker's numbers, and they sit inside the guard on both sides so
+# that "controller satisfied" implies "guard fires".
+pocket_left_max = -0.056
+pocket_left_min = -0.082
+[[node.transition]]                  # lost it: go and look, do not stand
+when = "not ball_seen.visible and ball_seen.age_s > 6.0 and elapsed_s > 1.0"
+to = "find_ball"
+# The pocket, and it is striker.toml's window with the goal-bearing term
+# taken out. Every number is measured, none is guessable: forward 0.100-0.125
+# is where the ball connects hard, left -0.086..-0.052 lines it up with the
+# right foot, and `speed_mps < 0.10` is "it has settled" — kicking a ball
+# that is still rolling is how you whiff.
+[[node.transition]]
+when = "ball_seen.visible and ball_seen.age_s < 0.4 and ball_seen.est_forward_m > 0.100 and ball_seen.est_forward_m < 0.125 and ball_seen.est_left_m > -0.086 and ball_seen.est_left_m < -0.052 and ball_seen.speed_mps < 0.10 and elapsed_s > 2.0"
+to = "boot"
+[[node.transition]]                  # the screen is 2.1 m of floor and the
+when = "elapsed_s > 25.0"            # approach is slower than a stroll: 25 s
+to = "settle"                        # is a crossing and a half. Past that the
+                                     # duck is not closing, and standing there
+                                     # trying is not ambient
+
+[[node]]
+name = "find_ball"
+behavior = "search_ball"             # turn in place, head level — the same
+[node.params]                        # glance `peek` uses, asking a question
+wz = 1.5                             # this time
+[[node.transition]]
+when = "ball_seen.visible and ball_seen.age_s < 0.4"
+to = "chase_ball"
+[[node.transition]]                  # six seconds is about 300 degrees at
+when = "elapsed_s > 6.0"             # this rate: a full look round. If it is
+to = "settle"                        # not there, it is behind a window or off
+                                     # past the wall, and the day resumes
+
+[[node]]
+name = "boot"
+behavior = "kick"
+[node.params]
+foot = "right"
+stage_ball = false                   # HONEST MODE, and it is the whole point:
+                                     # staging teleports the ball to the foot
+                                     # before the swing, which is fine for
+                                     # rehearsing a kick policy and would be
+                                     # a magic trick on somebody's Dock. Kick
+                                     # it where it actually is, or whiff.
+settle_s = 0.8                       # stop, look up (the kick policy fed a
+                                     # bowed head does not swing at all —
+                                     # measured, 1.3 m level against 0.00 m
+                                     # at 0.5 rad down), then swing
+[[node.transition]]                  # 0.8 s of settling + the trick's own 3 s
+when = "elapsed_s > 4.4"             # auto-return + a beat to look down again
+to = "watch_ball"
+
+[[node]]
+name = "watch_ball"
+behavior = "idle"
+# Stand and see where it went. Three seconds is long enough for a booted ball
+# to finish rolling, which is what makes the first guard below mean "there is
+# still a rally on" rather than "the ball is mid-flight".
+#
+# THE COIN IS WHAT ENDS THE RALLY, and it is here rather than on a timer for
+# the reason `peek`'s nap coin is: everything else this machine can sense
+# after a kick is downstream of that same kick, so a threshold on any of it
+# is a feedback loop with itself. An honest coin drawn on arrival gives about
+# two boots a bout, which is a duck that had a kick-about and then went back
+# to work — and not one that plays football on your Dock all afternoon.
+[[node.transition]]
+when = "elapsed_s > 3.0 and ball_seen.visible and ball_seen.age_s < 0.4 and roll > 0.5"
+to = "chase_ball"
+[[node.transition]]
+when = "elapsed_s > 3.0"
+to = "ball_rest"
+
+[[node]]
+name = "ball_rest"
+behavior = "idle"
+# THE COOLDOWN, and it is not decoration — it is the node this lane was
+# missing, found the only way it could be found. Offline, on the putter, the
+# play loop measured ZERO spurious bouts, because the putter's coarse gait
+# never actually reaches the kick pocket. On a real daemon it does: measured,
+# ten minutes with a ball nobody touched, **15 `see_ball` entries** — a bout
+# every forty seconds. The duck's own boot sets the ball rolling, the rolling
+# ball satisfies the play gate, and the loop feeds itself.
+#
+# So a bout does not end until the TOY has stopped. This node is excluded
+# from the global gate above, it is silent, and it waits for the ball to
+# settle rather than for a clock — because how long a kicked ball rolls is a
+# fact about the kick, and a timer would be guessing at it. The 12 s deadline
+# is only for a ball that rolled out of sight, where there is nothing left to
+# wait for and `speed_mps` has gone null.
+[[node.transition]]
+when = "elapsed_s > 2.0 and ball_seen.speed_mps < 0.10"
+to = "settle"
+[[node.transition]]
+when = "elapsed_s > 12.0"
 to = "settle"
 
 

@@ -40,6 +40,38 @@ rather than remembered:
    round — a window that does not match the image inside it is the one bug a
    screenshot cannot show you. `pet_map` owns that conversion.
 
+The mouse says four different things through one button. Three of them are
+named on the way *up*, in `pet_map.classify_release`: a click is a poke, a
+slow short stroke that ends on the duck is a pet, and anything faster is a
+shove. Only the first and the last reach `qvel` — a pet is answered by the
+duck, not by the physics, which is the one place in this app where "nothing is
+faked" means "and nothing is moved either". Alongside all that the window
+reports where the mouse *is*, five times a second, so a duck can notice a hand
+that has not touched it yet.
+
+The fourth is named on the way *down*, or rather partway through: a press that
+stays still for `CARRY_HOLD_S` is a **pick-up**, and from then on the pointer
+is streamed to `/pet/carry` and the duck hangs off an invisible welded hand
+until the button comes up. That promotion is decided on the 30 Hz tick and not
+in the drag callback, because `mouseDragged_` does not fire when the mouse
+does not move — a perfectly still hold, which is exactly the gesture, produces
+no events at all. Picking the duck up is also the one gesture that moves the
+WINDOW as well as the duck: the daemon's camera follows a lifted duck upwards
+and says how far in `screen.frame_floor_z_m`, and `_place` climbs the screen
+by the same amount.
+
+There are two things in the window to press on, and which one a press was
+aimed at is decided on the way *down*, in `press_target`, from the two boxes
+the daemon sends (`bbox` is the duck, `ball_bbox` is the toy — on the
+segmentation path; the chroma fallback cannot split them and says so, and
+`hit_rect_pt` falls back to arithmetic rather than believe it). A press on the
+ball is always a push — you do not pet a ball — and it travels through the
+same `/pet/push` route with `target: "ball"`, so the shove that rolls the toy
+is the shove that staggers the duck, at the same gain, into a different qvel.
+The toy is only in the picture while it is within about 0.195 m of the duck;
+past that it is neither drawn nor clickable, and the duck has to go and fetch
+it (`machines/pet.toml`'s chase), which is the design and not a limit.
+
 Threading: Cocoa's main thread only draws and moves the window; every socket
 lives on `pet_feed.PetFeed`'s background thread.
 
@@ -52,6 +84,7 @@ lives on `pet_feed.PetFeed`'s background thread.
 """
 
 import argparse
+import math
 import signal
 import sys
 import time
@@ -133,20 +166,230 @@ def hit_rect_pt(smap: pet_map.ScreenMap, pose: dict = None) -> tuple:
     this prefers it; the nominal standing box is deliberately generous, because
     a grab rectangle that is slightly too big is a far smaller sin than a duck
     you cannot grab.
+
+    **Except on the chroma fallback, where `bbox` is not the duck.** The
+    segmentation pass splits its masks and hands back a duck box and a ball
+    box; the fallback is "every pixel that is not the backdrop", which is one
+    silhouette covering duck AND toy with `ball_bbox: null` beside it. Trusting
+    that box would make the ball part of the duck again — a click on the toy
+    would shove the animal, and a stroke that ended on the ball would read as
+    a pet — which is the exact bug the mask split exists to prevent. The daemon
+    says which path it is on (`alpha`), so this asks rather than assumes, and
+    under chroma falls back to the nominal standing box: duck-sized, centred,
+    and leaving `ball_rect_pt`'s own arithmetic free to answer for the toy.
     """
     w = smap.window_pt
-    bbox = (pose or {}).get("bbox")
-    if (isinstance(bbox, (list, tuple)) and len(bbox) == 4
-            and bbox[2] > bbox[0] and bbox[3] > bbox[1]):
-        s = w / float(smap.frame_px)
-        x0, y0, x1, y1 = (float(v) * s for v in bbox)
-        # bbox counts down from the top (image order); Cocoa counts up.
-        return (x0 - HIT_PAD_PT, (w - y1) - HIT_PAD_PT,
-                x1 + HIT_PAD_PT, (w - y0) + HIT_PAD_PT)
+    pose = pose or {}
+    rect = (None if pose.get("alpha") == "chroma"
+            else _bbox_rect_pt(smap, pose.get("bbox")))
+    if rect is not None:
+        return rect
     half = pet_map.DUCK_DEPTH_M * smap.px_per_meter   # beak and tail included
     foot = smap.ground_pt
     return (0.5 * w - half - HIT_PAD_PT, foot - HIT_PAD_PT,
             0.5 * w + half + HIT_PAD_PT, foot + smap.duck_pt + HIT_PAD_PT)
+
+
+def _bbox_rect_pt(smap: pet_map.ScreenMap, bbox) -> tuple:
+    """A daemon bbox (frame pixels, top-left origin) as a Cocoa rectangle.
+
+    Shared by the duck's box and the ball's because it is the same flip both
+    times: the frame counts rows down from the top, Cocoa counts points up
+    from the bottom, and the scale between them is window points per frame
+    pixel. `None` for anything that is not a real box — the daemon sends
+    `null` the moment a thing leaves the frame, and the callers below each
+    have their own arithmetic to fall back on.
+    """
+    if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+        return None
+    try:
+        x0, y0, x1, y1 = (float(v) for v in bbox)
+    except (TypeError, ValueError):
+        return None
+    if not (x1 > x0 and y1 > y0):
+        return None
+    w = smap.window_pt
+    s = w / float(smap.frame_px)
+    x0, y0, x1, y1 = x0 * s, y0 * s, x1 * s, y1 * s
+    return (x0 - HIT_PAD_PT, (w - y1) - HIT_PAD_PT,
+            x1 + HIT_PAD_PT, (w - y0) + HIT_PAD_PT)
+
+
+def ball_rect_pt(smap: pet_map.ScreenMap, pose: dict = None) -> tuple:
+    """Where the ball's pixels are inside the window, in Cocoa points.
+
+    The exact twin of `hit_rect_pt`, and it shares that function's discipline:
+    prefer the daemon's `ball_bbox`, which comes off the segmentation mask and
+    is the real silhouette, and fall back to arithmetic otherwise.
+
+    The fallback is the case that MATTERS here, unlike for the duck. The duck
+    is always in its own frame; the ball is only in it while it is within
+    ~0.195 m of the duck, and `ball_bbox` is `null` the instant it is not. But
+    "was that press on the ball?" still has to be answerable then, and the
+    answer has to be NO — so this returns a real rectangle, computed from
+    `pose["ball"]`, which simply falls outside the window when the ball is
+    somewhere else. A `None` there would work by accident; a rectangle in the
+    right place works on purpose, and keeps working the moment the ball rolls
+    a few pixels back into view.
+
+    `None` only when there is no ball at all — a scene without one, or a
+    daemon that has not sent a pose yet.
+    """
+    pose = pose or {}
+    rect = _bbox_rect_pt(smap, pose.get("ball_bbox"))
+    if rect is not None:
+        return rect
+    ball = pose.get("ball")
+    if not isinstance(ball, dict) or ball.get("x_m") is None:
+        return None
+    # The window is centred on the duck and hung off the frame's floor line,
+    # so the ball's own metres map straight into window points. `frame_floor_z_m`
+    # is the lift the camera has taken (0 unless the duck is being carried);
+    # a daemon that does not report it has not lifted anything.
+    base_x = float(pose.get("base_x_m") or 0.0)
+    floor_z = float((pose.get("screen") or {}).get("frame_floor_z_m") or 0.0)
+    ppm = smap.px_per_meter
+    cx = 0.5 * smap.window_pt + (float(ball["x_m"]) - base_x) * ppm
+    cy = smap.ground_pt + (float(ball.get("z_m") or 0.0) - floor_z) * ppm
+    r = float(ball.get("radius_m") or pet_map.BALL_RADIUS_M) * ppm + HIT_PAD_PT
+    return (cx - r, cy - r, cx + r, cy + r)
+
+
+def press_target(smap: pet_map.ScreenMap, pose: dict, x_pt: float,
+                 y_pt: float) -> str:
+    """What a press at that window point is ON: `'duck'`, `'ball'` or `'none'`.
+
+    One place, because two callers need the same answer and must not disagree:
+    `beginDrag_` decides what a gesture is about, and `_update_click_through`
+    decides whether the window is solid at all. If the window were solid over
+    a ball that `beginDrag_` then read as duck, a click on the toy would shove
+    the animal.
+
+    The duck wins a tie. They overlap when the duck is standing over the ball,
+    and at that moment the thing you meant to grab is the one you can see.
+
+    The duck is asked first on both alpha paths, and it is safe on both:
+    `hit_rect_pt` refuses the chroma fallback's combined `bbox` and answers
+    with the nominal standing box there, so the toy is not swallowed by a
+    silhouette that happens to include it.
+    """
+    if _inside(hit_rect_pt(smap, pose), x_pt, y_pt):
+        return "duck"
+    if _inside(ball_rect_pt(smap, pose), x_pt, y_pt):
+        return "ball"
+    return "none"
+
+
+def _inside(rect, x_pt, y_pt) -> bool:
+    """Is that window-local point inside that rectangle? None is never hit."""
+    if not rect:
+        return False
+    x0, y0, x1, y1 = rect
+    return (x0 <= x_pt <= x1) and (y0 <= y_pt <= y1)
+
+
+# ------------------------------------------------- what the hand is doing
+#
+# Four gestures share one mouse button, and every decision about WHICH one is
+# happening lives in the four functions below rather than inside the Cocoa
+# delegate. They take a `drag` record, a clock and a couple of points, and
+# they touch nothing else — because this is the single easiest thing in the
+# app to get wrong and the only way to hold it still is to be able to run it
+# without a window server. `PetController` keeps the plumbing: reading the
+# mouse, talking to the feed, drawing.
+#
+# The `drag` record is built once in `beginDrag_` and is the whole memory of
+# a gesture: when and where the button went down (`t0`, `x0`, `y0`), what it
+# was aimed at (`target`), whether it has already become a pick-up (`mode`)
+# and whether it ever can (`carry_off`).
+
+
+def drag_left_the_spot(drag: dict, x_pt: float, y_pt: float) -> bool:
+    """Has the hand moved far enough that this press can never be a hold?
+
+    Six points is one Retina pixel-pair of tremor. Past that the hand is
+    dragging, and `sampleDrag_` latches it for the life of the gesture — a
+    press that wandered and came back was still a drag. The sampler is the
+    only place that sees every mouse move, which is why the latch lives there
+    and the promotion below merely reads it.
+    """
+    return (math.hypot(x_pt - drag["x0"], y_pt - drag["y0"])
+            > pet_map.CARRY_SLOP_PT)
+
+
+def promote_to_carry(drag: dict, now: float) -> bool:
+    """Should this press become a pick-up on this tick?
+
+    Four terms, and each rules out a different gesture: it must not already
+    be a carry (`undecided`), it must not have moved (`carry_off`), it must
+    be on the animal — you do not pick up a ball — and it must have lasted
+    `CARRY_HOLD_S`. Asked from the UI timer and never from the drag callback:
+    `mouseDragged_` does not fire when the mouse does not move, so a
+    perfectly still hold, which is exactly what a pick-up is made of,
+    produces no events at all.
+    """
+    return (drag is not None and drag["mode"] == "undecided"
+            and not drag["carry_off"] and drag["target"] == "duck"
+            and now - drag["t0"] >= pet_map.CARRY_HOLD_S)
+
+
+def carry_was_lost(drag: dict, carrying: bool) -> bool:
+    """Did the duck leave this window's hand without the button coming up?
+
+    A reconnect, or the daemon's own 1.5 s deadman, ends a carry the mouse
+    knows nothing about. Only meaningful once the grip was actually SEEN
+    (`carry_seen`): between `carry_start` and the feed's first confirmation
+    there is no token yet, and treating that gap as a loss would abandon
+    every pick-up on the tick it began.
+    """
+    return (drag is not None and drag["mode"] == "carry"
+            and bool(drag["carry_seen"]) and not carrying)
+
+
+def release_kind(drag: dict, now: float, total_dx: float, total_dy: float,
+                 tail_dx: float, tail_dy: float) -> str:
+    """What the button coming up meant. Five names, three lanes.
+
+      * A press that became a **carry** is already answered — the duck has
+        been hanging off a hand — so there is nothing to classify: `carry`
+        lets go and the daemon hands over whatever velocity the hand had.
+        Unless the hand never went anywhere and let go almost at once, which
+        was not a pick-up but a hand RESTING on a duck: `carry_pet` lets go
+        and answers it as a stroke.
+      * A press on the **ball** is a push or a poke and nothing else. The
+        classifier is not consulted — "a gentle stroke of a ball" is not a
+        thing.
+      * Everything else is `pet_map.classify_release`'s three, judged on the
+        press's own record: where the hand ended up is the classifier's
+        business only as displacement, never as a hit test (the duck walks
+        while it is stroked).
+    """
+    if drag["mode"] == "carry":
+        tap = (math.hypot(total_dx, total_dy) < pet_map.CARRY_STILL_PT
+               and now - drag["t0"] < pet_map.CARRY_TAP_S)
+        return "carry_pet" if tap else "carry"
+    if drag["target"] == "ball":
+        return "poke" if pet_map.is_click(total_dx, total_dy) else "push"
+    return pet_map.classify_release(now - drag["t0"], total_dx, total_dy,
+                                    tail_dx, tail_dy)
+
+
+def cursor_due(now: float, last_at: float, last_m, here_m) -> bool:
+    """Is this pointer sample worth a post? Five a second, or one a second.
+
+    The rate limit for `/pet/sense`: while the pointer is moving it goes at
+    `SENSE_HZ`, and while it sits still the heartbeat carries it. The
+    heartbeat is not padding — the daemon stales a sample in 2 s, and a duck
+    that decided the hand had left the room *because it stopped moving*,
+    which is exactly what a hand does while it waits for the duck, is the
+    whole feature failing at the last second.
+    """
+    since = now - last_at
+    moved = (last_m is None
+             or math.hypot(here_m[0] - last_m[0], here_m[1] - last_m[1])
+             >= pet_map.SENSE_MIN_M)
+    return ((moved and since >= 1.0 / pet_map.SENSE_HZ)
+            or since >= pet_map.SENSE_HEARTBEAT_S)
 
 
 # ---------------------------------------------------------------- the shell
@@ -200,7 +443,8 @@ def build(AppKit, Foundation, objc, smap, feed, args):
                 AppKit.NSRectFillUsingOperation(
                     bounds, AppKit.NSCompositingOperationSourceAtop)
 
-        # ----- the only two gestures the pet has -----
+        # ----- the hand: down, moving, up. What it MEANT is decided in
+        # pet_map.classify_release; this view only reports events. -----
 
         def mouseDown_(self, event):
             if self.ctl is not None:
@@ -234,6 +478,12 @@ def build(AppKit, Foundation, objc, smap, feed, args):
             self.interrupted = False
             self.drag = None
             self.click_through = True
+            # The cursor channel's rate limiter: when the last sample went
+            # out, where it said the pointer was (metres), and whether we
+            # have already told the daemon the pointer left this screen.
+            self._sense_at = 0.0
+            self._sense_m = None
+            self._sense_present = False
             # Is anybody in a position to see this window? Every frame the
             # feed asks for costs a ~40 ms render on the daemon's SIM thread,
             # so a duck behind a locked screen is a pinned core for nothing.
@@ -295,8 +545,10 @@ def build(AppKit, Foundation, objc, smap, feed, args):
                 self.view.stale = stale
                 self.view.setNeedsDisplay_(True)
                 self._say("offline — the duck freezes" if stale else "back")
+            self._gesture_tick(snap)
             self._place()
             self._update_click_through()
+            self._send_cursor()
 
         @objc.python_method
         def _resize_to(self, smap):
@@ -351,7 +603,14 @@ def build(AppKit, Foundation, objc, smap, feed, args):
             x_m = self.pose.get("base_x_m")
             if x_m is None:
                 return
-            ox, oy = self.smap.window_origin(float(x_m))
+            # How far the daemon's camera has followed the duck upwards — 0
+            # for a duck on the Dock, which is every duck that is not being
+            # carried. When it is not 0 the window has to climb the screen by
+            # exactly the same amount, or the picture rises inside a window
+            # that stayed put and the duck looks like it shrank into its own
+            # frame. A daemon too old to report it has not lifted anything.
+            floor_z = (self.pose.get("screen") or {}).get("frame_floor_z_m")
+            ox, oy = self.smap.window_origin(float(x_m), float(floor_z or 0.0))
             frame = self.win.frame()
             if abs(frame.origin.x - ox) > 0.05 or abs(frame.origin.y - oy) > 0.05:
                 self.win.setFrameOrigin_(Foundation.NSMakePoint(ox, oy))
@@ -382,9 +641,17 @@ def build(AppKit, Foundation, objc, smap, feed, args):
                 p = AppKit.NSEvent.mouseLocation()
                 f = self.win.frame()
                 lx, ly = p.x - f.origin.x, p.y - f.origin.y
+                # The ball counts as something to be solid over. It is drawn
+                # in this window, it can be shoved from this window, and a
+                # transparent square that let a click through onto a Dock
+                # icon while a duck's toy was sitting right there would be a
+                # ball you can see and cannot touch. `press_target` is the
+                # one place that decision lives, and `beginDrag_` asks it the
+                # same question — they must never disagree.
+                what = press_target(self.smap, self.pose, lx, ly)
+                over = what != "none"
                 x0, y0, x1, y1 = hit_rect_pt(self.smap, self.pose)
-                over = (x0 <= lx <= x1) and (y0 <= ly <= y1)
-                why = (f"cursor ({lx:.0f}, {ly:.0f}) vs duck "
+                why = (f"cursor ({lx:.0f}, {ly:.0f}) on {what} | duck "
                        f"({x0:.0f}, {y0:.0f})-({x1:.0f}, {y1:.0f})")
             if over == self.click_through:
                 self.click_through = not over
@@ -406,46 +673,295 @@ def build(AppKit, Foundation, objc, smap, feed, args):
                 self._last_complaint = error
                 self._say("no frame yet", error)
 
-        # ----- drag / poke -----
+        # ----- poke / pet / shove -----
 
         def beginDrag_(self, event):
+            """The button went down. Record where, and decide what it is ON.
+
+            The target is decided ONCE, here, and never revisited: a press
+            that started on the duck is about the duck even if the hand
+            wanders off it, the same way a scrollbar keeps a drag that leaves
+            the scrollbar. There are two things to press on now, and
+            `press_target` is the only place that question is answered —
+            `_update_click_through` asks it too, and a window that was solid
+            over the ball while this read "duck" would turn a click on the toy
+            into a shove of the animal.
+
+            A press on the BALL can only ever be a push. `carry_off` is
+            latched here so the hold can never promote, and the release
+            classifier is skipped for it below: you do not pet a ball and you
+            do not pick one up. That is not a limitation, it is what makes the
+            toy read as a toy.
+            """
             p = AppKit.NSEvent.mouseLocation()
-            self.drag = {"x0": p.x, "y0": p.y,
-                         "in_win": event.locationInWindow().x,
-                         "samples": [(time.time(), p.x, p.y)]}
+            loc = event.locationInWindow()
+            target = press_target(self.smap, self.pose, loc.x, loc.y)
+            if target == "none":
+                target = "duck"     # solid but on neither: treat as the duck
+            # Which side of the TOY the press landed on, decided here and not
+            # at release. `loc.x` is window-local and this window travels with
+            # the walking duck — 0.26 m/s is 170 pt/s, so a 100 ms click moves
+            # the frame ~17 pt while the ball's clickable half-width is only
+            # 31 pt. Comparing a press recorded in one frame against a centre
+            # measured in another can flip the sign and roll the toy TOWARDS
+            # the finger. Both numbers now come from one instant. (The duck
+            # needs none of this: it is pinned to the window's own centre, so
+            # the pairing is exact whenever the window is.)
+            ball_mid = None
+            if target == "ball":
+                rect = ball_rect_pt(self.smap, self.pose)
+                ball_mid = 0.5 * (rect[0] + rect[2]) if rect else None
+            self.drag = {
+                "t0": time.time(),
+                "x0": p.x, "y0": p.y,
+                "in_win": loc.x, "in_win_y": loc.y,
+                "target": target,
+                "ball_mid": ball_mid,
+                # The carry lane's two: a press that stays still long enough
+                # becomes a pick-up, and `carry_off` is the latch that says it
+                # never can. They are maintained HERE rather than there
+                # because `sampleDrag_` is the only place that sees every
+                # mouse move — a promotion decided anywhere else would be
+                # deciding on a hand it did not watch.
+                "mode": "undecided",
+                "carry_off": target == "ball",
+                # The carry's own bookkeeping: when the hand last restated
+                # itself to the daemon, and whether the daemon has ever
+                # confirmed the grip. Both are only read once `mode` is
+                # "carry" (see `_gesture_tick`).
+                "last_carry_at": 0.0,
+                "carry_seen": False,
+                "samples": [(time.time(), p.x, p.y)],
+            }
 
         def sampleDrag_(self, event):
             if self.drag is None:
                 return
             p = AppKit.NSEvent.mouseLocation()
-            s = self.drag["samples"]
+            d = self.drag
+            s = d["samples"]
             s.append((time.time(), p.x, p.y))
             del s[:-24]
+            if drag_left_the_spot(d, p.x, p.y):
+                d["carry_off"] = True
+            if d["mode"] == "carry":
+                # A moving hand should not wait for the next 30 Hz tick to be
+                # heard. `_carry_move` is rate-limited to CARRY_HZ either way,
+                # so this only ever makes the grip more responsive — it never
+                # makes it chattier.
+                self._carry_move()
+
+        # ----- the fourth gesture: a hold that becomes a pick-up -----
+
+        @objc.python_method
+        def _gesture_tick(self, snap):
+            """Promote a still hold into a carry, and keep a live one alive.
+
+            This runs off the 30 Hz timer rather than off `sampleDrag_`, and
+            that is the whole reason it exists as a separate method:
+            `mouseDragged_` does not fire when the mouse does not move, so a
+            perfectly still press — which is exactly what a pick-up is made
+            of — produces no events at all after the button goes down. A
+            promotion decided in the sampler would simply never happen.
+
+            Keeping a live carry alive is not optional either. The daemon
+            releases the weld after 1.5 s of silence (its deadman against a
+            crashed overlay), so a grip that stopped talking because the hand
+            stopped moving would put the duck down by itself.
+            """
+            d = self.drag
+            if d is None:
+                return
+            if d["mode"] == "carry":
+                carrying = bool(snap.get("carrying"))
+                if carry_was_lost(d, carrying):
+                    # The feed's token went away: a reconnect, or the daemon's
+                    # own deadman. Whatever this window thinks, the duck is
+                    # back on the floor — so the gesture is over, and the next
+                    # mouse-up must not send an `end` for a grip nobody holds.
+                    self._say("carry", "lost — the daemon let go")
+                    self.drag = None
+                    return
+                if carrying:
+                    d["carry_seen"] = True
+                self._carry_move()
+                return
+            if promote_to_carry(d, time.time()):
+                self._begin_carry()
+
+        @objc.python_method
+        def _carry_point(self) -> dict:
+            """Where the pointer is, in the duck's own metres."""
+            p = AppKit.NSEvent.mouseLocation()
+            return pet_map.screen_to_sim_m(self.smap, p.x, p.y)
+
+        @objc.python_method
+        def _begin_carry(self):
+            d = self.drag
+            d["mode"] = "carry"
+            d["last_carry_at"] = time.time()
+            d["carry_seen"] = False
+            self.feed.carry_start(**self._carry_point())
+            self._say("carry", f"held still for "
+                               f"{pet_map.CARRY_HOLD_S:.2f} s — picking it up")
+
+        @objc.python_method
+        def _carry_move(self):
+            d = self.drag
+            now = time.time()
+            if now - d["last_carry_at"] < 1.0 / pet_map.CARRY_HZ:
+                return
+            d["last_carry_at"] = now
+            self.feed.carry_move(**self._carry_point())
+
+        @objc.python_method
+        def _end_carry(self):
+            self.feed.carry_end()
+            self._say("carry", "let go")
 
         def endDrag_(self, event):
+            """The button came up — and only now is the gesture named.
+
+            `release_kind` does the naming from five numbers: how long the
+            hand was down, how far it went in total, how fast it was still
+            going at the end, and whether it let go on the animal. A poke and
+            a shove both land in qvel; a pet deliberately does not touch the
+            physics at all, and a carry has already been answered by the weld.
+            Everything below this line is plumbing — measuring the tail,
+            sending the result.
+            """
             d, self.drag = self.drag, None
             if d is None:
                 return
             p = AppKit.NSEvent.mouseLocation()
+            now = time.time()
             total_dx, total_dy = p.x - d["x0"], p.y - d["y0"]
-            if pet_map.is_click(total_dx, total_dy):
-                push = pet_map.poke_to_push(d["in_win"], self.smap.window_pt)
-                kind = "poke"
+            # A flick is its last few milliseconds, not its average: a slow
+            # drag that ends in a snap should shove like a snap. The same tail
+            # is what tells a stroke from a throw, so it is measured for every
+            # gesture rather than only for the ones already known to be drags.
+            ref = d["samples"][0]
+            for sample in d["samples"]:
+                if now - sample[0] <= pet_map.FLICK_WINDOW_S:
+                    break
+                ref = sample
+            tail_dx, tail_dy = p.x - ref[1], p.y - ref[2]
+            kind = release_kind(d, now, total_dx, total_dy, tail_dx, tail_dy)
+            if kind in ("carry", "carry_pet"):
+                # A pick-up has already happened; there is nothing left to
+                # classify. Let go, and the daemon hands the duck whatever
+                # velocity the hand had — a flung duck flies, a duck set down
+                # gently does not, and neither of those is this app's decision.
+                self._end_carry()
+                # ...unless the hand never went anywhere and let go almost at
+                # once. That was not a pick-up, it was a hand RESTING on a
+                # duck, and the kindest reading of it is a pet. The daemon has
+                # already put the duck back down by the time this lands.
+                if kind == "carry_pet":
+                    base_x = self.pose.get("base_x_m") or 0.0
+                    self.feed.touch(pet_map.touch_payload(
+                        self.smap, p.x, p.y, base_x_m=base_x,
+                        duration_s=now - d["t0"],
+                        travel_pt=math.hypot(total_dx, total_dy)))
+                    self._say("pet", "a hand that rested and let go, not a lift")
+                return
+            if kind == "pet":
+                base_x = self.pose.get("base_x_m") or 0.0
+                self.feed.touch(pet_map.touch_payload(
+                    self.smap, p.x, p.y, base_x_m=base_x,
+                    duration_s=now - d["t0"],
+                    travel_pt=math.hypot(total_dx, total_dy)))
+                self._say("pet", f"{now - d['t0']:.2f} s, "
+                                 f"{math.hypot(total_dx, total_dy):.0f} pt, "
+                                 f"tail {math.hypot(tail_dx, tail_dy):.0f} pt")
+                return
+            if kind == "poke":
+                # A poke shoves away from the finger, measured about the
+                # thing's own centre: the window's middle for the duck (which
+                # is always centred in its frame), and the ball's rectangle
+                # for the ball (which is wherever it rolled to). The toy's
+                # centre is the one recorded in `beginDrag_` — the same
+                # instant, and therefore the same window frame, as the press
+                # it is being compared with. See there for what a window that
+                # moved in between does to the sign.
+                push = pet_map.poke_to_push(d["in_win"], self.smap.window_pt,
+                                            center_pt=d.get("ball_mid"))
             else:
-                # A flick is its last few milliseconds, not its average: a slow
-                # drag that ends in a snap should shove like a snap.
-                now = time.time()
-                ref = d["samples"][0]
-                for sample in d["samples"]:
-                    if now - sample[0] <= pet_map.FLICK_WINDOW_S:
-                        break
-                    ref = sample
-                push = pet_map.drag_to_push(p.x - ref[1], p.y - ref[2],
+                push = pet_map.drag_to_push(tail_dx, tail_dy,
                                             self.smap.px_per_meter)
-                kind = "drag"
-            self._say(kind, f"{push['dx_m']:+.3f}, {push['dy_m']:+.3f} m "
-                            f"-> ~{pet_map.push_speed_mps(push):.2f} m/s")
+            push = {**push, "target": d["target"]}
+            self._say(kind, d["target"],
+                      f"{push['dx_m']:+.3f}, {push['dy_m']:+.3f} m "
+                      f"-> ~{pet_map.push_speed_mps(push):.2f} m/s")
             self.feed.push(push)
+
+        # ----- where the hand is when it is not touching anything -----
+
+        @objc.python_method
+        def _send_cursor(self):
+            """Tell the daemon where the mouse pointer is, in the duck's metres.
+
+            This is the only thing the duck can perceive that is not physics,
+            and it is deliberately the cheapest channel in the app: five posts
+            a second while the pointer moves, one a second while it sits
+            still, and nothing at all while the screen is asleep. The daemon
+            spends no render on it (`sim_server._handle_pet_sense`), so the
+            entire cost is one queued 50 Hz tick.
+
+            The heartbeat is not padding. A cursor sample goes stale in two
+            seconds on the daemon's side, and a duck that walked over to a
+            pointer only to decide it had left the room — because the hand
+            stopped moving, which is exactly what a hand does when it is
+            waiting for the duck — would be the whole feature failing at the
+            last second.
+            """
+            if not self.awake:
+                return          # a locked screen has no pointer worth reporting
+            if self.drag is not None and self.drag["mode"] == "carry":
+                # The carry channel already carries the pointer, at four times
+                # this rate. Two channels saying where the same mouse is would
+                # be two sim ticks spent on one fact — and the duck's `cursor.*`
+                # guards have nothing to say about a hand that is holding it.
+                return
+            p = AppKit.NSEvent.mouseLocation()
+            now = time.time()
+            if not self._on_this_screen(p.x, p.y):
+                # Said once, not every tick: "gone" is one fact.
+                if self._sense_present:
+                    self._sense_present = False
+                    self._sense_at = now
+                    self.feed.sense({"present": False})
+                return
+            body = pet_map.cursor_payload(self.smap, p.x, p.y)
+            if not cursor_due(now, self._sense_at, self._sense_m,
+                              (body["x_m"], body["z_m"])):
+                return
+            self._sense_at = now
+            self._sense_m = (body["x_m"], body["z_m"])
+            self._sense_present = True
+            # Stamped with THIS clock, at measurement time: the daemon
+            # computes `cursor.speed_mps` from consecutive `t_s` deltas,
+            # because its own arrival times are queue-compressed behind
+            # renders (see `_handle_pet_sense`) and read a wiggling hand as
+            # anything from 6x too fast to standing still.
+            body["t_s"] = time.monotonic()
+            self.feed.sense(body)
+
+        @objc.python_method
+        def _on_this_screen(self, x_pt, y_pt) -> bool:
+            """Is the pointer on the display the duck lives on?
+
+            `ScreenMap` carries the usable band and the screen's height, which
+            is the whole test on a one-display Mac (Cocoa's global space puts
+            the main screen's origin at 0,0). On a second display to the side
+            the x test already answers correctly; one stacked above or below
+            would need the screen's own origin, which the map does not carry —
+            and the cost of getting it wrong is a `present: False` the next
+            sample immediately corrects.
+            """
+            s = self.smap
+            return (s.left_pt <= x_pt <= s.left_pt + s.width_pt
+                    and 0.0 <= y_pt <= s.screen_h_pt)
 
         # ----- nobody is looking -----
 

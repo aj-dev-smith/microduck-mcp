@@ -111,6 +111,22 @@ GUARD_PATHS = {
     # lives — while the grammar has no abs() to paper over it. The components
     # are wrap-free and read plainly: `base.heading_x > 0.0` is "pointing +x".
     "base.x", "base.y", "base.yaw_deg", "base.heading_x", "base.heading_y",
+    # The human, as the desktop pet sees one (sim_server's _pet_cursor_state /
+    # _pet_touch_state). The overlay is the only thing on either side of the
+    # socket that can see a mouse pointer, so unlike base.* these come from
+    # the SERVER's digest — but they are shaped the same way ball_seen is, and
+    # for the same reason: a machine asks where something is and how long ago
+    # it was true, and a null answers every question about a hand that is not
+    # there. `dx_m` is signed (which way to walk), `dist_m` is horizontal only
+    # (a cursor held overhead is 0 m away — the duck cannot walk upwards).
+    "cursor.present", "cursor.x_m", "cursor.z_m", "cursor.dx_m",
+    "cursor.dist_m", "cursor.age_s", "cursor.near_floor", "cursor.speed_mps",
+    "touch.petted", "touch.age_s", "touch.count",
+    # Being held. False on every daemon that has no weld to be held by, which
+    # is what lets a machine carve `not carried` out of its fall reflex — a
+    # duck dangling from a hand reads `not upright` within a second, and
+    # without the carve-out every pick-up is a fall.
+    "carried", "carried_s",
     "elapsed_s", "sim_time_s", "node", "roll",
 }
 

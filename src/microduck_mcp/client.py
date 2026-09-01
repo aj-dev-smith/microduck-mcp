@@ -114,6 +114,28 @@ def main():
     pet.add_argument("--wall-margin-m", type=float, default=None)
     pet.add_argument("--corridor-m", type=float, default=None)
     pet.add_argument("--floor-pad-px", type=int, default=None)
+    # How high above the walk line a mouse pointer still counts as "down here
+    # with me" — the threshold behind `cursor.near_floor`, which is what
+    # machines/pet.toml checks before crossing the screen to look at a hand.
+    # A claim about a SCREEN (a taller Dock, a bigger duck, another scale all
+    # move it), so it is config rather than a constant.
+    pet.add_argument("--cursor-floor-m", type=float, default=None)
+    # How big the toy is. Reported by the scene rather than chosen — the head
+    # camera's range solve is built on it — but writable, because a future
+    # desktop scene with a different ball would otherwise need a protocol
+    # change to say so. The overlay reads it back to draw a grab box round a
+    # ball that has rolled out of the frame's own `ball_bbox`.
+    pet.add_argument("--ball-radius-m", type=float, default=None)
+    # The pick-up's three. All of them are claims about a SCREEN rather than
+    # about physics, which is why they are config: how high a duck may be
+    # carried before it has left the display it lives on, how fast the
+    # invisible hand chases the pointer (a cursor jump must not teleport a
+    # welded duck), and how far off the floor a duck has to be before the pet
+    # camera starts following it up — the number that decides whether a
+    # stumble looks like a fall or like a camera move.
+    pet.add_argument("--carry-max-z-m", type=float, default=None)
+    pet.add_argument("--carry-hand-speed-mps", type=float, default=None)
+    pet.add_argument("--lift-trigger-m", type=float, default=None)
     pet.add_argument("--size-px", type=int, default=None,
                      help="frame: render at this size instead of the configured one")
     pet.add_argument("--rects", default=None,
@@ -189,7 +211,9 @@ def main():
             # own is a read, not a reset to argparse's idea of a screen.
             for flag in ("px_per_meter", "screen_width_px", "frame_px",
                          "supersample", "wall_margin_m", "corridor_m",
-                         "floor_pad_px"):
+                         "floor_pad_px", "cursor_floor_m", "ball_radius_m",
+                         "carry_max_z_m", "carry_hand_speed_mps",
+                         "lift_trigger_m"):
                 val = getattr(args, flag, None)
                 if val is not None:
                     req[flag] = val

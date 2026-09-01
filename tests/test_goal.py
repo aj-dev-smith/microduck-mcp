@@ -163,9 +163,28 @@ class _StubSim:
         self._goal_seen = dict(GOAL_NOT_SEEN)
         self._goal_seen_t = 0.0
         self.machine = None
+        # The desktop pet's senses ride in _machine_digest too. A goal scene
+        # has no overlay attached, so these are the blanks it reports — and
+        # they are here rather than absent because the digest's KEY SET is
+        # what `test_key_set_is_stable_across_scenes` is about.
+        self._pet_cursor = None
+        self._pet_touch = {"t": None, "count": 0, "ack_t": None}
+        # ...and no hand holding it either. A goal scene has no `pet_carry`
+        # weld in it at all, so `carried` is the constant False that lets
+        # machines/pet.toml's carve-outs load anywhere.
+        self._pet_carry = None
+        self.pet = {"cursor_floor_m": 0.35}
+        self.qpos_adr = 0
 
     def _goal_estimates(self):
         return None, None  # goal never sighted
+
+    # Borrowed whole from the real thing rather than re-implemented, which is
+    # the point of the stub: `_machine_digest` is under test here, and a
+    # hand-written blank cursor block would let the two drift while this file
+    # went on passing.
+    _pet_cursor_state = DuckSim._pet_cursor_state
+    _pet_touch_state = DuckSim._pet_touch_state
 
 
 class RefereeTick(unittest.TestCase):

@@ -23,6 +23,7 @@ import math
 import os
 import queue
 import random
+import secrets
 import shutil
 import socket
 import subprocess
@@ -251,8 +252,145 @@ PET_PUSH_MAX = 2.0            # same clamp the `push` intent already applies
 PET_INHABITED_S = 8.0
 # Polls, not intents: these never count as somebody taking the wheel, and they
 # never reach the AX event feed (a 20 fps frame stream would flush it in
-# fifteen seconds — G18).
-PET_AMBIENT_CMDS = ("pet_frame", "pet_state")
+# fifteen seconds — G18). `pet_sense` is here for the same arithmetic at a
+# fifth of the rate: five cursor samples a second flush the 500-entry feed in
+# under two minutes, and where the mouse pointer happens to be is not an act.
+PET_AMBIENT_CMDS = ("pet_frame", "pet_state", "pet_sense")
+
+# ---------- the hand on the other side of the glass ----------
+# The overlay can see something the sim cannot: the human's pointer. It is
+# reported in the same metres as everything else (the screen mapping is
+# exact because the pet camera is orthographic), which is what lets a machine
+# guard on it without the grammar learning a second coordinate system.
+#
+# How long a cursor sample stays believable. The app heartbeats at 1 Hz even
+# when the pointer has not moved (pet_map.SENSE_HEARTBEAT_S), so anything
+# older than two seconds means the app stopped talking — a locked screen, a
+# quit overlay, a pointer that left this display — and the duck should stop
+# acting as though somebody were standing next to it.
+PET_CURSOR_STALE_S = 2.0
+# How high above the walk line a pointer still counts as "down here with me".
+# 0.35 m is about 230 pt: the Dock's own band plus a little. A cursor up in a
+# text editor is not visiting the duck.
+PET_CURSOR_FLOOR_M = 0.35
+# Smoothing on the pointer's speed. A mouse moves in jerks (one sample can be
+# a whole screen), and an unfiltered |dx|/dt is a number no guard could ever
+# sensibly threshold. 0.4 keeps two thirds of a burst after three samples.
+PET_CURSOR_SPEED_EMA = 0.4
+# Where a `touch.petted` window ends. Three seconds is one stroke's worth of
+# "that just happened", long enough for the machine to notice at 50 Hz and
+# short enough that a pet does not keep a duck standing still.
+PET_TOUCH_RECENT_S = 3.0
+# ...and how often the duck answers one out loud. The nuzzle carries a coo,
+# and a coo is the only sound in the pet's whole vocabulary a human can
+# trigger on purpose — so a long stroke is one coo, not twenty.
+PET_TOUCH_ACK_COOLDOWN_S = 2.5
+# The gesture the duck understands. A roster of one, and a roster rather than
+# a boolean because "scratched", "tickled" and "picked up by the beak" are
+# all the same shape of request and this is where they would go.
+PET_TOUCH_KINDS = ("pet",)
+# What a pet is answered with: a lean into the hand, and the voice-bank tag
+# that rides on it (emotes/nuzzle.toml).
+PET_TOUCH_EMOTE = "nuzzle"
+
+# ---------- the toy ----------
+# scene_desktop.xml carries one free body that is neither duck nor invisible
+# furniture: the same 70 mm floorball the pitch scenes use. It is the first
+# thing in the pet's world the segmentation mask has to be able to tell APART
+# from the duck rather than merely exclude — the frame's `bbox` is what the
+# overlay hit-tests a click against, and a ball folded into it would be a duck
+# you could grab from half a window away. Hence two masks, not one.
+PET_BALL_GEOM = "ball_geom"
+PET_BALL_JOINT = "ball_free"
+
+
+def kick_policies_apply(scene_key: str, has_ball: bool) -> bool:
+    """Should this daemon load the two kick policies?
+
+    Two terms, and the second one used to be a name standing in for a fact.
+    There has to be a ball to kick, asked of the COMPILED MODEL rather than of
+    the scene's name — which is both more correct generally and the thing that
+    lets the desktop pet boot a toy: `scene_desktop.xml` grew a ball, and the
+    old `scene_key in LOCAL_SCENES` gate would have gone on refusing it the
+    policy that kicks one, leaving `machines/pet.toml`'s `boot` a silent 4.4 s
+    no-op that nothing would ever have complained about.
+
+    And the `plain` scene has no ball however the question is asked, so it
+    keeps its explicit "don't bother" — it is the scene people start for a
+    walk test and the load time is the whole reason it exists.
+
+    Its own function because a gate nothing can call is a gate nothing can
+    test: a regression here is invisible both to a test suite that never runs
+    `__init__` and to a casual look at a running pet, since a missing kick
+    policy is SAFE (infer_policy.trigger_behavior prints and returns, the
+    machine's pocket guard is never satisfied, the node's deadline exits).
+    Safe is not the same as working.
+    """
+    return scene_key != "plain" and bool(has_ball)
+# Breathing room between the toy and an invisible wall when the toy has to be
+# put back inside one (`_pet_ball_into_play`). On top of the wall's own half
+# thickness and the ball's radius, both of which are read off the model — this
+# is only the gap that stops a nudged-back ball resting in permanent contact.
+PET_BALL_WALL_PAD_M = 0.02
+# Where a `push` may be aimed. The default is "duck" so every caller written
+# before the toy existed (pet_mock, `duck pet`, every test, mcp_server's
+# duck_push) keeps working unchanged.
+PET_PUSH_TARGETS = ("duck", "ball")
+
+# ---------- being picked up ----------
+# The one gesture that is not a force. A poke and a flick are impulses the
+# controller has to survive; a pick-up is a CONSTRAINT — scene_desktop.xml
+# carries an invisible mocap "hand" and a weld between it and the trunk, and
+# the whole feature is toggling that weld's `eq_active` and dragging the hand
+# around. Nothing about the duck is animated while it hangs there: a standing
+# policy with no ground under it flails, and that flail is the honest answer
+# a real robot gives when you lift it off the floor.
+PET_CARRY_EQ = "pet_carry"        # <equality><weld name=...> in the scene
+PET_HAND_BODY = "pet_hand"        # the mocap body the weld hangs off
+# Pet furniture that is neither wall, rail nor ledge: registered in
+# `_pet_geoms` purely so its body joins `pet_bodies` and is excluded from the
+# duck's segmentation mask. Group 4 already keeps it out of the picture, but
+# the mask is built from body ids and the two must agree.
+PET_PROP_GEOMS = ("pet_hand",)
+# The deadman. An overlay that crashed, was force-quit or lost its connection
+# mid-lift must not leave the duck hanging in the air for the rest of the
+# session, so silence for this long is a release. The app re-states the hand
+# at PET_CARRY_HZ (pet_map.CARRY_HZ, 20 Hz) even when the mouse is not moving,
+# which is what makes silence mean something.
+PET_CARRY_TIMEOUT_S = 1.5
+# How far inside the invisible walls a carried duck may be taken. The walls
+# stop a duck that walks into them; nothing stops a hand, so the hand is
+# clamped instead — and a little inside, because the duck hangs BELOW the
+# hand and swings.
+PET_CARRY_WALL_PAD_M = 0.05
+# The floor of the carry, and the ceiling. Below the first the hand is
+# putting the duck down (which is what `end` is for); above the second it has
+# left the screen it lives on. The app overrides `carry_max_z_m` from the
+# actual display height (pet_map.ScreenMap.config_payload).
+PET_CARRY_MIN_Z_M = 0.05
+PET_CARRY_MAX_Z_M = 0.55
+# How fast the hand chases the pointer, metres per second. A cursor can jump
+# a whole screen between two samples and a welded body would go with it —
+# through a wall, through the floor, at a speed the solver cannot answer for.
+# 1.5 m/s is faster than anyone lifts a duck and slow enough to be physics.
+PET_CARRY_HAND_SPEED_MPS = 1.5
+# The release velocity is the hand's own, measured over the last fraction of
+# a second of its track. Six samples at 20 Hz is 0.3 s of history, which is
+# more than the window needs and enough that a jerk at the end does not have
+# to be the whole answer.
+PET_CARRY_TRACK = 6
+PET_CARRY_VEL_WINDOW_S = 0.1
+# Trunk z above which the pet frame's floor line starts to rise with the duck
+# (see `_pet_camera`). A standing trunk is ~0.116 m and the worst shove
+# stagger measured stays well under 0.20, so ordinary walking, stumbles and
+# face-plants never move the camera — the Dock's edge stays pinned, which is
+# the entire illusion. Only a duck that has genuinely left the floor lifts
+# the picture with it.
+PET_LIFT_TRIGGER_M = 0.20
+# The verbs a carry understands. `start` mints a token, `move` restates where
+# the hand is, `end` lets go — and every `move`/`end` has to carry the token
+# it was given, so a stale gesture cannot release a grab that came after it.
+PET_CARRY_ACTIONS = ("start", "move", "end")
 
 
 def load_infer_policy_module(rl_repo: str):
@@ -610,8 +748,9 @@ class DuckSim:
                 paths[role] = p
             else:
                 print(f"note: no {role} policy at {p} — skipping")
-        if self.scene_key == "plain" or self.scene_key in LOCAL_SCENES:
-            # No ball to kick: don't spend the load time or the memory.
+        has_ball = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT,
+                                     PET_BALL_JOINT) >= 0
+        if not kick_policies_apply(self.scene_key, has_ball):
             paths.pop("kick_left", None)
             paths.pop("kick_right", None)
         # Which file each role is running RIGHT NOW — kept true across live
@@ -715,7 +854,8 @@ class DuckSim:
         # Every movable pet part is a mocap body wearing a same-named geom:
         # the geom id carries the size, the mocap id carries the pose.
         self._pet_geoms, self._pet_mocap = {}, {}
-        for name in PET_WALL_GEOMS + PET_RAIL_GEOMS + PET_PLATFORM_GEOMS:
+        for name in (PET_WALL_GEOMS + PET_RAIL_GEOMS + PET_PLATFORM_GEOMS
+                     + PET_PROP_GEOMS):
             self._pet_geoms[name] = mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
             bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
@@ -723,17 +863,17 @@ class DuckSim:
                                      if bid >= 0 else -1)
         self.pet_scene = all(self._pet_geoms[n] >= 0 and self._pet_mocap[n] >= 0
                              for n in PET_WALL_GEOMS)
-        # Which geoms ARE the duck, resolved once, by name, at load (G20: the
-        # mouth plate shifts ids). Everything on the worldbody is scenery and
-        # everything on a pet mocap body is invisible furniture; what is left
-        # is robot. The frame's alpha is this array and nothing else, so a
-        # future visible prop cannot accidentally become part of the duck.
-        pet_bodies = {int(self.model.geom_bodyid[self._pet_geoms[n]])
-                      for n in self._pet_geoms if self._pet_geoms[n] >= 0}
-        self._pet_duck_geom = np.array(
-            [int(self.model.geom_bodyid[g]) != 0
-             and int(self.model.geom_bodyid[g]) not in pet_bodies
-             for g in range(self.model.ngeom)], dtype=bool)
+        self._pet_resolve_masks()
+        # The pick-up: one weld, one invisible hand, one body to weld them to.
+        # Resolved by NAME once, here, for the reason every other lookup in
+        # this file is — the mouth plate is injected at load and shifts ids.
+        # All three are -1 on a scene without them, which is what
+        # `_pet_can_carry` reads.
+        self._pet_carry_eq = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_EQUALITY, PET_CARRY_EQ)
+        self._pet_hand_mocap = self._pet_mocap.get(PET_HAND_BODY, -1)
+        self._pet_trunk_body = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "trunk_base")
         # render_px -> Renderer, most-recently-used last (see
         # PET_RENDERER_CACHE). `_pet_renderer` is whichever one the frame in
         # hand is being drawn with — `_pet_alpha` renders through it.
@@ -752,6 +892,18 @@ class DuckSim:
         # so in pet_state rather than silently shipping a worse cutout.
         self._pet_seg_ok = True
         self._pet_cache = None  # (key, png bytes, w, h) for one sim tick
+        # The human, as far as the duck can tell. Both are written on the sim
+        # thread (by the pet_sense/pet_touch handlers, which run inside
+        # drain_requests) and read on the sim thread (_machine_digest,
+        # pet_state), so there is no lock here and none is wanted.
+        self._pet_cursor = None      # the last pointer sample, or None
+        self._pet_touch = {"t": None, "count": 0, "ack_t": None}
+        # ...and the hand that is actually holding it: None, or the one live
+        # grab. Same thread discipline as the two above — written by
+        # `_handle_pet_carry` inside drain_requests, advanced by
+        # `pet_carry_tick` in the same loop, read by `_machine_digest` and
+        # `pet_state`. All sim thread, so no lock, and none is wanted.
+        self._pet_carry = None
         if self.pet_scene:
             self._pet_apply_world_geometry()
         # Who has the wheel. Set by drain_requests when an MCP client sends an
@@ -1109,6 +1261,14 @@ class DuckSim:
         gs = self._goal_seen
         g_bear, g_dist = self._goal_estimates()
         r = self.referee
+        # The desktop pet's own senses. They live here rather than in
+        # _pose_digest (the executor's half) because unlike `base.*` they are
+        # not derivable from the robot's own state — only the server has been
+        # told where the human's hand is. Always present, null/False/999.0 on
+        # a scene with no overlay attached, so the key set stays stable and a
+        # machine that guards on a cursor loads on any daemon new enough.
+        cur = self._pet_cursor_state()
+        touch = self._pet_touch_state()
         return {
             "ball_seen.visible": bs["visible"],
             "ball_seen.distance_m": bs["distance_m"],
@@ -1128,6 +1288,27 @@ class DuckSim:
             "goal_seen.est_distance_m": g_dist,
             "goal.scored": bool(r.scored) if r is not None else False,
             "goal.count": int(r.count) if r is not None else 0,
+            "cursor.present": cur["present"],
+            "cursor.x_m": cur["x_m"],
+            "cursor.z_m": cur["z_m"],
+            "cursor.dx_m": cur["dx_m"],
+            "cursor.dist_m": cur["dist_m"],
+            "cursor.age_s": cur["age_s"],
+            "cursor.near_floor": cur["near_floor"],
+            "cursor.speed_mps": cur["speed_mps"],
+            "touch.petted": touch["petted"],
+            "touch.age_s": touch["age_s"],
+            "touch.count": touch["count"],
+            # The pick-up. `machines/pet.toml` carves `not carried` out of its
+            # reflexes for one measured reason: a dangling duck reads `not
+            # upright` within a second of being lifted, and without the
+            # carve-out the machine storms `fallen`, latches a wake, droops
+            # and says "I have gone over" every single time anybody picks it
+            # up. False and 0.0 on a scene with no weld in it, which is what
+            # lets the same file load on a daemon that cannot be picked up.
+            "carried": self._pet_carry is not None,
+            "carried_s": (round(self.sim_time - self._pet_carry["t0"], 3)
+                          if self._pet_carry is not None else 0.0),
             "upright": bool(proj_g[2] < -0.7),
             "sitting": bool(self.policy.sit_mode),
             "active_policy": self.policy.current_policy,
@@ -1433,11 +1614,28 @@ class DuckSim:
             self._set_head_offset([req.get(k, 0.0) for k in HEAD_CHANNELS])
             return self.get_state()
         if cmd == "push":
+            # What is being shoved. Default "duck" so every caller written
+            # before the toy existed is unchanged, and a scene with no ball
+            # says so rather than silently shoving the duck instead — a poke
+            # that moved the wrong thing is worse than one that refused.
+            target = str(req.get("target", "duck"))
+            if target not in PET_PUSH_TARGETS:
+                return {"ok": False, "error":
+                        f"unknown push target {target!r} — this scene "
+                        f"understands {', '.join(PET_PUSH_TARGETS)}"}
+            if target == "ball":
+                if getattr(self.policy, "ball_qvel_adr", None) is None:
+                    return {"ok": False,
+                            "error": "no ball in this scene to shove"}
+                adr = self.policy.ball_qvel_adr
+            else:
+                adr = self.qvel_adr
             mag = float(np.clip(req.get("magnitude", 1.0), 0.0, 2.0))
             angle = math.radians(req["angle_deg"]) if "angle_deg" in req else random.uniform(0, 2 * math.pi)
-            self.data.qvel[self.qvel_adr + 0] = mag * math.cos(angle)
-            self.data.qvel[self.qvel_adr + 1] = mag * math.sin(angle)
-            pushed = {"magnitude": mag, "angle_deg": round(math.degrees(angle), 1)}
+            self.data.qvel[adr + 0] = mag * math.cos(angle)
+            self.data.qvel[adr + 1] = mag * math.sin(angle)
+            pushed = {"magnitude": mag, "angle_deg": round(math.degrees(angle), 1),
+                      "target": target}
             # Optional vertical component. The desktop pet's drag gesture
             # happens in a side view, where "up the screen" is world +z and a
             # shove that cannot lift the duck is only half a shove. Absent, the
@@ -1445,9 +1643,9 @@ class DuckSim:
             # horizontal push has behaved this way since it was written.
             if req.get("vz") is not None:
                 vz = float(np.clip(req["vz"], -PET_PUSH_MAX, PET_PUSH_MAX))
-                self.data.qvel[self.qvel_adr + 2] = vz
+                self.data.qvel[adr + 2] = vz
                 pushed["vz"] = round(vz, 3)
-            return {"ok": True, "pushed": pushed}
+            return {"ok": True, "target": target, "pushed": pushed}
         if cmd == "mouth":
             # robot.mouth semantics: a continuous opening intent, clamped.
             # Ambient (streamed at ~40 Hz by `duck say`), so _log_event skips
@@ -1485,6 +1683,12 @@ class DuckSim:
             return self._handle_pet_config(req)
         if cmd == "pet_world":
             return self._handle_pet_world(req)
+        if cmd == "pet_sense":
+            return self._handle_pet_sense(req)
+        if cmd == "pet_touch":
+            return self._handle_pet_touch(req)
+        if cmd == "pet_carry":
+            return self._handle_pet_carry(req)
         return {"ok": False, "error": f"unknown cmd {cmd!r}"}
 
     def _handle_chirp(self, tag: str) -> dict:
@@ -1637,8 +1841,22 @@ class DuckSim:
 
     def _handle_reset(self) -> dict:
         p = self.policy
+        # Let go FIRST. `eq_active` is sim state and the rewind below does not
+        # touch it, so a reset made mid-carry would rewind qpos while the weld
+        # cheerfully dragged the duck straight back to wherever the hand was
+        # left — a reset that looks like it failed. The release velocity it
+        # writes is wiped by the qvel zeroing two lines down, which is the
+        # right answer: a new episode starts at rest.
+        self._pet_carry_release()
         self.data.qpos[:] = self._qpos0
         self.data.qvel[:] = 0.0
+        # ...and `_qpos0` carries the scene's baked-in toy spawn, which is a
+        # number about a display nobody has measured yet. The walls are still
+        # wherever this screen put them (the pet's WORLD is deliberately not
+        # reset — it belongs to the screen, not the episode), so a spawn that
+        # lands inside one has to be trimmed here too or every reset re-ejects
+        # the ball off the far side of the world.
+        self._pet_ball_into_play()
         p.last_action = np.zeros(p.n_joints, dtype=np.float32)
         p.vel_cmd = np.zeros(3, dtype=np.float32)
         p.head_offset[:] = 0.0
@@ -1660,6 +1878,17 @@ class DuckSim:
         # pet's WORLD — walls, ledges — is deliberately not reset: it belongs
         # to the screen, not the episode.)
         self._pet_cache = None
+        # The human, though, IS episode state, and its clock is the one that
+        # just rewound: a cursor sample stamped at t=41 against a sim clock
+        # back at 0 is future-dated, reads as age -41 s, and every "the hand
+        # has gone" guard in machines/pet.toml stops being able to fire. Drop
+        # it and let the overlay's next sample (≤1 s away, it heartbeats)
+        # re-establish where the pointer is. `count` survives on purpose —
+        # it is a session tally of how often this duck has been petted, not a
+        # fact about the episode that just ended.
+        self._pet_cursor = None
+        self._pet_touch["t"] = None
+        self._pet_touch["ack_t"] = None
         self._det_step = 0
         self._ball_seen = dict(NOT_SEEN)
         self._ball_seen_t = 0.0
@@ -1740,6 +1969,42 @@ class DuckSim:
     # be moved to match the frame it is showing, and one submit costs a 20 ms
     # tick, so asking for the pose separately would halve the frame rate to
     # learn something the render already knew.
+    # Two more (`pet_sense`, `pet_touch`) live further down, under "the
+    # human": they are about the person rather than the picture.
+
+    def _pet_resolve_masks(self):
+        """Decide, once at load, which geoms are duck and which are toy.
+
+        By NAME, not by index: the mouth plate is injected at load and shifts
+        every geom id after it (G20). Everything hanging off the worldbody is
+        scenery, everything on a pet mocap body is invisible furniture, and
+        what is left used to be, by elimination, robot.
+
+        That elimination stopped being safe the moment the scene grew a ball.
+        A free body is not the worldbody and is not a mocap body, so the old
+        one-mask rule would have quietly made the toy part of the duck — in
+        the alpha, which is cosmetic, and in `bbox`, which is not: `bbox` is
+        what the overlay hit-tests a click against, so a ball on the far side
+        of the window would have been a duck you could grab from there. Hence
+        two masks that partition the drawn world instead of one that assumes
+        it. Both are ngeom-long boolean arrays, indexed straight by the
+        segmentation pass's object ids.
+        """
+        pet_bodies = {int(self.model.geom_bodyid[self._pet_geoms[n]])
+                      for n in self._pet_geoms if self._pet_geoms[n] >= 0}
+        ball_gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM,
+                                     PET_BALL_GEOM)
+        ball_body = (int(self.model.geom_bodyid[ball_gid])
+                     if ball_gid >= 0 else None)
+        self._pet_ball_geom = np.array(
+            [ball_body is not None
+             and int(self.model.geom_bodyid[g]) == ball_body
+             for g in range(self.model.ngeom)], dtype=bool)
+        self._pet_duck_geom = np.array(
+            [int(self.model.geom_bodyid[g]) != 0
+             and int(self.model.geom_bodyid[g]) not in pet_bodies
+             and not self._pet_ball_geom[g]
+             for g in range(self.model.ngeom)], dtype=bool)
 
     def _pet_default_config(self) -> dict:
         return {
@@ -1752,6 +2017,31 @@ class DuckSim:
             "wall_margin_m": PET_FRAME_PX / (2 * PET_PX_PER_METER),
             "corridor_m": PET_CORRIDOR_M,
             "floor_pad_px": PET_FLOOR_PAD_PX,
+            # How high a pointer can be and still be visiting (see
+            # PET_CURSOR_FLOOR_M). Config rather than a constant because it is
+            # a claim about a SCREEN — a taller Dock, a bigger duck or a
+            # display at another scale all move it.
+            "cursor_floor_m": PET_CURSOR_FLOOR_M,
+            # How big the toy is, in the same metres as everything else, so
+            # the overlay can draw a grab rectangle around a ball that has
+            # rolled off the frame and out of `ball_bbox`. Reported rather
+            # than negotiated — BALL_RADIUS_M is baked into the head camera's
+            # range solve, so this is the scene telling the app, never the
+            # other way round. It is still in the config bounds table (and so
+            # writable) for one reason: a future scene with a bigger toy would
+            # otherwise need a protocol change to say so. Writing it moves the
+            # overlay's grab box and NOTHING else — not the geom, not the
+            # detector — so it is a lie unless the scene changed with it.
+            "ball_radius_m": BALL_RADIUS_M,
+            # The pick-up's three, and all three are claims about a SCREEN
+            # rather than about physics, which is why they are config and not
+            # constants. The app knows how tall the display is and overrides
+            # `carry_max_z_m` from it on the first `pet_config` — a duck
+            # carried above the menu bar has left the world it lives in, and
+            # only the app can say where that is.
+            "carry_max_z_m": PET_CARRY_MAX_Z_M,
+            "carry_hand_speed_mps": PET_CARRY_HAND_SPEED_MPS,
+            "lift_trigger_m": PET_LIFT_TRIGGER_M,
             "camera_distance_m": PET_CAM_DISTANCE_M,
             "azimuth_deg": PET_CAM_AZIMUTH_DEG,
             "elevation_deg": PET_CAM_ELEVATION_DEG,
@@ -1793,6 +2083,11 @@ class DuckSim:
         Sunk PET_SOLID_SINK below the floor so there is no seam at the
         ground line for a toe to catch (the walls are 0.60 m of box; two
         centimetres of it can live underground).
+
+        The toy comes with them. Where the walls stand is a fact about the
+        SCREEN and it changes under the scene's feet; where the ball spawned
+        is a number baked into the scene. `_pet_ball_into_play` is what keeps
+        the second inside the first.
         """
         half = self._pet_wall_x()
         z = PET_SOLID_HALF_H - PET_SOLID_SINK
@@ -1800,6 +2095,54 @@ class DuckSim:
             self._pet_set_geom(name, [sign * half, 0.0, z])
         for name, sign in zip(PET_RAIL_GEOMS, (-1.0, 1.0)):
             self._pet_set_geom(name, [0.0, sign * self.pet["corridor_m"], z])
+        self._pet_ball_into_play()
+
+    def _pet_ball_into_play(self) -> bool:
+        """Put the toy back between the walls, wherever the walls have moved.
+
+        The spawn is baked into `scenes/scene_desktop.xml` — x = 0.75, and the
+        same number again in the STAND keyframe — but the walls are placed at
+        RUNTIME from the app's screen (`_pet_wall_x`: half the usable band,
+        less one duck-depth). The two only agree on a display wide enough for
+        2 * (0.75 + 0.1227) = 1.745 m of sim floor. They do not agree on, say,
+        a 1512 pt MacBook Pro 14" asked for a 240 pt duck: 875 px/m puts the
+        band at 1.729 m and the walls at ±0.7417, and the right wall's box
+        (0.02 half-thick) then spans 0.7217..0.7617 — with the ball's centre
+        at 0.75, INSIDE it. Measured: the solver ejects it at 1.06 m/s and it
+        settles at x = 3.22 m, out of play for the rest of the session. It
+        cannot even be fetched back: the head camera does not see the wall
+        (group 4 is culled from the pet's MjvOption) so `ball_seen` keeps
+        reporting a toy `chase_ball` walks into a wall trying to reach, and
+        `reset` restores `_qpos0`, which is the scene's number again.
+
+        So the spawn is a wish and this is where it is trimmed — on every
+        config that moves the walls, and after every reset. Velocity goes with
+        it: a ball that had to be teleported was not rolling anywhere.
+
+        Returns True if the toy actually had to be moved.
+        """
+        adr = getattr(self.policy, "ball_qpos_adr", None)
+        if not self.pet_scene or adr is None:
+            return False
+        gid = self._pet_geoms.get(PET_WALL_GEOMS[1], -1)
+        # Off the model rather than from a constant: the wall's half thickness
+        # and the ball's radius are both the scene's to state, and a scene
+        # with a fatter wall or a bigger toy must not need this edited too.
+        wall_half = float(self.model.geom_size[gid][0]) if gid >= 0 else 0.0
+        bgid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM,
+                                 PET_BALL_GEOM)
+        radius = (float(self.model.geom_size[bgid][0]) if bgid >= 0
+                  else BALL_RADIUS_M)
+        limit = max(0.0, self._pet_wall_x() - wall_half - radius
+                    - PET_BALL_WALL_PAD_M)
+        x = float(self.data.qpos[adr])
+        if abs(x) <= limit:
+            return False
+        self.data.qpos[adr] = math.copysign(limit, x)
+        vadr = getattr(self.policy, "ball_qvel_adr", None)
+        if vadr is not None:
+            self.data.qvel[vadr:vadr + 6] = 0.0
+        return True
 
     def _pet_not_a_pet_scene(self) -> dict:
         return {"ok": False, "error":
@@ -1847,6 +2190,11 @@ class DuckSim:
             "wall_margin_m": (0.0, 5.0),
             "corridor_m": (0.05, 5.0),
             "floor_pad_px": (0, PET_FRAME_MAX_PX // 2),
+            "cursor_floor_m": (0.05, 3.0),
+            "ball_radius_m": (0.005, 0.5),
+            "carry_max_z_m": (0.10, 3.0),
+            "carry_hand_speed_mps": (0.1, 10.0),
+            "lift_trigger_m": (0.12, 2.0),
             "camera_distance_m": (0.2, 20.0),
             "azimuth_deg": (-360.0, 360.0),
             "elevation_deg": (-89.0, 89.0),
@@ -1971,6 +2319,569 @@ class DuckSim:
                 "parked": len(PET_PLATFORM_GEOMS) - len(placed),
                 "capacity": len(PET_PLATFORM_GEOMS)}
 
+    def _pet_lift_m(self) -> float:
+        """How far the frame's floor line has risen off world z=0, in metres.
+
+        Zero almost always, and that is the point. The pet frame is 0.39 m of
+        world with a 0.274 m duck in it — 9.6 cm of headroom — so a duck being
+        carried leaves its own picture almost immediately, and the window has
+        to travel up the screen with it. But a camera that followed every
+        wobble would slide the Dock's edge up and down the frame and turn a
+        stumble into a camera move, which is the illusion this whole overlay
+        is built on. So the follow has a floor under it: nothing happens until
+        the trunk passes `lift_trigger_m` (0.20 m against a standing 0.116 and
+        a worst measured shove-stagger well under it), and past that the frame
+        rises 1:1 with the duck.
+
+        Reported to the app as `pet_state.screen.frame_floor_z_m`, which is
+        what `pet_map.window_origin` hangs the window off. Emergent and worth
+        knowing: a flick UPWARDS now also lifts the frame, so the shove
+        gesture stops throwing the duck out of its own picture.
+        """
+        z = float(self.data.qpos[self.qpos_adr + 2])
+        return max(0.0, z - self.pet["lift_trigger_m"])
+
+    def _pet_frame_z_span(self) -> tuple:
+        """World z of the bottom and top edges of the pet frame, in metres.
+
+        Falls straight out of `_pet_camera`'s framing: the floor line sits
+        `floor_pad_px` output pixels above the bottom edge, so the bottom edge
+        is that far BELOW the floor (negative z — the inside of the Dock) and
+        the top edge is the rest of the frame above it. Used to answer
+        `ball.in_frame`, which is the app's licence to hit-test a click
+        against a toy it can actually see.
+
+        Both edges carry `_pet_lift_m`, because the frame's "floor" is not
+        world z=0 once the duck is off the ground — it is wherever the camera
+        put it. Without that a ball at the duck's feet would read as in frame
+        while the duck was dangling half a metre above it.
+        """
+        p = self.pet
+        lift = self._pet_lift_m()
+        return (lift - p["floor_pad_px"] / p["px_per_meter"],
+                lift + (p["frame_px"] - p["floor_pad_px"]) / p["px_per_meter"])
+
+    def _pet_ball_state(self) -> dict:
+        """Where the toy is, or None on a scene that has none.
+
+        Ground truth, and deliberately so: this is not a sense, it is the
+        renderer's half of the contract. The overlay has to know where the
+        ball's pixels are to decide whether a click was aimed at it, and the
+        camera is orthographic, so world x and z ARE screen coordinates once
+        multiplied out. The DUCK's knowledge of the ball is a different thing
+        entirely and stays where it was — `ball_seen.*`, out of the head
+        camera, with nothing in it the real robot could not compute.
+
+        `in_frame` is the useful half: the pet camera renders 0.39 m of world
+        around the duck, so a ball further away than that is neither drawn nor
+        clickable — which is the design, not a defect. Past the edge of the
+        window the duck has to go and fetch it, which is exactly what
+        `machines/pet.toml`'s chase does.
+        """
+        p = self.policy
+        if getattr(p, "ball_qpos_adr", None) is None:
+            return None
+        adr, vadr = p.ball_qpos_adr, p.ball_qvel_adr
+        b = self.data.qpos[adr:adr + 3]
+        v = self.data.qvel[vadr:vadr + 3]
+        r = self.pet["ball_radius_m"]
+        dx = float(b[0]) - float(self.data.qpos[self.qpos_adr])
+        half_x = 0.5 * self.pet["frame_px"] / self.pet["px_per_meter"]
+        z_lo, z_hi = self._pet_frame_z_span()
+        return {
+            "present": True,
+            "x_m": float(b[0]), "y_m": float(b[1]), "z_m": float(b[2]),
+            # Signed and horizontal, exactly like `cursor.dx_m`: the frame is
+            # centred on the duck, so this is also where in the window to draw
+            # the grab box.
+            "dx_m": dx,
+            "radius_m": r,
+            # The disc overlapping the frame, not just its centre — half a
+            # ball sticking into the picture is still a ball you can click.
+            "in_frame": bool(abs(dx) <= half_x + r
+                             and z_lo - r <= float(b[2]) <= z_hi + r),
+            "vel_mps": [float(x) for x in v],
+        }
+
+    # ---------- the human: a pointer, and a hand on the duck ----------
+    # Two more verbs, and between them everything the duck can know about the
+    # person it lives with:
+    #   pet_sense   where the mouse pointer is, in the duck's own metres
+    #   pet_touch   a hand was laid on the duck, gently, and let go
+    # Both are the overlay's to send: the sim has no window server and cannot
+    # see a cursor, exactly the way it cannot see the Dock. The app measures,
+    # the sim decides what it means — which is the same division of labour
+    # `pet_config` already runs on.
+
+    def _pet_cursor_state(self) -> dict:
+        """What the duck makes of the last pointer sample it was given.
+
+        Everything derived is derived HERE rather than in the app, for the
+        reason `pet_state`'s screen block exists: two implementations of the
+        same arithmetic drift, and the one that matters (`cursor.dist_m`, what
+        a machine walks towards) has to agree with the duck's own odometry to
+        the millimetre or the approach node oscillates around its own target.
+
+        A stale sample keeps its `age_s` and loses everything else. That split
+        is what lets a machine say both "the hand is gone" (`age_s > 2.5`) and
+        "the hand is close" (`dist_m < 0.22`) without either question
+        answering about a pointer that stopped existing two minutes ago — a
+        null compares False in the grammar, which is the honest answer to
+        "how far away is a cursor that is not there".
+        """
+        blank = {"present": False, "x_m": None, "z_m": None, "dx_m": None,
+                 "dist_m": None, "age_s": 999.0, "near_floor": False,
+                 "speed_mps": None}
+        c = self._pet_cursor
+        if c is None:
+            return blank
+        age = round(self.sim_time - c["t"], 3)
+        if age > PET_CURSOR_STALE_S:
+            return {**blank, "age_s": age}
+        base_x = float(self.data.qpos[self.qpos_adr])
+        dx = c["x_m"] - base_x
+        return {
+            "present": True,
+            "x_m": c["x_m"],
+            "z_m": c["z_m"],
+            # Signed, and the sign is the whole point: it is which way to
+            # walk. Positive is world +x, which the pet camera puts on the
+            # right of the screen.
+            "dx_m": dx,
+            # Horizontal only. A cursor held directly over the duck is 0 m
+            # away, because the duck cannot walk upwards to reach it.
+            "dist_m": abs(dx),
+            "age_s": age,
+            "near_floor": bool(c["z_m"] <= self.pet["cursor_floor_m"]),
+            "speed_mps": c["speed_mps"],
+        }
+
+    def _pet_touch_state(self) -> dict:
+        """When the duck was last petted, and how often it ever has been."""
+        t = self._pet_touch["t"]
+        age = 999.0 if t is None else round(self.sim_time - t, 3)
+        return {"petted": bool(t is not None and age < PET_TOUCH_RECENT_S),
+                "age_s": age, "count": int(self._pet_touch["count"])}
+
+    def _handle_pet_sense(self, req: dict) -> dict:
+        """A pointer position, in the duck's metres. Cheap on purpose.
+
+        No render, no mj_forward, no emote — this arrives five times a second
+        for as long as the overlay is awake, and the only thing it may cost
+        the sim thread is the queued tick it already spent getting here. It
+        is also deliberately not a `push`: knowing where a hand is and being
+        shoved by one are different events, and only one of them is physics.
+        """
+        if not self.pet_scene:
+            return self._pet_not_a_pet_scene()
+        if not req.get("present", True):
+            # The pointer left this screen, or the app is going idle. Drop the
+            # sample rather than let it age out: "gone" is information, and
+            # two seconds of the duck still walking towards a cursor on
+            # another display is two seconds of it looking broken.
+            self._pet_cursor = None
+            return {"ok": True, "cursor": self._pet_cursor_state()}
+        try:
+            x_m = float(req["x_m"])
+            z_m = float(req["z_m"])
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "error": "x_m and z_m must be numbers"}
+        if not (math.isfinite(x_m) and math.isfinite(z_m)):
+            return {"ok": False, "error": "x_m and z_m must be numbers"}
+        # `t_s` is the SENDER's clock (the overlay stamps each sample as it
+        # measures it), and it is what speed is computed from. Arrival time
+        # is a lie here: sense posts queue on the sim thread behind ~40 ms
+        # renders, so two samples sent 400 ms apart routinely land in the
+        # same tick — measured live, that read 0.375 m/s of real hand as
+        # 2.23 m/s once and as a dt of zero the next time, and the zero
+        # reset the EMA to None, which is how `cursor.speed_mps > 0.05`
+        # spent the first hands-on test never once being true.
+        t_s = req.get("t_s")
+        if t_s is not None:
+            try:
+                t_s = float(t_s)
+            except (TypeError, ValueError):
+                t_s = None
+            else:
+                if not math.isfinite(t_s):
+                    t_s = None
+        prev = self._pet_cursor
+        speed = None
+        if prev is not None:
+            if t_s is not None and prev.get("t_s") is not None:
+                dt = t_s - prev["t_s"]
+            else:
+                dt = self.sim_time - prev["t"]
+            if dt > 0.001:
+                inst = abs(x_m - prev["x_m"]) / dt
+                # An EMA rather than the raw difference: a mouse moves in
+                # jerks, and a guard cannot low-pass a number for itself.
+                speed = (inst if prev["speed_mps"] is None else
+                         PET_CURSOR_SPEED_EMA * inst
+                         + (1.0 - PET_CURSOR_SPEED_EMA) * prev["speed_mps"])
+            else:
+                # Two samples from the same instant carry no new information
+                # about the hand — keep what was known rather than forget it.
+                speed = prev["speed_mps"]
+        # The SIM clock, like ball_seen.age_s: a --fast daemon and a laptop
+        # that slept both break wall-clock ages, and this one is read by
+        # guards that decide whether anybody is still there. `t_s` rides
+        # along for the next speed only; age never reads it.
+        self._pet_cursor = {"x_m": x_m, "z_m": z_m, "t": self.sim_time,
+                            "t_s": t_s, "speed_mps": speed}
+        return {"ok": True, "cursor": self._pet_cursor_state()}
+
+    def _handle_pet_touch(self, req: dict) -> dict:
+        """A hand was laid on the duck — the gesture that is not a shove.
+
+        The app decides what a gesture WAS (pet_map.classify_release: a click
+        is a poke, a fast finish is a shove, a slow short stroke that ends on
+        the animal is this); the sim decides what it MEANS. Nothing here
+        reaches qvel, and that is the whole distinction the feature exists to
+        draw: a poke moves the duck, a pet does not.
+
+        The answer is one gesture and one sound, rate-limited, and it is
+        honest about not happening. `start_emote(machine=False)` means a pet
+        arriving while the head is busy steering (mid-approach, mid-kick) is
+        refused in the emote engine's own words and those words come back in
+        `note` — the duck keeps its eye on the ball, and the reply does not
+        claim a nuzzle that never played.
+        """
+        if not self.pet_scene:
+            return self._pet_not_a_pet_scene()
+        kind = str(req.get("kind", "pet"))
+        if kind not in PET_TOUCH_KINDS:
+            return {"ok": False, "error":
+                    f"unknown touch {kind!r} — this duck understands "
+                    f"{', '.join(PET_TOUCH_KINDS)}"}
+        for key in ("x_m", "z_m", "duration_s", "travel_m"):
+            if req.get(key) is None:
+                continue
+            try:
+                float(req[key])
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"{key} must be a number"}
+        # The tally and the clock move whether or not the duck answers: being
+        # petted twice in a second is two pets, and a machine watching
+        # `touch.age_s` should see the second one even though it heard no coo.
+        self._pet_touch["t"] = self.sim_time
+        self._pet_touch["count"] += 1
+        out = {"ok": True, "kind": kind, "acknowledged": False,
+               "emote": None, "sound": None, "note": "",
+               "count": self._pet_touch["count"],
+               "cooldown_s": PET_TOUCH_ACK_COOLDOWN_S}
+        ack_t = self._pet_touch["ack_t"]
+        if ack_t is not None and self.sim_time - ack_t < PET_TOUCH_ACK_COOLDOWN_S:
+            out["note"] = "still enjoying the last one"
+            return out
+        played = self.start_emote(PET_TOUCH_EMOTE, machine=False)
+        if not played.get("ok"):
+            # Mid-gesture, head bound, or no emote directory at all. Say so
+            # in the daemon's own words rather than inventing a refusal.
+            out["note"] = played.get("error", "")
+            return out
+        self._pet_touch["ack_t"] = self.sim_time
+        out.update(acknowledged=True, emote=played.get("emote"),
+                   sound=played.get("sound"), note=played.get("note", ""))
+        return out
+
+    # ---------- the hand that closes: picking the duck up ----------
+    # The third thing a mouse can say, and the only one that is not a force.
+    # A poke and a flick are impulses the controller has to survive; this is a
+    # CONSTRAINT — scene_desktop.xml's `pet_carry` weld, activated between an
+    # invisible mocap hand and the trunk, with the hand then dragged around by
+    # the pointer. Nothing is animated while the duck dangles: `machines/
+    # pet.toml`'s `carried` node commands zero velocity, which selects the
+    # standing policy, and a standing policy with no ground under it flails.
+    # That flail is not a bug to hide behind a keyframe — it is exactly what a
+    # real Microduck does when you lift it off the floor, and it is the whole
+    # reason this feature is honest.
+
+    def _pet_can_carry(self) -> bool:
+        """Does this compiled scene actually have a hand and a weld in it?
+
+        Separate from `pet_scene`: a daemon can have walls, rails and ledges
+        (an older `scene_desktop.xml`, or a hand-written one) and no pick-up,
+        and the refusal should say which of the two is missing.
+        """
+        return (self._pet_carry_eq >= 0 and self._pet_hand_mocap >= 0
+                and self._pet_trunk_body >= 0)
+
+    def _pet_carry_limits(self) -> dict:
+        """The box the hand may move in, and how fast. Sent with every reply.
+
+        The app draws no boundary of its own from these — it just posts where
+        the pointer is and lets the clamp below have the last word — but a
+        gesture that is being silently trimmed should be able to say so, and
+        `duck pet state` should be able to show why a duck stopped rising.
+        """
+        wall = max(0.05, self._pet_wall_x() - PET_CARRY_WALL_PAD_M)
+        return {"x_m": [-wall, wall],
+                "z_m": [PET_CARRY_MIN_Z_M, self.pet["carry_max_z_m"]],
+                "hand_speed_mps": self.pet["carry_hand_speed_mps"],
+                "timeout_s": PET_CARRY_TIMEOUT_S}
+
+    def _pet_carry_clamp(self, x_m: float, z_m: float, y_m: float) -> list:
+        """Where the hand is ALLOWED to be, given where it was asked to go.
+
+        This is the whole safety story of the feature. The walls stop a duck
+        that walks into them; nothing stops a hand, and a welded body follows
+        a hand anywhere — through a wall, under the floor, off the display. So
+        the target is clamped before it is ever chased, and the chase itself
+        is rate-limited (`pet_carry_tick`), because a cursor can jump a whole
+        screen between two samples and a teleporting constraint is a solver
+        explosion rather than a pick-up.
+
+        `y` is pinned to whatever depth the duck was grabbed at and then held
+        inside the rails: the pet camera looks along y, so depth is invisible
+        on screen and a hand that wandered in it would be moving the duck
+        somewhere the human cannot see.
+        """
+        wall = max(0.05, self._pet_wall_x() - PET_CARRY_WALL_PAD_M)
+        corridor = max(0.02, self.pet["corridor_m"] - 0.05)
+        return [float(np.clip(x_m, -wall, wall)),
+                float(np.clip(y_m, -corridor, corridor)),
+                float(np.clip(z_m, PET_CARRY_MIN_Z_M,
+                              self.pet["carry_max_z_m"]))]
+
+    def _pet_carry_grab(self, token: str, target, grab=(0.0, 0.0)) -> dict:
+        """Close the weld on the duck exactly where it is standing.
+
+        Two things happen here and the second one is the one that matters.
+
+        The hand is teleported onto the trunk's own origin, because a weld
+        pulls the two bodies into their declared relative pose and a hand that
+        started anywhere else would yank the duck across the screen.
+
+        `grab` is the third thing, and it is bookkeeping rather than physics:
+        the (x, z) offset from where the human pressed to where the weld
+        actually holds on. Every later `move` adds it back, so the point that
+        was grabbed is the point that stays under the pointer.
+
+        And `eq_data[3:10]` is rewritten from the LIVE relative pose. MuJoCo
+        bakes a weld's relpose from qpos0 at compile time, and on this scene
+        that is the hand parked at z=3 against a duck at z=0.12 — measured,
+        [0,0,0, 0,0,-2.88, 1,0,0,0, 1]. Activating it unedited drives the duck
+        2.88 m straight down on the first step. With the hand moved onto the
+        trunk, the honest relative pose is "no offset at all, wearing the
+        trunk's current orientation", which is what goes in.
+        """
+        tb, mid, eid = self._pet_trunk_body, self._pet_hand_mocap, self._pet_carry_eq
+        hand = np.array(self.data.xpos[tb], dtype=float)
+        self.data.mocap_pos[mid] = hand
+        self.data.mocap_quat[mid] = [1.0, 0.0, 0.0, 0.0]
+        self.model.eq_data[eid, 0:3] = 0.0          # anchor, in body2's frame
+        self.model.eq_data[eid, 3:6] = 0.0          # relpos: the hand IS the trunk
+        self.model.eq_data[eid, 6:10] = self.data.xquat[tb]
+        self.model.eq_data[eid, 10] = 1.0           # torquescale
+        self.data.eq_active[eid] = 1
+        track = deque(maxlen=PET_CARRY_TRACK)
+        track.append((self.sim_time, hand.copy()))
+        self._pet_carry = {"token": token, "t0": self.sim_time,
+                           "last_move_t": self.sim_time,
+                           "target": target, "track": track,
+                           "grab": (float(grab[0]), float(grab[1]))}
+        return self._pet_carry
+
+    def _pet_carry_hand_vel(self, carry: dict):
+        """How fast the hand was moving when it let go, per axis.
+
+        Over the last PET_CARRY_VEL_WINDOW_S of the hand's own track rather
+        than over the last tick: a 20 Hz channel against a 50 Hz loop means
+        two of every five ticks moved the hand nowhere at all, and
+        differencing those would throw the duck away in whichever direction
+        the last sample happened to land.
+        """
+        track = carry["track"]
+        if len(track) < 2:
+            return np.zeros(3)
+        t1, p1 = track[-1]
+        t0, p0 = track[0]
+        for t, p in track:
+            if t1 - t <= PET_CARRY_VEL_WINDOW_S:
+                t0, p0 = t, p
+                break
+        dt = t1 - t0
+        if dt <= 0.0:
+            return np.zeros(3)
+        return (np.asarray(p1) - np.asarray(p0)) / dt
+
+    def _pet_carry_release(self):
+        """Open the weld and hand the duck whatever the hand was doing.
+
+        The release velocity goes into the trunk's linear qvel, clamped to the
+        same PET_PUSH_MAX every other gesture is: a duck let go mid-swing
+        should fly, and a duck set down gently should not. Angular velocity is
+        deliberately left alone — the controller is already fighting for its
+        balance and a spin nobody asked for is not information, it is noise.
+
+        Returns the velocity that landed, or None if nothing was being held.
+        """
+        carry, self._pet_carry = self._pet_carry, None
+        if carry is None:
+            return None
+        if self._pet_carry_eq >= 0:
+            self.data.eq_active[self._pet_carry_eq] = 0
+        v = np.clip(self._pet_carry_hand_vel(carry), -PET_PUSH_MAX, PET_PUSH_MAX)
+        self.data.qvel[self.qvel_adr:self.qvel_adr + 3] = v
+        return [float(x) for x in v]
+
+    def pet_carry_tick(self):
+        """Move the hand one control step towards where the pointer said.
+
+        Called from `run_loop` beside `mouth_tick`, BEFORE the physics steps,
+        so the pose the solver sees this tick is the pose the human asked for
+        this tick — a mocap body written after the steps is a frame behind,
+        and one frame behind at 1.5 m/s is three centimetres of lag in a
+        constraint that is meant to feel like fingers.
+
+        The deadman lives here too, and it is not paranoia: `eq_active` is
+        sim state, so an overlay that crashed, was force-quit or lost its
+        connection mid-lift would otherwise leave the duck hanging in the air
+        for the rest of the session with nothing able to put it down.
+        """
+        carry = self._pet_carry
+        if carry is None:
+            return
+        if self.sim_time - carry["last_move_t"] > PET_CARRY_TIMEOUT_S:
+            self._pet_carry_release()
+            return
+        mid = self._pet_hand_mocap
+        here = np.array(self.data.mocap_pos[mid], dtype=float)
+        want = np.array(carry["target"], dtype=float)
+        step = self.pet["carry_hand_speed_mps"] * DECIMATION * TIMESTEP
+        delta = want - here
+        dist = float(np.linalg.norm(delta))
+        if dist > step > 0.0:
+            want = here + delta * (step / dist)
+        self.data.mocap_pos[mid] = want
+        carry["track"].append((self.sim_time, want.copy()))
+
+    def _pet_carry_state(self) -> dict:
+        """What the overlay and the machine are told about the grip."""
+        carry = self._pet_carry
+        if carry is None:
+            return {"carried": False, "token": None, "held_s": 0.0,
+                    "hand_m": None}
+        return {"carried": True, "token": carry["token"],
+                "held_s": round(self.sim_time - carry["t0"], 3),
+                "hand_m": [float(v)
+                           for v in self.data.mocap_pos[self._pet_hand_mocap]]}
+
+    def _handle_pet_carry(self, req: dict) -> dict:
+        """`start` / `move` / `end` — one grip, and the daemon owns the token.
+
+        THE DAEMON MINTS IT, never the app. A grab is a piece of sim state
+        that outlives the gesture that made it (the deadman can end one, a
+        `reset` can, a second overlay could), so "is this still the hand I am
+        holding" has to be answerable by the side that knows — and a `move` or
+        an `end` carrying a token that is no longer current changes nothing
+        and says 409. That is what stops a stale `end`, from a gesture the
+        window server abandoned when a Space switched, releasing a grab the
+        human started afterwards.
+
+        A seated duck is stood up first. Welding a sitter and putting it down
+        leaves `sit_mode` set with the duck in the air, and nothing in the
+        machine or the policy recovers from that state — the sit is a
+        transition that has already been consumed (docs/mcp-design-notes.md
+        says the same thing about swapping a policy into a seated body).
+        """
+        if not self.pet_scene:
+            return self._pet_not_a_pet_scene()
+        if not self._pet_can_carry():
+            return {"ok": False, "error":
+                    f"scene {self.scene!r} has no {PET_CARRY_EQ!r} weld — this "
+                    "duck cannot be picked up (scenes/scene_desktop.xml grew "
+                    "one; an older copy of it did not)"}
+        action = str(req.get("action", ""))
+        if action not in PET_CARRY_ACTIONS:
+            return {"ok": False, "error":
+                    f"unknown carry action {action!r} — this hand understands "
+                    f"{', '.join(PET_CARRY_ACTIONS)}"}
+        coords = None
+        if action in ("start", "move"):
+            if req.get("x_m") is not None or req.get("z_m") is not None:
+                try:
+                    coords = (float(req["x_m"]), float(req["z_m"]))
+                except (KeyError, TypeError, ValueError):
+                    return {"ok": False,
+                            "error": "x_m and z_m must be numbers"}
+                if not all(math.isfinite(v) for v in coords):
+                    return {"ok": False,
+                            "error": "x_m and z_m must be numbers"}
+        carry = self._pet_carry
+        note = ""
+
+        if action == "start":
+            if carry is not None:
+                if req.get("token") == carry["token"]:
+                    # A restatement of the grab we already answered — the app
+                    # never does this, but a retried POST is not a conflict.
+                    return self._pet_carry_reply(action, note="already yours")
+                return {"ok": False, "conflict": True, "error":
+                        "the duck is already in somebody's hand (that grab is "
+                        "still live — let go of it, or wait for the deadman)"}
+            if self.policy.sit_mode:
+                self._handle_trick("stand")
+                note = "stood it up first — a sitter cannot be put back down"
+            token = secrets.token_hex(4)
+            pos = self.data.qpos[self.qpos_adr:self.qpos_adr + 3]
+            # THE HAND CLOSES ON THE TRUNK, NOT ON THE CURSOR. `_pet_carry_grab`
+            # teleports the hand onto the trunk's origin and writes a zero
+            # relpos, so the weld holds the duck by that one point — and the
+            # press landed wherever on the animal the human aimed, because
+            # `pet_app.hit_rect_pt`'s box is the whole silhouette. Driving the
+            # hand at the raw cursor would therefore SNAP the trunk under the
+            # pointer: measured on this scene, a press on the head (z 0.25
+            # against a trunk at 0.12) yanks the duck 0.13 m upwards, and a
+            # press on the feet (z 0.02, clamped to PET_CARRY_MIN_Z_M) presses
+            # it 6.6 cm below standing until the feet penetrate the floor
+            # against ~55 N of constraint force. Roughly half of all presses
+            # are below trunk height, so both are the common case.
+            #
+            # So the grab remembers the offset instead, `move` adds it back,
+            # and the point the human took hold of is the point that follows
+            # the pointer. A `start` with no coordinates at all (the CLI, the
+            # tests) has no grab point to speak of and gets a zero offset,
+            # which is the old behaviour exactly.
+            grab = ((float(pos[0]) - coords[0], float(pos[2]) - coords[1])
+                    if coords is not None else (0.0, 0.0))
+            target = self._pet_carry_clamp(float(pos[0]), float(pos[2]),
+                                           float(pos[1]))
+            self._pet_carry_grab(token, target, grab)
+            return self._pet_carry_reply(action, note=note)
+
+        if carry is None or req.get("token") != carry["token"]:
+            return {"ok": False, "conflict": True, "error":
+                    "not the current carry (token expired — the hand was "
+                    "released)"}
+        if action == "move":
+            if coords is not None:
+                # Clamped AFTER the offset, not before: the bounds are about
+                # where the weld's hand may be, and the hand is the trunk.
+                gx, gz = carry["grab"]
+                carry["target"] = self._pet_carry_clamp(
+                    coords[0] + gx, coords[1] + gz, carry["target"][1])
+            # Even a move that named no coordinates is a heartbeat: the hand
+            # is still there, and the deadman is the only thing listening.
+            carry["last_move_t"] = self.sim_time
+            return self._pet_carry_reply(action)
+        released = self._pet_carry_release()
+        return self._pet_carry_reply(action, released=released,
+                                     note="put down")
+
+    def _pet_carry_reply(self, action: str, released=None,
+                         note: str = "") -> dict:
+        state = self._pet_carry_state()
+        carry = self._pet_carry
+        return {"ok": True, "action": action, "note": note,
+                "token": state["token"], "carried": state["carried"],
+                "held_s": state["held_s"], "hand_m": state["hand_m"],
+                "target_m": ([carry["target"][0], carry["target"][2]]
+                             if carry is not None else None),
+                "limits": self._pet_carry_limits(),
+                "released_vel_mps": released}
+
     def _pet_inhabited(self):
         """Is an MCP client driving right now, and how long since it spoke?"""
         if not self._mcp_intent_t:
@@ -2017,12 +2928,31 @@ class DuckSim:
             "inhabited": inhabited,
             "inhabited_age_s": age_s,
             "inhabited_cmd": cmd,
+            # The human, from the duck's side of the glass. Unrounded like
+            # everything else here — `dist_m` is what a machine walks towards,
+            # and a millimetre is two thirds of a pixel at 656 px/m.
+            "cursor": self._pet_cursor_state(),
+            "touch": self._pet_touch_state(),
+            # ...and whether the hand actually closed. The token is in here on
+            # purpose: it is what a second overlay, or `duck pet state` in a
+            # terminal, reads to find out that somebody else is holding the
+            # duck right now.
+            "carry": self._pet_carry_state(),
+            # The toy, in the same unrounded metres — `null` on a scene
+            # without one, so the app can ask "is there a ball" with the same
+            # question it asks "where is it".
+            "ball": self._pet_ball_state(),
             # Precomputed screen mapping, so the app does no arithmetic it
             # could get subtly out of step with the renderer's.
             "screen": {
                 "center_offset_px": float(pos[0]) * p["px_per_meter"],
                 "floor_px_from_bottom": p["floor_pad_px"],
                 "px_per_meter": p["px_per_meter"],
+                # What world z the frame's floor row is showing. 0 for a duck
+                # on the Dock, which is every duck that is not being carried;
+                # above the lift trigger it is how far the WINDOW has to climb
+                # the screen (pet_map.ScreenMap.window_origin).
+                "frame_floor_z_m": self._pet_lift_m(),
                 "frame_px": p["frame_px"],
             },
             "config": self._pet_config_state(),
@@ -2032,9 +2962,11 @@ class DuckSim:
         """The tracking camera: centred on the duck, level with the world.
 
         lookat.x follows the duck so it is always in the middle of its window
-        (the WINDOW is what travels); lookat.z does NOT follow, or the Dock's
-        edge would slide up and down the frame and a stumble would look like
-        a camera move instead of a fall. lookat.y follows only to keep the
+        (the WINDOW is what travels); lookat.z follows only ABOVE
+        `lift_trigger_m`, or the Dock's edge would slide up and down the frame
+        and a stumble would look like a camera move instead of a fall. Below
+        that trigger the floor line is pinned exactly as it always was — see
+        `_pet_lift_m` for the measurement. lookat.y follows only to keep the
         duck inside the depth clip — under orthographic it changes nothing on
         screen, which is exactly why the side view can be trusted.
 
@@ -2051,26 +2983,40 @@ class DuckSim:
         # World z of the frame's centre: put the floor `floor_pad_px` above
         # the bottom edge and everything else follows.
         floor_from_center_px = (size_px or p["frame_px"]) / 2 - p["floor_pad_px"]
+        # ...plus the lift, which is 0 for every duck that is on the floor —
+        # see `_pet_lift_m` for why the follow has a dead band under it.
         cam.lookat[:] = [float(pos[0]), float(pos[1]),
-                         floor_from_center_px / p["px_per_meter"]]
+                         self._pet_lift_m()
+                         + floor_from_center_px / p["px_per_meter"]]
         cam.distance = p["camera_distance_m"]
         cam.azimuth = p["azimuth_deg"]
         cam.elevation = p["elevation_deg"]
         return cam
 
-    def _pet_alpha(self, rgb) -> "np.ndarray":
-        """The duck's silhouette, as an alpha channel.
+    def _pet_alpha(self, rgb):
+        """What is drawn, split into the two things it can be.
+
+        Returns `(alpha, duck_mask, ball_mask)`. The alpha is everything the
+        window should show — duck and toy together, because they are one
+        picture — and the two masks are how the frame answers WHICH of them a
+        given pixel belongs to. They are separate because `bbox` is a hit
+        rectangle, not decoration: the overlay swallows a click inside it, and
+        one box drawn round a duck and a ball a window apart is a duck you
+        could grab from anywhere between them.
 
         Segmentation pass: render() returns (H, W, 2) int32 of (object id,
-        object type), so looking each id up in the duck-geom table built at
-        load is the exact cutout — every duck part, nothing of the scene, no
-        colour heuristic to fool. The mouth plate is a body of its own and
-        comes along for free; walls and ledges are excluded by name even
-        though the group cull already keeps them out of the render.
+        object type), so looking each id up in the tables built at load is the
+        exact cutout — every duck part, nothing of the scene, no colour
+        heuristic to fool. The mouth plate is a body of its own and comes
+        along for free; walls and ledges are excluded by name even though the
+        group cull already keeps them out of the render.
 
         Chroma fallback for a host that cannot do the second pass: key the
         backdrop's magenta. Worse (it eats any magenta highlight on the duck)
         but it is one render instead of two and it never returns a blank duck.
+        It also cannot tell a duck from a ball — the whole method is "not the
+        backdrop" — so it says so by returning no masks at all, and the frame
+        reports `ball_bbox: null` rather than guessing.
         """
         if self._pet_seg_ok:
             try:
@@ -2081,14 +3027,16 @@ class DuckSim:
                     self._pet_renderer.disable_segmentation_rendering()
                 ids = np.clip(seg[:, :, 0], 0, self.model.ngeom - 1)
                 is_geom = seg[:, :, 1] == int(mujoco.mjtObj.mjOBJ_GEOM)
-                return ((is_geom & self._pet_duck_geom[ids])
-                        .astype(np.uint8)) * 255
+                duck = is_geom & self._pet_duck_geom[ids]
+                ball = is_geom & self._pet_ball_geom[ids]
+                return ((duck | ball).astype(np.uint8) * 255, duck, ball)
             except Exception as e:
                 self._pet_seg_ok = False
                 print(f"note: pet segmentation pass disabled ({e}) — falling "
                       "back to the chroma key")
         d = np.abs(rgb.astype(np.int16) - np.asarray(PET_CHROMA_RGB, dtype=np.int16))
-        return (~(d.max(axis=2) <= PET_CHROMA_TOL)).astype(np.uint8) * 255
+        return ((~(d.max(axis=2) <= PET_CHROMA_TOL)).astype(np.uint8) * 255,
+                None, None)
 
     @staticmethod
     def _pet_compose(rgb, alpha, ss: int):
@@ -2150,11 +3098,18 @@ class DuckSim:
         return r
 
     def _handle_pet_frame(self, req: dict) -> dict:
-        """One RGBA cutout of the duck, plus the pose it was taken at.
+        """One RGBA cutout of the duck and its toy, plus the pose it was taken at.
 
         Its own renderer, never `self._renderer`: that one is clamped to
         640x480 and shared with the AX debug page, and toggling segmentation
         on it would corrupt the page's frames mid-stream.
+
+        Two boxes come back beside the picture, not one. `bbox` is the DUCK
+        and only the duck; `ball_bbox` is the toy, `null` when it is off frame
+        or when the chroma fallback is running (which cannot tell them apart
+        and says so). The overlay hit-tests both, and which one a press landed
+        on is what decides whether the drag that follows shoves a duck or
+        rolls a ball.
 
         Budget: rendering runs on the 50 Hz sim thread, and ~40 fps of it
         stops physics dead (measured: sim/wall 0.012). The app should stay at
@@ -2177,9 +3132,14 @@ class DuckSim:
                p["floor_pad_px"], p["camera_distance_m"], p["azimuth_deg"],
                p["elevation_deg"])
         if self._pet_cache is not None and self._pet_cache[0] == key:
-            png, w, h, bbox = self._pet_cache[1:]
+            png, w, h, bbox, ball_bbox = self._pet_cache[1:]
+            # `cached` says where the PNG came from; `alpha` says what the
+            # boxes MEAN, and the app now branches on it (`pet_app.hit_rect_pt`
+            # cannot trust a chroma `bbox` to be duck-only). Reporting "cache"
+            # there answered the wrong question and hid the one that matters.
             return {**state, "png": png, "width": w, "height": h,
-                    "bbox": bbox, "cached": True, "alpha": "cache"}
+                    "bbox": bbox, "ball_bbox": ball_bbox, "cached": True,
+                    "alpha": "segmentation" if self._pet_seg_ok else "chroma"}
         model = self.model
         was_ortho = int(model.vis.global_.orthographic)
         was_fovy = float(model.vis.global_.fovy)
@@ -2195,7 +3155,7 @@ class DuckSim:
                                             camera=self._pet_camera(size),
                                             scene_option=self._pet_option)
             rgb = self._pet_renderer.render().copy()
-            alpha = self._pet_alpha(rgb)
+            alpha, duck_mask, ball_mask = self._pet_alpha(rgb)
         except Exception as e:
             return {"ok": False, "error": f"pet render failed: {e} (offscreen "
                     "rendering is unavailable under mjpython — run the pet "
@@ -2212,16 +3172,27 @@ class DuckSim:
         Image.fromarray(rgba, "RGBA").save(buf, format="PNG", compress_level=1)
         png = buf.getvalue()
         h, w = rgba.shape[:2]
-        bbox = self._pet_bbox(rgba[:, :, 3])
-        self._pet_cache = (key, png, w, h, bbox)
+        # From the MASKS, not from the composed alpha, because the composed
+        # alpha is both of them at once. `ss` is passed so the boxes land in
+        # OUTPUT pixels — the same pixels the PNG is measured in, which is the
+        # only frame of reference the app has.
+        if duck_mask is None:
+            # Chroma: one keyed silhouette, no way to say which half is which.
+            # `bbox` stays the honest answer to "where are the drawn pixels";
+            # `ball_bbox` is null rather than a guess.
+            bbox, ball_bbox = self._pet_bbox(rgba[:, :, 3]), None
+        else:
+            bbox = self._pet_bbox(duck_mask, ss)
+            ball_bbox = self._pet_bbox(ball_mask, ss)
+        self._pet_cache = (key, png, w, h, bbox, ball_bbox)
         return {**state, "png": png, "width": w, "height": h, "bbox": bbox,
-                "cached": False,
+                "ball_bbox": ball_bbox, "cached": False,
                 "alpha": "segmentation" if self._pet_seg_ok else "chroma"}
 
     @staticmethod
-    def _pet_bbox(alpha):
-        """Where the duck's pixels actually are, in frame pixels, top-left
-        origin, as [x0, y0, x1, y1] half-open.
+    def _pet_bbox(mask, ss: int = 1):
+        """Where that mask's pixels actually are, in OUTPUT frame pixels,
+        top-left origin, as [x0, y0, x1, y1] half-open.
 
         The overlay window is a transparent square sitting over the Dock, so
         it has to decide per cursor position whether to swallow a click or let
@@ -2229,11 +3200,24 @@ class DuckSim:
         knows the silhouette, and the silhouette is already in our hands: the
         segmentation mask cost nothing extra and two `nonzero` reductions on a
         binary channel are cheaper than the app scanning the PNG it just
-        decoded. None when the duck is off frame — the app then falls back to
-        its nominal standing box.
+        decoded. None when the thing is off frame — the app then falls back to
+        arithmetic (`pet_app.hit_rect_pt` / `ball_rect_pt`).
+
+        `ss` folds the supersample down the way `_pet_compose` does, and it
+        has to agree with it exactly: a box filter over a binary mask leaves
+        an output pixel non-zero iff ANY of its ss×ss inputs was set, so
+        `.any()` over the same blocks is the same picture — measured against
+        the composed alpha, not assumed. Doing it here rather than reading the
+        composed channel back is what lets the two boxes be separate at all.
         """
-        cols = np.flatnonzero(alpha.any(axis=0))
-        rows = np.flatnonzero(alpha.any(axis=1))
+        if mask is None:
+            return None
+        if ss > 1:
+            h, w = mask.shape
+            h2, w2 = h // ss, w // ss
+            mask = mask[:h2 * ss, :w2 * ss].reshape(h2, ss, w2, ss).any(axis=(1, 3))
+        cols = np.flatnonzero(mask.any(axis=0))
+        rows = np.flatnonzero(mask.any(axis=1))
         if not cols.size or not rows.size:
             return None
         return [int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1]
@@ -2270,6 +3254,12 @@ class DuckSim:
         # Ambient traffic, not agent intent. The pet polls belong here or a
         # 20 fps overlay flushes the whole 300-entry feed in fifteen seconds.
         if cmd in ("camera_web", "ping", "mouth") or cmd in PET_AMBIENT_CMDS:
+            return
+        # A carry is three events, not sixty: `start` and `end` are acts and
+        # belong on the feed, and the `move`s in between are the same channel
+        # `pet_sense` is — a position, restated twenty times a second, which
+        # would flush the 500-entry feed in twenty-five seconds (G18 again).
+        if cmd == "pet_carry" and req.get("action") == "move":
             return
         if not resp.get("ok"):
             note = resp.get("error", "error")
@@ -2372,6 +3362,11 @@ def run_loop(sim: DuckSim, viewer=None, realtime: bool = True, stop: threading.E
         action = sim.policy.infer()
         sim.policy.apply_action(action)
         sim.mouth_tick()
+        # The human's hand, moved before the steps for the same reason the
+        # beak is: a mocap body written after them is a frame behind, and one
+        # frame behind at 1.5 m/s is three centimetres of lag in a constraint
+        # that is meant to feel like fingers.
+        sim.pet_carry_tick()
         for _ in range(DECIMATION):
             mujoco.mj_step(sim.model, sim.data)
         sim.sim_time += control_dt
