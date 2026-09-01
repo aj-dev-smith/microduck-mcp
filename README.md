@@ -423,6 +423,20 @@ off. Stop the daemon and the duck freezes mid-step, tinted cool — proof of lif
 the same way an unplugged robot is proof of life.
 
 ```bash
+uv run duck pet up                     # daemon + machine + overlay, detached
+uv run duck pet status                 # both halves alive? which node?
+uv run duck pet down                   # kill both, sweep strays, rm the socket
+```
+
+`up` starts the pair in its own session, so the duck outlives the terminal
+that summoned it; pidfiles and per-half logs land in `~/.microduck/pet/`.
+`down` also sweeps the feed port and the overlay's process names for strays
+from launches it never made — the cure for the "trail of ghost ducks" a night
+of manual restarts leaves behind. The launcher deliberately parks the pet on
+its own socket and port 8410 so it can never seize a resident duck's default
+socket. The three verbs are sugar over the manual recipe, which still works:
+
+```bash
 uv run duck-sim --scene desktop        # headless; --viewer has no offscreen GL
 uv run duck machine load machines/pet.toml && uv run duck machine arm
 uv run duck-pet                        # both sides default to port 8400

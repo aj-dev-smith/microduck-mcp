@@ -16,6 +16,9 @@ Library (`request()`) plus a small CLI:
     duck machine arm --block-s 300        # arm, then block for the first wake
     duck film -o match.mp4
     duck mouth 0.6
+    duck pet up                              # daemon + machine + overlay, detached
+    duck pet down                            # kill both halves, sweep strays
+    duck pet status                          # alive? armed? which node?
     duck pet state                           # the desktop overlay's own pose
     duck pet config --px-per-meter 656       # ...and the screen it thinks it is on
     duck pet world                           # park every ledge (the undo)
@@ -106,7 +109,14 @@ def main():
     # box. `reset` deliberately leaves the pet's world alone (it belongs to
     # the screen, not to the run), so without this a badly-placed ledge could
     # only be undone over HTTP.
-    pet.add_argument("action", choices=["state", "config", "frame", "world"])
+    # `up`/`down`/`status` are not socket intents — they MANAGE the pair of
+    # processes the socket belongs to (see pet_launcher.py). Their default
+    # socket is the pet's own, never DUCK_SIM_SOCKET: standing up the pet
+    # must not seize a resident duck's control plane.
+    from . import pet_launcher
+    pet.add_argument("action", choices=["up", "down", "status",
+                                        "state", "config", "frame", "world"])
+    pet_launcher.add_arguments(pet)
     pet.add_argument("--px-per-meter", type=float, default=None)
     pet.add_argument("--screen-width-px", type=float, default=None)
     pet.add_argument("--frame-px", type=int, default=None)
@@ -171,6 +181,8 @@ def main():
         sys.exit(voice.run_chirp(args))
     if args.command == "train":
         sys.exit(train.run(args))
+    if args.command == "pet" and args.action in ("up", "down", "status"):
+        sys.exit(pet_launcher.run(args))
 
     if args.command == "drive":
         req = {"cmd": "set_velocity", "vx": args.vx, "vy": args.vy, "wz": args.wz}
