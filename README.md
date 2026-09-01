@@ -106,6 +106,7 @@ the agent rarely needs a follow-up poll.
 | `duck_train_start(task_id, ...)` | **Train a new behavior**: launches a run in its own tmux session on the GPU box (see below). `smoke=True` is the 64-env / 5-iteration validation run |
 | `duck_train_status(session?, tail?)` | List training sessions; for one, the wandb URL, latest iteration/reward/ETA, whether it's alive, and a diagnosis if it died |
 | `duck_train_stop(session)` | Ctrl-C the trainer, then kill the session (`destructive_hint` — it ends an experiment) |
+| `duck_policy(action, role?, path?)` | **The brains, inspectable and mutable on a live sim**: `list` every role's ONNX and obs width; `swap` rebinds one role to a freshly exported checkpoint with no restart. Validated off to the side first (missing/malformed file, obs-width mismatch → refused with the incumbent still flying); the reply's `previous` is the one-call rollback |
 | `duck_reset` | Back to origin, default stance (`destructive_hint` — it ends the episode) |
 
 ## Honest sensing (fake mediad)
@@ -536,17 +537,21 @@ happens on the sim thread via the same intent queue as every other client.
 - Camera rendering is offscreen (no window needed); in `--viewer` mode on
   macOS, offscreen rendering may be unavailable — run headless if you need
   frames.
-- The shipped policy set includes no StandUp policy, so a duck that ends up
-  [on its side](docs/images/recovery_attempt_front.png) (e.g. after a rough
-  roulade landing) stays there — `duck_reset` is the escape hatch. Training
-  one (`Mjlab-StandUp-*` in microduck_rl) is the fix.
+- Falls are recoverable without a reset when the `sitstand` slot holds a
+  getup policy: `duck_trick stand` fires it from the floor, the resident
+  machine's fall reflex spends two honest attempts before waking anyone, and
+  `duck_policy` swaps in a better brain the moment one finishes training.
+  (Pollen ships none — the first ones here were trained from scratch via
+  `Mjlab-StandUp-*` and hot-swapped in live.)
 
 ## Roadmap
 
 - [ ] Real-robot backend speaking the daemon's WebSocket API (see
       `microduck` docs `design/architecture.md` §5.3) behind the same tools
 - [ ] Body-pose intents (crouch/lean while standing)
-- [ ] Optional StandUp policy slot so falls are recoverable without `duck_reset`
+- [x] Optional StandUp policy slot so falls are recoverable without
+      `duck_reset` — shipped as `duck_policy` live hot-swap + the resident
+      machine's try-twice fall reflex, running a self-trained getup brain
 - [ ] Close the training loop: a `duck_train_export` that takes a finished
       run's `wandb_run_path` straight to an ONNX in the sim's policy dir, so
       train → export → hot-swap needs no human hands
