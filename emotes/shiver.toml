@@ -1,0 +1,50 @@
+# shiver — a fast feather-ruffle: rapid small head rolls with a touch of
+# yaw, ending in one bigger settling roll. Silent on purpose; a shiver with
+# a sound effect is a cartoon, a silent one is a bird. Good as a rare idle
+# fidget, or after anything undignified (a fall, a pet, rain someday).
+
+[emote]
+name = "shiver"
+
+[[key]]
+t = 0.0
+
+[[key]]
+t = 0.1
+head_roll = 0.16
+head_yaw = 0.08
+ease = "smooth"
+
+[[key]]
+t = 0.2
+head_roll = -0.16
+head_yaw = -0.08
+ease = "smooth"
+
+[[key]]
+t = 0.3
+head_roll = 0.14
+head_yaw = 0.06
+ease = "smooth"
+
+[[key]]
+t = 0.4
+head_roll = -0.12
+head_yaw = -0.05
+ease = "smooth"
+
+[[key]]
+t = 0.5
+head_roll = 0.09
+ease = "smooth"
+
+[[key]]                  # one slower, bigger roll to settle the feathers
+t = 0.75
+head_roll = -0.22
+ease = "smooth"
+
+[[key]]
+t = 1.1
+head_roll = 0.0
+head_yaw = 0.0
+ease = "smooth"

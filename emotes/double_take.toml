@@ -1,0 +1,44 @@
+# double_take — glance away, glance back, then the BIG look with the beak
+# slightly open. The comedy is entirely in the timing: the first look is
+# casual, the return is fast, the second look overshoots. The inquire call
+# lands on the second look. For the pet: reacting to a new window, the
+# mouse rushing past, anything that deserves cartoon disbelief.
+
+[emote]
+name = "double_take"
+sound = "inquire"
+
+[[key]]
+t = 0.0
+
+[[key]]                  # casual glance left
+t = 0.35
+head_yaw = 0.55
+ease = "smooth"
+
+[[key]]
+t = 0.7
+ease = "hold"
+
+[[key]]                  # back to front, nothing to see here
+t = 1.0
+head_yaw = 0.0
+ease = "smooth"
+
+[[key]]                  # ...wait. fast return, overshooting, beak cracks
+t = 1.25
+head_yaw = 0.95
+head_pitch = -0.15
+mouth = 0.35
+ease = "smooth"
+
+[[key]]                  # the stare
+t = 2.1
+ease = "hold"
+
+[[key]]
+t = 2.6
+head_yaw = 0.0
+head_pitch = 0.0
+mouth = 0.0
+ease = "smooth"

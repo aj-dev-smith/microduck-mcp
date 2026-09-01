@@ -1,0 +1,50 @@
+# yawn — the cornerstone of the cozy-pet shelf. Not a startle and not a
+# performance: slow wind-up, beak wide with the head rolled back, a beat of
+# hold at the top (the part that reads as a real yawn), then a lazy close
+# that overshoots into a tiny settle. The coo plays under it — a sleepy
+# sound, not a call. Meant for doze entry/exit and long-idle fidgets.
+
+[emote]
+name = "yawn"
+sound = "coo"
+
+[[key]]
+t = 0.0
+
+[[key]]                  # slow wind-up: head starts tipping back, beak cracks
+t = 0.6
+neck_pitch = -0.20
+head_pitch = -0.45
+mouth = 0.25
+ease = "smooth"
+
+[[key]]                  # full yawn: head back, beak all the way
+t = 1.2
+neck_pitch = -0.30
+head_pitch = -0.70
+mouth = 1.0
+ease = "smooth"
+
+[[key]]                  # the hold at the top is what sells it
+t = 1.7
+ease = "hold"
+
+[[key]]                  # lazy close, head coming down ahead of the beak
+t = 2.5
+neck_pitch = -0.05
+head_pitch = -0.10
+mouth = 0.15
+ease = "smooth"
+
+[[key]]                  # tiny settle shake, like shaking the sleep off
+t = 2.8
+head_roll = 0.10
+mouth = 0.0
+ease = "smooth"
+
+[[key]]
+t = 3.1
+head_roll = 0.0
+neck_pitch = 0.0
+head_pitch = 0.0
+ease = "smooth"

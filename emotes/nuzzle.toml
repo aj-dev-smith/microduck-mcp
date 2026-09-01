@@ -1,0 +1,50 @@
+# nuzzle — content: the answer to a hand that is being gentle. head_tilt's
+# opposite number — where the tilt is a question held still, this is a slow
+# lean into the hand and back, twice, with the beak barely cracking.
+#
+# The coo is the only sound in the desktop pet's whole vocabulary that a human
+# can trigger ON PURPOSE, which is the entire reason this gesture can afford
+# one at all. Everything else that makes a noise here is rationed against a
+# clock (machines/pet.toml's header does that arithmetic: seventy wall
+# arrivals an hour, eight naps); a stroke is rationed by the person doing the
+# stroking. The daemon still holds a leash on it —
+# sim_server.PET_TOUCH_ACK_COOLDOWN_S is 2.5 s — so a long slow pet is one
+# coo, not twenty.
+#
+# head_roll stays inside 0.12: the joint was trained to ±0.31 (head_tilt.toml
+# spells out why a command past the training range is not a bigger tilt, it is
+# an untrained one), and content is a LEAN, not a cock of the head. The pitch
+# goes down rather than up for the same reason a bird's does — leaning into a
+# hand is a lowering, and 0.22 is well inside what the neck was taught.
+
+[emote]
+name = "nuzzle"
+sound = "coo"
+
+[[key]]
+t = 0.0
+
+[[key]]                  # into the hand, slowly: this is not a flinch
+t = 0.5
+head_pitch = 0.18
+head_roll = 0.12
+ease = "smooth"
+
+[[key]]                  # ...and across, which is what makes it a nuzzle
+t = 1.0                  # rather than a nod
+head_pitch = 0.22
+head_roll = -0.10
+ease = "smooth"
+
+[[key]]                  # back the other way, and the beak cracks — the small
+t = 1.5                  # contented sound-shape, not a call
+head_roll = 0.10
+mouth = 0.10
+ease = "smooth"
+
+[[key]]                  # home. Six tenths for the return, so the gesture
+t = 2.1                  # ENDS soft instead of snapping back to attention
+head_pitch = 0.0
+head_roll = 0.0
+mouth = 0.0
+ease = "smooth"
